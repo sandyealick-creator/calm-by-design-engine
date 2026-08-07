@@ -23,9 +23,9 @@ GHL form ──▶ POST /assess ──▶ Daily Log (Airtable)
 - [x] Deployed to Google Cloud Run (`cbd-assess`, `us-east1`)
 - [x] End-to-end test verified: journal → Gemini classification → Airtable records → state transition
 - [x] Credentials rotated after being briefly exposed in a shared doc during setup
-- [ ] GitHub repo created and pushed *(this repo)*
+- [x] GitHub repo created and pushed *(this repo)*
 - [ ] GoHighLevel inbound/outbound webhooks wired
-- [ ] Golden test set run and results archived
+- [x] Golden test set run and results archived (`golden_results.json`, 15/15 passed)
 - [ ] Devpost submission finalized
 
 ## Local setup (for reference — do not commit real credentials)

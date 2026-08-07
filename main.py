@@ -44,6 +44,7 @@ T_CLIENTS = "tblfPZYJSaJM8DGBl"
 T_LOGS = "tblEK3w2sFXV4g5jk"
 T_ASSESS = "tbl6k1vxYhGfaUY2v"
 T_TRANSITIONS = "tblXCKPuDcyyI8VqW"
+T_CRISIS = "tblWvBNGc2KbWHPfK"
 
 # --- Field IDs (stable even if fields are renamed in the UI) ---------------
 F_CLIENT = {
@@ -75,6 +76,7 @@ F_ASSESS = {
     "action": "fldx6GYj97KkFtBJb",
     "buffer_element": "fldOTTpdLLuRtFhBL",
     "crisis": "fldjxYzPGHx6u6KXz",
+    "crisis_alert": "fldxZHaU5f2ovk5os",
     "reasoning": "fldFSdkyazP5d94GZ",
     "model": "fldtWL3VNkNlIPpcU",
     "latency": "fldmnHBc3uOWmhShp",
@@ -93,6 +95,15 @@ F_TRANS = {
     "timestamp": "fldUqOIUfVzJU0YxT",
     "client": "fldjKhpzoYijXmGy6",
     "assessment": "fldAJ4vFe0wAGP3Ss",
+}
+F_CRISIS = {
+    "alert_id": "fldqMTPoljYuaV14s",
+    "client": "fldoLJJkT1zHbpdlR",
+    "client_name": "fldvxeEMl6tdEGojh",
+    "client_email": "fldYzD6ZRZ1xwn8bB",
+    "reasoning": "fldSMPsKySOUcDsBN",
+    "assessment": "fldgq1Qptv0bwrrU0",
+    "flagged_at": "fldngpL8kr8LxZMiW",
 }
 
 # Gemini enum -> Airtable select option names
@@ -262,15 +273,18 @@ def assess():
         return jsonify({"error": "unauthorized"}), 401
 
     body = request.get_json(force=True, silent=True) or {}
-    journal = (body.get("journal_text") or "").strip()
-    scores = {k: body.get(k) for k in
+    # GHL's Webhook action nests custom key-value pairs under "customData"
+    # instead of the request body's top level.
+    data = body.get("customData") or body
+    journal = (data.get("journal_text") or "").strip()
+    scores = {k: data.get(k) for k in
               ("sleep", "energy", "anxiety", "physical_symptoms")}
     if not journal:
         return jsonify({"error": "journal_text required"}), 400
 
     # -- 1. find client --
-    client_rec = find_client(email=body.get("email"),
-                             ghl_id=body.get("ghl_contact_id"))
+    client_rec = find_client(email=data.get("email"),
+                             ghl_id=data.get("ghl_contact_id"))
     if not client_rec:
         return jsonify({"error": "client not found"}), 404
     cf = client_rec["fields"]
@@ -291,7 +305,7 @@ def assess():
         F_LOG["energy"]: scores["energy"],
         F_LOG["anxiety"]: scores["anxiety"],
         F_LOG["physical"]: scores["physical_symptoms"],
-        F_LOG["source"]: body.get("source", "GHL Form"),
+        F_LOG["source"]: data.get("source", "GHL Form"),
         F_LOG["client"]: [client_id],
     })
 
@@ -311,6 +325,7 @@ def assess():
         F_ASSESS["buffer_element"]: ELEMENT_MAP.get(
             (result.get("buffer_element") or "").upper()),
         F_ASSESS["crisis"]: bool(result.get("crisis_flag")),
+        F_ASSESS["crisis_alert"]: "Yes" if result.get("crisis_flag") else "No",
         F_ASSESS["reasoning"]: result.get("reasoning_summary", ""),
         F_ASSESS["model"]: GEMINI_MODEL,
         F_ASSESS["latency"]: latency_ms,
@@ -335,6 +350,15 @@ def assess():
 
     # -- 5. crisis path: alert human, no AI routing --
     if result.get("crisis_flag"):
+        at_create(T_CRISIS, {
+            F_CRISIS["alert_id"]: f"{client_name}-{today}-CRISIS",
+            F_CRISIS["client"]: [client_id],
+            F_CRISIS["client_name"]: client_name,
+            F_CRISIS["client_email"]: cf.get(F_CLIENT["email"]),
+            F_CRISIS["reasoning"]: result.get("reasoning_summary", ""),
+            F_CRISIS["assessment"]: [assess_rec["id"]],
+            F_CRISIS["flagged_at"]: datetime.now(timezone.utc).isoformat(),
+        })
         hook = os.environ.get("GHL_CRISIS_WEBHOOK")
         if hook:
             requests.post(hook, json={

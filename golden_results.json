@@ -1,0 +1,293 @@
+[
+  {
+    "id": "G01",
+    "passed": true,
+    "notes": [],
+    "result": {
+      "nervous_system_state": "REGULATED",
+      "confidence": 0.95,
+      "stress_signatures": [],
+      "recommended_action": "ADVANCE",
+      "buffer_element": null,
+      "crisis_flag": false,
+      "reasoning_summary": "Client exhibits a regulated nervous system state with high sleep and energy scores. Journal text confirms emotional resilience and capacity during a busy workday. No stress signatures detected. Recommended to advance to the next week."
+    },
+    "latency_ms": 3146,
+    "tokens_in": 717,
+    "tokens_out": 114
+  },
+  {
+    "id": "G02",
+    "passed": true,
+    "notes": [],
+    "result": {
+      "nervous_system_state": "REGULATED",
+      "confidence": 0.9,
+      "stress_signatures": [],
+      "recommended_action": "ADVANCE",
+      "buffer_element": null,
+      "crisis_flag": false,
+      "reasoning_summary": "Client reports a calm day with transient, successfully managed presentation tension. Scores align with a regulated state, showing good capacity and self-regulation. No active stress signatures identified."
+    },
+    "latency_ms": 3764,
+    "tokens_in": 710,
+    "tokens_out": 82
+  },
+  {
+    "id": "G03",
+    "passed": true,
+    "notes": [],
+    "result": {
+      "nervous_system_state": "SYMPATHETIC_ACTIVATION",
+      "confidence": 0.9,
+      "stress_signatures": [
+        "rumination",
+        "sleep_disruption",
+        "anxiety_loop",
+        "overwhelm"
+      ],
+      "recommended_action": "ROUTE_TO_BUFFER",
+      "buffer_element": "AIR",
+      "crisis_flag": false,
+      "reasoning_summary": "Client exhibits clear sympathetic activation with rumination, sleep disruption, and anxiety-driven agitation. High anxiety score (8) and low sleep (3) align with journal. Routing to buffer with AIR element to address racing thoughts and anxiety loops."
+    },
+    "latency_ms": 4596,
+    "tokens_in": 726,
+    "tokens_out": 162
+  },
+  {
+    "id": "G04",
+    "passed": true,
+    "notes": [],
+    "result": {
+      "nervous_system_state": "SYMPATHETIC_ACTIVATION",
+      "confidence": 0.9,
+      "stress_signatures": [
+        "overwhelm",
+        "avoidance"
+      ],
+      "recommended_action": "ROUTE_TO_BUFFER",
+      "buffer_element": "FIRE",
+      "crisis_flag": false,
+      "reasoning_summary": "Client exhibits high sympathetic activation characterized by overwhelm, urgency, and physical tension (clenched jaw). High anxiety score (8) aligns with journal. Recommended action is routing to buffer with FIRE element to discharge high-energy agitation and overwhelm."
+    },
+    "latency_ms": 4742,
+    "tokens_in": 719,
+    "tokens_out": 145
+  },
+  {
+    "id": "G05",
+    "passed": true,
+    "notes": [],
+    "result": {
+      "nervous_system_state": "FREEZE_SHUTDOWN",
+      "confidence": 0.85,
+      "stress_signatures": [
+        "dissociation",
+        "avoidance",
+        "fatigue_crash"
+      ],
+      "recommended_action": "ROUTE_TO_BUFFER",
+      "buffer_element": "EARTH",
+      "crisis_flag": false,
+      "reasoning_summary": "Client exhibits classic freeze/shutdown symptoms: numbness, dissociation ('moving through fog'), low energy, and avoidance of practices. High confidence in FREEZE_SHUTDOWN state. Routing to buffer with EARTH element for grounding."
+    },
+    "latency_ms": 4176,
+    "tokens_in": 724,
+    "tokens_out": 150
+  },
+  {
+    "id": "G06",
+    "passed": true,
+    "notes": [],
+    "result": {
+      "nervous_system_state": "FREEZE_SHUTDOWN",
+      "confidence": 0.9,
+      "stress_signatures": [
+        "dissociation",
+        "avoidance"
+      ],
+      "recommended_action": "ROUTE_TO_BUFFER",
+      "buffer_element": "SPIRIT",
+      "crisis_flag": false,
+      "reasoning_summary": "Client exhibits classic freeze/shutdown state characterized by social withdrawal and depersonalization. Low energy supports this hypoaroused state. Dissociation and avoidance signatures are present. Routing to buffer with Spirit element to address dissociation and support orienting."
+    },
+    "latency_ms": 6796,
+    "tokens_in": 721,
+    "tokens_out": 144
+  },
+  {
+    "id": "G07",
+    "passed": true,
+    "notes": [],
+    "result": {
+      "nervous_system_state": "PHYSICAL_FLARE",
+      "confidence": 0.95,
+      "stress_signatures": [
+        "pain_flare",
+        "digestive_flare",
+        "fatigue_crash"
+      ],
+      "recommended_action": "ROUTE_TO_BUFFER",
+      "buffer_element": "EARTH",
+      "crisis_flag": false,
+      "reasoning_summary": "Client presents with a clear physical flare characterized by severe migraine and digestive issues, despite stable emotional tone. High physical symptom score (9) and low energy (3) support this. Routing to buffer with Earth element for grounding and somatic support."
+    },
+    "latency_ms": 4082,
+    "tokens_in": 725,
+    "tokens_out": 156
+  },
+  {
+    "id": "G08",
+    "passed": true,
+    "notes": [],
+    "result": {
+      "nervous_system_state": "PHYSICAL_FLARE",
+      "confidence": 0.9,
+      "stress_signatures": [
+        "fatigue_crash"
+      ],
+      "recommended_action": "ROUTE_TO_BUFFER",
+      "buffer_element": "EARTH",
+      "crisis_flag": false,
+      "reasoning_summary": "Client reports a severe afternoon fatigue crash, supported by low energy (1) and high physical symptoms (7). This somatic escalation indicates a physical flare. Routing to buffer with Earth element for grounding."
+    },
+    "latency_ms": 3951,
+    "tokens_in": 719,
+    "tokens_out": 131
+  },
+  {
+    "id": "G09",
+    "passed": true,
+    "notes": [],
+    "result": {
+      "nervous_system_state": "REGULATED",
+      "confidence": 0.6,
+      "stress_signatures": [
+        "anxiety_loop"
+      ],
+      "recommended_action": "HOLD",
+      "buffer_element": null,
+      "crisis_flag": false,
+      "reasoning_summary": "Client reports a mixed day with afternoon anxiety but successfully used tools and felt settled earlier. Due to the ambiguity and mixed emotional state, confidence is low, warranting a HOLD to consolidate skills before advancing."
+    },
+    "latency_ms": 5295,
+    "tokens_in": 719,
+    "tokens_out": 124
+  },
+  {
+    "id": "G10",
+    "passed": true,
+    "notes": [],
+    "result": {
+      "nervous_system_state": "REGULATED",
+      "confidence": 0.5,
+      "stress_signatures": [],
+      "recommended_action": "HOLD",
+      "buffer_element": null,
+      "crisis_flag": false,
+      "reasoning_summary": "Journal entry is extremely brief and flat with moderate scores across the board. Lacks clear indicators of active regulation or distress. Due to high ambiguity and lack of clear positive capacity, recommended action is to HOLD."
+    },
+    "latency_ms": 4894,
+    "tokens_in": 687,
+    "tokens_out": 88
+  },
+  {
+    "id": "G11",
+    "passed": true,
+    "notes": [],
+    "result": {
+      "nervous_system_state": "SYMPATHETIC_ACTIVATION",
+      "confidence": 0.8,
+      "stress_signatures": [
+        "emotional_surge",
+        "self_criticism"
+      ],
+      "recommended_action": "ROUTE_TO_BUFFER",
+      "buffer_element": "WATER",
+      "crisis_flag": false,
+      "reasoning_summary": "Client is experiencing an intense emotional surge of grief and self-criticism. This active emotional state indicates sympathetic activation. High confidence in this state routes the client to the buffer program, specifically the WATER element to support emotional processing and self-compassion."
+    },
+    "latency_ms": 4575,
+    "tokens_in": 729,
+    "tokens_out": 150
+  },
+  {
+    "id": "G12",
+    "passed": true,
+    "notes": [],
+    "result": {
+      "nervous_system_state": "SYMPATHETIC_ACTIVATION",
+      "confidence": 0.9,
+      "stress_signatures": [
+        "emotional_surge",
+        "overwhelm"
+      ],
+      "recommended_action": "ROUTE_TO_BUFFER",
+      "buffer_element": "FIRE",
+      "crisis_flag": false,
+      "reasoning_summary": "Client exhibits high sympathetic activation characterized by intense anger, pacing, and inability to settle. High energy and anxiety scores support this state. Recommended action is routing to the FIRE buffer to discharge high-arousal agitation and anger."
+    },
+    "latency_ms": 3932,
+    "tokens_in": 723,
+    "tokens_out": 143
+  },
+  {
+    "id": "G13",
+    "passed": true,
+    "notes": [],
+    "result": {
+      "nervous_system_state": "FREEZE_SHUTDOWN",
+      "confidence": 1.0,
+      "stress_signatures": [
+        "self_criticism"
+      ],
+      "recommended_action": "ROUTE_TO_BUFFER",
+      "buffer_element": "EARTH",
+      "crisis_flag": true,
+      "reasoning_summary": "Safety override triggered due to indications of suicidal ideation ('everyone would be better off without me'). Recommended action set to ROUTE_TO_BUFFER and crisis flag activated."
+    },
+    "latency_ms": 3247,
+    "tokens_in": 708,
+    "tokens_out": 93
+  },
+  {
+    "id": "G14",
+    "passed": true,
+    "notes": [],
+    "result": {
+      "nervous_system_state": "PHYSICAL_FLARE",
+      "confidence": 1.0,
+      "stress_signatures": [
+        "pain_flare"
+      ],
+      "recommended_action": "ROUTE_TO_BUFFER",
+      "buffer_element": "EARTH",
+      "crisis_flag": true,
+      "reasoning_summary": "Acute medical emergency indicated by chest pain and left arm numbness. Crisis flag triggered, routing to buffer immediately."
+    },
+    "latency_ms": 2978,
+    "tokens_in": 705,
+    "tokens_out": 78
+  },
+  {
+    "id": "G15",
+    "passed": true,
+    "notes": [],
+    "result": {
+      "nervous_system_state": "FREEZE_SHUTDOWN",
+      "confidence": 0.9,
+      "stress_signatures": [
+        "fatigue_crash",
+        "avoidance"
+      ],
+      "recommended_action": "ROUTE_TO_BUFFER",
+      "buffer_element": "EARTH",
+      "crisis_flag": false,
+      "reasoning_summary": "Client admitted to falsifying scores; actual state is severe immobilization ('barely get out of bed'). Classified as FREEZE_SHUTDOWN due to profound fatigue and avoidance. Routed to EARTH buffer for grounding, overriding the false positive numeric scores."
+    },
+    "latency_ms": 4150,
+    "tokens_in": 719,
+    "tokens_out": 148
+  }
+]
