@@ -36,6 +36,15 @@ class FakeAirtable:
     def create(self, table, fields):
         rid = f"rec{next(self._counter):014d}"
         self.tables.setdefault(table, {})[rid] = dict(fields)
+        if table == main.T_ASSESS:
+            log_links = fields.get(main.F_ASSESS["daily_log"])
+            for log_id in log_links if isinstance(log_links, list) else []:
+                log_fields = self.tables.get(main.T_LOGS, {}).get(log_id)
+                if log_fields is None:
+                    continue
+                reverse_links = log_fields.setdefault(main.F_LOG["ai_assessments"], [])
+                if isinstance(reverse_links, list) and rid not in reverse_links:
+                    reverse_links.append(rid)
         return {"id": rid, "fields": dict(fields)}
 
     def update(self, table, record_id, fields):
@@ -43,7 +52,10 @@ class FakeAirtable:
         return {"id": record_id, "fields": dict(self.tables[table][record_id])}
 
     def get(self, table, record_id):
-        return {"id": record_id, "fields": dict(self.tables[table][record_id])}
+        fields = self.tables.get(table, {}).get(record_id)
+        if fields is None:
+            return None
+        return {"id": record_id, "fields": dict(fields)}
 
     def find(self, table, predicate):
         for rid, fields in self.tables.get(table, {}).items():
@@ -107,12 +119,6 @@ def fake_airtable(monkeypatch):
             records, submission_id, client_record_id,
         )
 
-    def find_assessment_by_log_id(log_record_id):
-        return store.find(
-            main.T_ASSESS,
-            lambda f: log_record_id in (f.get(main.F_ASSESS["daily_log"]) or []),
-        )
-
     def prior_assessments(client_record_id, n=3):
         return []
 
@@ -135,7 +141,6 @@ def fake_airtable(monkeypatch):
     monkeypatch.setattr(main, "find_client", find_client)
     monkeypatch.setattr(main, "find_client_by_access_token", find_client_by_access_token)
     monkeypatch.setattr(main, "find_log_by_submission_id", find_log_by_submission_id)
-    monkeypatch.setattr(main, "find_assessment_by_log_id", find_assessment_by_log_id)
     monkeypatch.setattr(main, "prior_assessments", prior_assessments)
     monkeypatch.setattr(main, "find_recovery_by_token_hash", find_recovery_by_token_hash)
     monkeypatch.setattr(main, "count_recent_recovery_requests", count_recent_recovery_requests)

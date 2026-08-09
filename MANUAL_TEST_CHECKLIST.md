@@ -2,7 +2,7 @@
 
 Everything not marked "done locally" below needs a live Cloud Run deployment (or `python main.py` locally against real Airtable/Gemini) with real `GEMINI_API_KEY` / `AIRTABLE_API_KEY` / `WEBHOOK_SECRET` / `SESSION_SECRET` set, and must be run against **test data only**. Before starting: enroll every test participant with **Test Record** checked on the Clients table, and use email addresses you control — never a real participant's contact info. **Never trigger the safety route or medical-emergency route against a real phone number or email you don't own.**
 
-The replay/token and emergency-guidance remediation was validated locally with 230 mocked tests passing and outbound sockets blocked. This confirms mocked logic only; live Airtable, GHL, Gemini, Cloud Run, browser, and delivery behavior still require the approvals and manual checks below.
+The replay/token and emergency-guidance remediation was validated locally with 265 mocked tests passing and outbound sockets blocked. This confirms mocked logic only; live Airtable, GHL, Gemini, Cloud Run, browser, and delivery behavior still require the approvals and manual checks below.
 
 ## Status legend
 
@@ -15,13 +15,14 @@ The replay/token and emergency-guidance remediation was validated locally with 2
 ## Before you start
 
 - [ ] 🔲 Needs live Airtable/Cloud Run. `SESSION_SECRET` and `WEBHOOK_SECRET` are set to long random strings, distinct from each other, not committed anywhere.
+- [ ] 🔲 Needs Cloud Run. Confirm the deployed Python runtime version is supported by every dependency declared in `requirements.txt`, then run the mocked suite and `pip check` in that same runtime before live verification.
 - [ ] 🔲 Needs GHL workflow (not yet created). Create the new GHL workflow **"Send Check-in Link"**: Trigger = Airtable "New Record Created" on the `Recovery Requests` table, filtered to records where `Recovery Link` is not empty → Find Contact by email → Send Email containing the `Recovery Link` field value directly. That field holds the full, single-use, 30-minute fragment link (`/recover-access#rt=...`); the browser removes the fragment before same-origin POST redemption, and the Airtable field is cleared once used.
 - [ ] 🔲 Needs live Airtable/Cloud Run. The existing "Daily Check-In - Assessment" GHL workflow still targets `/assess`, which continues to call the shared `process_checkin()` core. Verify the real payload stays within the journal limit and either omits `submission_id` or supplies a canonical UUIDv4; malformed IDs now fail closed.
 - [ ] 🔲 Needs live Airtable/Cloud Run. The existing "Crisis Alert Notification" and "Safety Buffer Routing" GHL workflows are still active and untouched.
 
 ## A. Enrollment and identity
 
-- [x] ✅ Done locally. **New enrollment** creates one Clients row, does not require SMS/marketing consent to complete (`test_new_enrollment_creates_client_and_sets_cookie`, `test_enrollment_without_sms_consent_still_succeeds`).
+- [x] ✅ Done locally. **New enrollment** creates one Clients row, does not require SMS/marketing consent to complete (`test_new_enrollment_creates_client_and_uses_clean_cookie_redirect`, `test_enrollment_without_sms_consent_still_succeeds`).
 - [x] ✅ Done locally. **Consent handling**: SMS and marketing consent save independently, no cross-contamination (`test_enrollment_without_sms_consent_still_succeeds` plus the schema keeps the two fields separate).
 - [x] ✅ Done locally. **Existing email protection**: a clean browser cannot overwrite the participant profile or consent fields, rotate the durable access token, or receive an authenticated cookie; the submission uses the generic recovery process instead (`test_existing_email_enrollment_uses_generic_recovery_without_authenticating`, `test_existing_email_enrollment_cannot_overwrite_profile_or_consents`).
 - [x] ✅ Done locally. **Returning participant**: session cookie skips name/email/phone/consent fields on `/checkin` (`test_returning_participant_checkin_prefilled`).

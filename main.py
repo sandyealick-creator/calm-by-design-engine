@@ -279,6 +279,7 @@ def validate_submission_id(value):
 
 AIRTABLE_RECORD_ID_RE = re.compile(r"^rec[A-Za-z0-9]{14}$")
 MAX_REPLAY_CANDIDATES = 10
+REPLAY_QUERY_LIMIT = MAX_REPLAY_CANDIDATES + 1
 
 
 class ReplayLookupUnavailable(Exception):
@@ -347,8 +348,8 @@ def find_client_by_access_token(raw_token):
     return rec
 
 
-def _single_client_link(record, field_id):
-    """Return one valid Client record ID, or None for any malformed shape."""
+def _single_linked_record_id(record, field_id):
+    """Return one valid linked-record ID, or None for any malformed shape."""
     if not isinstance(record, dict):
         return None
     fields = record.get("fields")
@@ -361,11 +362,20 @@ def _single_client_link(record, field_id):
     return link if _valid_airtable_record_id(link) else None
 
 
-def _record_links_to_client(record, field_id, client_record_id):
+def _single_client_link(record, field_id):
+    """Return one valid Client record ID, or None for any malformed shape."""
+    return _single_linked_record_id(record, field_id)
+
+
+def _record_links_to(record, field_id, record_id):
     return (
-        _valid_airtable_record_id(client_record_id)
-        and _single_client_link(record, field_id) == client_record_id
+        _valid_airtable_record_id(record_id)
+        and _single_linked_record_id(record, field_id) == record_id
     )
+
+
+def _record_links_to_client(record, field_id, client_record_id):
+    return _record_links_to(record, field_id, client_record_id)
 
 
 def _select_owned_log_candidate(records, submission_id, client_record_id, truncated=False):
@@ -378,7 +388,11 @@ def _select_owned_log_candidate(records, submission_id, client_record_id, trunca
     submission_id = validate_submission_id(submission_id)
     if not _valid_airtable_record_id(client_record_id):
         raise ReplayLookupUnavailable()
-    if truncated or not isinstance(records, list):
+    if (
+        truncated
+        or not isinstance(records, list)
+        or len(records) > MAX_REPLAY_CANDIDATES
+    ):
         raise ReplayLookupUnavailable()
     if not records:
         return None
@@ -410,8 +424,8 @@ def find_log_by_submission_id(submission_id, client_record_id):
     formula = "{Submission ID}='%s'" % escaped_submission
     r = requests.get(f"{AT_URL}/{T_LOGS}", headers=at_headers(),
                      params={"filterByFormula": formula,
-                             "maxRecords": MAX_REPLAY_CANDIDATES,
-                             "pageSize": MAX_REPLAY_CANDIDATES,
+                             "maxRecords": REPLAY_QUERY_LIMIT,
+                             "pageSize": REPLAY_QUERY_LIMIT,
                              "returnFieldsByFieldId": "true"}, timeout=30)
     r.raise_for_status()
     payload = r.json()
@@ -423,17 +437,24 @@ def find_log_by_submission_id(submission_id, client_record_id):
     )
 
 
-def find_assessment_by_log_id(log_record_id):
-    """Look up the AI Assessment for a Daily Log directly via the
-    assessment's own Daily Log link field, rather than relying on the log's
-    reverse-link field having been populated yet."""
-    formula = "FIND('%s', ARRAYJOIN({Daily Log}))" % _airtable_string_literal(log_record_id)
-    r = requests.get(f"{AT_URL}/{T_ASSESS}", headers=at_headers(),
-                     params={"filterByFormula": formula, "maxRecords": 1,
-                             "returnFieldsByFieldId": "true"}, timeout=30)
-    r.raise_for_status()
-    recs = r.json().get("records", [])
-    return recs[0] if recs else None
+def find_assessment_for_log(log_record):
+    """Fetch one Assessment through an owned Daily Log's raw reverse link."""
+    assessment_id = _single_linked_record_id(log_record, F_LOG["ai_assessments"])
+    if assessment_id is None:
+        return None
+    try:
+        assessment = at_get(T_ASSESS, assessment_id)
+    except requests.HTTPError as exc:
+        if getattr(getattr(exc, "response", None), "status_code", None) == 404:
+            return None
+        raise
+    if (
+        not isinstance(assessment, dict)
+        or assessment.get("id") != assessment_id
+        or not isinstance(assessment.get("fields"), dict)
+    ):
+        return None
+    return assessment
 
 
 def prior_assessments(client_record_id, n=3):
@@ -729,7 +750,7 @@ def process_checkin(client_rec, physical, anxiety, energy, sleep, journal, submi
         raise ReplayLookupUnavailable()
     if existing_log:
         try:
-            existing_assessment = find_assessment_by_log_id(existing_log["id"])
+            existing_assessment = find_assessment_for_log(existing_log)
         except Exception as exc:
             if keyword_safety_triggered or keyword_medical:
                 return _build_early_emergency_result(
@@ -739,8 +760,13 @@ def process_checkin(client_rec, physical, anxiety, energy, sleep, journal, submi
                     failure_event="checkin_replay_assessment_lookup_failed",
                     error_type=type(exc).__name__)
             raise
-        if existing_assessment and _record_links_to_client(
-                existing_assessment, F_ASSESS["client"], client_id):
+        if (
+            existing_assessment
+            and _record_links_to_client(
+                existing_assessment, F_ASSESS["client"], client_id)
+            and _record_links_to(
+                existing_assessment, F_ASSESS["daily_log"], existing_log["id"])
+        ):
             return _result_from_assessment(existing_assessment)
         # A saved log without a provably owned assessment is a partial prior
         # submission. Never fall through to duplicate writes or webhooks.
@@ -1523,13 +1549,13 @@ def recovery_redeem_submit():
     if f.get(F_RECOVERY["used_at"]) or _parse_iso(f[F_RECOVERY["expires_at"]]) < now:
         return protect_redemption_response(make_response("", 400))
 
-    links = f.get(F_RECOVERY["client"]) or []
-    if not links:
+    client_id = _single_linked_record_id(rec, F_RECOVERY["client"])
+    if client_id is None:
         return protect_redemption_response(make_response("", 400))
 
     at_update(T_RECOVERY, rec["id"], {F_RECOVERY["used_at"]: now.isoformat(),
                                        F_RECOVERY["recovery_link"]: ""})
-    raw_access_token, expires = issue_access_token(links[0])
+    raw_access_token, expires = issue_access_token(client_id)
     resp = make_response("", 204)
     resp = set_access_cookie(resp, raw_access_token, expires)
     return protect_redemption_response(resp)

@@ -16,7 +16,7 @@ Participant browser                              GoHighLevel (existing, unchange
                                                                  │
                                                                  ├──▶ Gemini structured output
                                                                  │      + deterministic safety rule
-                                                                 │      (runs on every submission)
+                                                                 │      (normal eligible assessment path)
                                                                  │
                                                                  ├──▶ support score + tier
                                                                  │      (routing_config.py, central config)
@@ -93,6 +93,6 @@ python run_golden.py        # scenario eval against the live Gemini API
 ## Safety design
 
 - The support score is a deterministic, non-clinical routing signal (4-40) — never a diagnosis, medical assessment, suicide-risk score, or validated instrument.
-- Safety detection runs on every submission: Gemini's structured `safety_signal` plus a narrow deterministic keyword rule (`safety_rules.py`), combined so the strongest signal wins. The keyword rule is the only safety signal available if Gemini is unavailable or returns an invalid response (`Fallback Mode` is recorded).
+- Normal eligible assessment paths use Gemini's structured `safety_signal` when Gemini is available, combined with a narrow deterministic keyword rule (`safety_rules.py`) so the strongest signal wins. Validation, replay, rate-limit, and deterministic emergency short-circuits may finish without calling Gemini. The keyword rule remains available if Gemini is unavailable or returns an invalid response (`Fallback Mode` is recorded on processed fallback assessments).
 - The Safety Route is independent of the score — a high score alone never classifies someone as suicidal, and it always shows 988/911 resources first, states plainly that the app is not emergency care and is not monitored in real time, and offers a grounding element only as an additional option afterward, never a replacement.
 - This software supports a wellness curriculum; it does not diagnose or treat any condition. See `MANUAL_TEST_CHECKLIST.md` for what remains unsuitable for real clinical/crisis use.

@@ -215,8 +215,8 @@ def test_production_replay_formula_uses_submission_id_only(monkeypatch):
     assert formula == f"{{Submission ID}}='{replay_id}'"
     assert client_id not in formula
     assert "ARRAYJOIN" not in formula
-    assert captured["maxRecords"] == main.MAX_REPLAY_CANDIDATES
-    assert captured["pageSize"] == main.MAX_REPLAY_CANDIDATES
+    assert captured["maxRecords"] == main.MAX_REPLAY_CANDIDATES + 1
+    assert captured["pageSize"] == main.MAX_REPLAY_CANDIDATES + 1
 
 
 def test_replay_candidate_selection_handles_zero_owned_mixed_and_duplicate_states():
@@ -245,6 +245,96 @@ def test_replay_candidate_selection_handles_zero_owned_mixed_and_duplicate_state
         main._select_owned_log_candidate([{"unexpected": "shape"}], replay_id, owner)
     with pytest.raises(main.ReplayLookupUnavailable):
         main._select_owned_log_candidate([owned], replay_id, owner, truncated=True)
+
+
+def test_replay_candidate_boundary_accepts_ten_but_rejects_eleven_and_offset():
+    replay_id = submission_id_for("candidate-boundary")
+    owner = "rec00000000000001"
+
+    def record(index, client_id):
+        return {
+            "id": f"rec{index:014d}",
+            "fields": {
+                main.F_LOG["submission_id"]: replay_id,
+                main.F_LOG["client"]: [client_id],
+            },
+        }
+
+    ten = [record(2, owner)] + [
+        record(index, f"rec{index + 20:014d}") for index in range(3, 12)
+    ]
+    assert len(ten) == main.MAX_REPLAY_CANDIDATES
+    assert main._select_owned_log_candidate(ten, replay_id, owner) is ten[0]
+
+    with pytest.raises(main.ReplayLookupUnavailable):
+        main._select_owned_log_candidate(
+            ten + [record(12, "rec00000000000042")], replay_id, owner)
+    with pytest.raises(main.ReplayLookupUnavailable):
+        main._select_owned_log_candidate(ten, replay_id, owner, truncated=True)
+
+
+@pytest.mark.parametrize(
+    "record_count,has_offset,expect_result",
+    [(0, False, False), (1, False, True), (10, False, True),
+     (11, False, None), (10, True, None)],
+)
+def test_production_replay_lookup_enforces_candidate_boundary(
+    monkeypatch, record_count, has_offset, expect_result,
+):
+    replay_id = submission_id_for(f"production-boundary-{record_count}-{has_offset}")
+    owner = "rec00000000000001"
+    records = []
+    for index in range(record_count):
+        client_id = owner if index == 0 else f"rec{index + 20:014d}"
+        records.append({
+            "id": f"rec{index + 2:014d}",
+            "fields": {
+                main.F_LOG["submission_id"]: replay_id,
+                main.F_LOG["client"]: [client_id],
+            },
+        })
+    payload = {"records": records}
+    if has_offset:
+        payload["offset"] = "opaque-page-token"
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return payload
+
+    monkeypatch.setattr(main.requests, "get", lambda *args, **kwargs: Response())
+    if expect_result is None:
+        with pytest.raises(main.ReplayLookupUnavailable):
+            main.find_log_by_submission_id(replay_id, owner)
+    else:
+        result = main.find_log_by_submission_id(replay_id, owner)
+        assert (result is not None) is expect_result
+
+
+def test_fake_replay_lookup_uses_same_eleven_candidate_fail_closed_boundary(
+    fake_airtable, mock_gemini, make_client_record,
+):
+    owner = make_client_record()
+    replay_id = submission_id_for("fake-eleven-candidate-boundary")
+    fake_airtable.create(main.T_LOGS, {
+        main.F_LOG["submission_id"]: replay_id,
+        main.F_LOG["client"]: [owner["id"]],
+    })
+    for index in range(main.MAX_REPLAY_CANDIDATES):
+        foreign = make_client_record(email=f"foreign-boundary-{index}@example.com")
+        fake_airtable.create(main.T_LOGS, {
+            main.F_LOG["submission_id"]: replay_id,
+            main.F_LOG["client"]: [foreign["id"]],
+        })
+
+    with pytest.raises(main.ReplayLookupUnavailable):
+        main.process_checkin(
+            owner, 5, 5, 5, 5, "An ordinary retry.", replay_id, "Flask Web")
+    assert len(fake_airtable.find_all(main.T_LOGS)) == 11
+    assert len(fake_airtable.find_all(main.T_ASSESS)) == 0
+    assert mock_gemini.call_count() == 0
 
 
 @pytest.mark.parametrize("payload", [None, [], "records", {"records": None}, {"records": {}}])
@@ -295,6 +385,183 @@ def test_explicit_null_client_link_is_never_owned(field_id):
     }
     assert not main._record_links_to_client(
         record, field_id, "rec00000000000001")
+
+
+def test_assessment_replay_uses_reverse_link_and_direct_record_get(monkeypatch):
+    assessment_id = "rec00000000000002"
+    log_record = {
+        "id": "rec00000000000001",
+        "fields": {main.F_LOG["ai_assessments"]: [assessment_id]},
+    }
+    expected = {"id": assessment_id, "fields": {}}
+    calls = []
+    monkeypatch.setattr(
+        main, "at_get",
+        lambda table, record_id: calls.append((table, record_id)) or expected,
+    )
+    monkeypatch.setattr(
+        main.requests, "get",
+        lambda *args, **kwargs: pytest.fail("Assessment replay used a formula lookup"),
+    )
+
+    assert main.find_assessment_for_log(log_record) is expected
+    assert calls == [(main.T_ASSESS, assessment_id)]
+
+
+@pytest.mark.parametrize(
+    "assessment",
+    [
+        None,
+        [],
+        {"id": "rec00000000000999", "fields": {}},
+        {"id": "rec00000000000002", "fields": []},
+    ],
+)
+def test_direct_assessment_fetch_rejects_missing_or_malformed_responses(
+    monkeypatch, assessment,
+):
+    log_record = {
+        "id": "rec00000000000001",
+        "fields": {main.F_LOG["ai_assessments"]: ["rec00000000000002"]},
+    }
+    monkeypatch.setattr(main, "at_get", lambda *args: assessment)
+    assert main.find_assessment_for_log(log_record) is None
+
+
+def test_direct_assessment_fetch_treats_not_found_as_incomplete(monkeypatch):
+    log_record = {
+        "id": "rec00000000000001",
+        "fields": {main.F_LOG["ai_assessments"]: ["rec00000000000002"]},
+    }
+    error = main.requests.HTTPError("not found")
+    error.response = type("Response", (), {"status_code": 404})()
+    monkeypatch.setattr(
+        main, "at_get", lambda *args: (_ for _ in ()).throw(error))
+    assert main.find_assessment_for_log(log_record) is None
+
+
+@pytest.mark.parametrize(
+    "reverse_links",
+    [
+        pytest.param("missing", id="missing"),
+        pytest.param(None, id="null"),
+        pytest.param([], id="empty"),
+        pytest.param({}, id="non-list"),
+        pytest.param([["rec00000000000002"]], id="nested"),
+        pytest.param(["bad"], id="malformed"),
+        pytest.param(
+            ["rec00000000000002", "rec00000000000003"], id="multiple"),
+    ],
+)
+def test_assessment_reverse_link_shapes_fail_closed_without_side_effects(
+    fake_airtable, mock_gemini, make_client_record, reverse_links,
+):
+    client_rec = make_client_record()
+    replay_id = submission_id_for(f"assessment-reverse-{reverse_links}")
+    log_rec = fake_airtable.create(main.T_LOGS, {
+        main.F_LOG["submission_id"]: replay_id,
+        main.F_LOG["client"]: [client_rec["id"]],
+        main.F_LOG["journal"]: "An ordinary saved journal.",
+        main.F_LOG["physical"]: 5,
+        main.F_LOG["anxiety"]: 5,
+        main.F_LOG["energy"]: 5,
+        main.F_LOG["sleep"]: 5,
+    })
+    if reverse_links != "missing":
+        fake_airtable.update(
+            main.T_LOGS, log_rec["id"],
+            {main.F_LOG["ai_assessments"]: reverse_links},
+        )
+    before = {table: len(fake_airtable.find_all(table)) for table in (
+        main.T_LOGS, main.T_ASSESS, main.T_CRISIS,
+    )}
+
+    result = main.process_checkin(
+        client_rec, 5, 5, 5, 5, "An ordinary retry.", replay_id, "Flask Web")
+
+    assert result["processing_incomplete"] is True
+    assert result["response_route"] is None
+    assert result["summary"] == ""
+    assert result["trigger_reasons"] == [
+        "saved check-in assessment unavailable during replay"]
+    assert result["crisis_alert_created"] is None
+    assert mock_gemini.call_count() == 0
+    assert before == {table: len(fake_airtable.find_all(table)) for table in before}
+
+
+def test_missing_directly_fetched_assessment_fails_closed(
+    fake_airtable, mock_gemini, make_client_record,
+):
+    client_rec = make_client_record()
+    replay_id = submission_id_for("missing-direct-assessment")
+    log_rec = fake_airtable.create(main.T_LOGS, {
+        main.F_LOG["submission_id"]: replay_id,
+        main.F_LOG["client"]: [client_rec["id"]],
+        main.F_LOG["journal"]: "An ordinary saved journal.",
+        main.F_LOG["ai_assessments"]: ["rec00000000000999"],
+    })
+
+    result = main.process_checkin(
+        client_rec, 5, 5, 5, 5, "An ordinary retry.", replay_id, "Flask Web")
+
+    assert result["processing_incomplete"] is True
+    assert result["response_route"] is None
+    assert result["summary"] == ""
+    assert result["trigger_reasons"] == [
+        "saved check-in assessment unavailable during replay"]
+    assert result["crisis_alert_created"] is None
+    assert len(fake_airtable.find_all(main.T_LOGS)) == 1
+    assert len(fake_airtable.find_all(main.T_ASSESS)) == 0
+    assert mock_gemini.call_count() == 0
+    assert log_rec["id"]
+
+
+@pytest.mark.parametrize(
+    "client_links,daily_log_links",
+    [
+        (["rec00000000000999"], "owned"),
+        ("owned", ["rec00000000000999"]),
+        ("owned", ["rec00000000000001", "rec00000000000999"]),
+    ],
+)
+def test_assessment_replay_requires_exact_client_and_daily_log_relationships(
+    fake_airtable, mock_gemini, make_client_record, client_links, daily_log_links,
+):
+    client_rec = make_client_record()
+    replay_id = submission_id_for(f"assessment-rel-{client_links}-{daily_log_links}")
+    log_rec = fake_airtable.create(main.T_LOGS, {
+        main.F_LOG["submission_id"]: replay_id,
+        main.F_LOG["client"]: [client_rec["id"]],
+        main.F_LOG["journal"]: "An ordinary saved journal.",
+    })
+    resolved_client_links = (
+        [client_rec["id"]] if client_links == "owned" else client_links)
+    resolved_log_links = (
+        [log_rec["id"]] if daily_log_links == "owned" else daily_log_links)
+    assessment = fake_airtable.create(main.T_ASSESS, {
+        main.F_ASSESS["daily_log"]: resolved_log_links,
+        main.F_ASSESS["client"]: resolved_client_links,
+        main.F_ASSESS["reasoning"]: "private rejected summary",
+        main.F_ASSESS["trigger_reasons"]: '["private rejected reason"]',
+        main.F_ASSESS["response_route"]: main.ROUTE_LABELS[ROUTE_SAFETY],
+        main.F_ASSESS["owner_alert_status"]: "sent",
+    })
+    fake_airtable.update(
+        main.T_LOGS, log_rec["id"],
+        {main.F_LOG["ai_assessments"]: [assessment["id"]]},
+    )
+
+    result = main.process_checkin(
+        client_rec, 5, 5, 5, 5, "An ordinary retry.", replay_id, "Flask Web")
+
+    assert result["processing_incomplete"] is True
+    assert result["response_route"] is None
+    assert result["summary"] == ""
+    assert result["trigger_reasons"] == [
+        "saved check-in assessment unavailable during replay"]
+    assert result["crisis_alert_created"] is None
+    assert "private rejected" not in str(result)
+    assert mock_gemini.call_count() == 0
 
 
 @pytest.mark.parametrize(
@@ -427,8 +694,11 @@ def test_gemini_fallback_log_excludes_identity_content_and_raw_exception(
 ):
     journal = "private fallback journal content"
     raw_exception = "private fallback exception detail"
+    phone = "+15559871001"
     client_rec = make_client_record(
-        email="fallback-private@example.com", name="Private Participant")
+        email="fallback-private@example.com", name="Private Participant", **{
+            main.F_CLIENT["phone"]: phone,
+        })
     mock_gemini.fail(RuntimeError(raw_exception))
 
     _checkin(client_rec, STEADY, journal, "sub-fallback-private-log")
@@ -437,7 +707,7 @@ def test_gemini_fallback_log_excludes_identity_content_and_raw_exception(
     assert "gemini_fallback" in output
     for prohibited in (
         "Private Participant", "fallback-private@example.com", journal,
-        raw_exception, client_rec["id"],
+        raw_exception, phone, client_rec["id"],
     ):
         assert prohibited not in output
 
@@ -699,8 +969,8 @@ def test_replay_assessment_lookup_failure_confirms_saved_but_not_alert_state(
     )
 
     monkeypatch.setattr(
-        main, "find_assessment_by_log_id",
-        lambda log_id: (_ for _ in ()).throw(
+        main, "find_assessment_for_log",
+        lambda log_record: (_ for _ in ()).throw(
             ConnectionError(raw_exception)),
     )
     monkeypatch.setattr(
@@ -1173,8 +1443,11 @@ def test_ordinary_success_log_excludes_participant_identity_and_content(
     fake_airtable, mock_gemini, make_client_record, caplog
 ):
     journal = "private ordinary journal content"
+    phone = "+15559871002"
     client_rec = make_client_record(
-        email="ordinary-private@example.com", name="Private Participant")
+        email="ordinary-private@example.com", name="Private Participant", **{
+            main.F_CLIENT["phone"]: phone,
+        })
 
     _checkin(client_rec, STEADY, journal, "sub-ordinary-private-log")
 
@@ -1182,7 +1455,7 @@ def test_ordinary_success_log_excludes_participant_identity_and_content(
     assert '"event": "assessment"' in output
     for prohibited in (
         "Private Participant", "ordinary-private@example.com", journal,
-        client_rec["id"], submission_id_for("sub-ordinary-private-log"),
+        phone, client_rec["id"], submission_id_for("sub-ordinary-private-log"),
     ):
         assert prohibited not in output
 

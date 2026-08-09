@@ -1,4 +1,6 @@
+import json
 import re
+import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -150,6 +152,7 @@ def test_checkin_happy_path_saves_and_shows_result(client, fake_airtable, mock_g
     })
     assert resp.status_code == 200
     assert b"progress" in resp.data.lower()
+    assert main.SAFETY_FOOTER.encode() in resp.data
     assert len(fake_airtable.find_all(main.T_LOGS)) == 1
 
 
@@ -361,6 +364,88 @@ def test_redemption_script_requires_exactly_one_expected_fragment_key():
     assert "params.get(expectedKey)" not in source
 
 
+def test_redemption_script_fragment_edge_cases_execute_in_javascript():
+    script_path = Path(__file__).parents[1] / "static" / "redemption.js"
+    harness = r"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(process.argv[1], "utf8");
+
+async function runCase(pathname, hash, search, fetchOk = true) {
+  const state = {destinations: [], fetchCount: 0, cleanedPath: null};
+  const context = {
+    URLSearchParams,
+    window: {
+      location: {
+        pathname,
+        hash,
+        search,
+        replace: (destination) => state.destinations.push(destination),
+      },
+      history: {
+        replaceState: (_state, _title, path) => { state.cleanedPath = path; },
+      },
+    },
+    fetch: () => {
+      state.fetchCount += 1;
+      return Promise.resolve({ok: fetchOk});
+    },
+  };
+  vm.runInNewContext(source, context);
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  return {
+    destination: state.destinations.at(-1),
+    fetchCount: state.fetchCount,
+    cleanedPath: state.cleanedPath,
+  };
+}
+
+(async () => {
+  const token = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const results = {
+    duplicate: await runCase("/access", `#t=${token}&t=${token}`, ""),
+    extra: await runCase("/access", `#t=${token}&rt=${token}`, ""),
+    empty: await runCase("/access", "#t=", ""),
+    decode: await runCase("/access", "#t=%E0%A4%A", "", false),
+    queryOnly: await runCase("/access", "", `?t=${token}`),
+    valid: await runCase("/access", `#t=${token}`, ""),
+    validRecovery: await runCase("/recover-access", `#rt=${token}`, ""),
+  };
+  process.stdout.write(JSON.stringify(results));
+})().catch(() => process.exit(1));
+"""
+    completed = subprocess.run(
+        ["node", "-e", harness, str(script_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    results = json.loads(completed.stdout)
+
+    for case in ("duplicate", "extra", "empty", "queryOnly"):
+        assert results[case] == {
+            "destination": "/link-invalid",
+            "fetchCount": 0,
+            "cleanedPath": "/access",
+        }
+    assert results["decode"] == {
+        "destination": "/link-invalid",
+        "fetchCount": 1,
+        "cleanedPath": "/access",
+    }
+    assert results["valid"] == {
+        "destination": "/checkin",
+        "fetchCount": 1,
+        "cleanedPath": "/access",
+    }
+    assert results["validRecovery"] == {
+        "destination": "/checkin",
+        "fetchCount": 1,
+        "cleanedPath": "/recover-access",
+    }
+
+
 def test_invalid_and_expired_access_post_tokens_fail_without_reflection(
     client, fake_airtable, make_client_record
 ):
@@ -451,6 +536,66 @@ def test_recover_confirm_full_round_trip(client, fake_airtable):
     assert resp2.status_code == 400
 
 
+@pytest.mark.parametrize(
+    "client_links",
+    [
+        pytest.param("missing", id="missing"),
+        pytest.param(None, id="null"),
+        pytest.param([], id="empty"),
+        pytest.param("rec00000000000001", id="non-list"),
+        pytest.param(["bad"], id="malformed"),
+        pytest.param([["rec00000000000001"]], id="nested"),
+        pytest.param([7], id="numeric"),
+        pytest.param([{"id": "rec00000000000001"}], id="dictionary"),
+        pytest.param(
+            ["rec00000000000001", "rec00000000000002"], id="multiple"),
+    ],
+)
+def test_recovery_redemption_requires_exactly_one_valid_client_link_without_mutation(
+    client, fake_airtable, make_client_record, monkeypatch, client_links,
+):
+    participant = make_client_record(email="recovery-owner@example.com", **{
+        main.F_CLIENT["access_token_hash"]: "original-access-hash",
+    })
+    raw_token = main.new_random_token()
+    now = datetime.now(timezone.utc)
+    fields = {
+        main.F_RECOVERY["request_id"]: "malformed-recovery-owner",
+        main.F_RECOVERY["token_hash"]: main.hash_token(raw_token),
+        main.F_RECOVERY["requested_at"]: now.isoformat(),
+        main.F_RECOVERY["expires_at"]: (now + timedelta(minutes=30)).isoformat(),
+    }
+    if client_links != "missing":
+        fields[main.F_RECOVERY["client"]] = client_links
+    recovery = fake_airtable.create(main.T_RECOVERY, fields)
+    recovery_before = fake_airtable.get(main.T_RECOVERY, recovery["id"])
+    participant_before = fake_airtable.get(main.T_CLIENTS, participant["id"])
+    monkeypatch.setattr(
+        main, "at_update",
+        lambda *args, **kwargs: pytest.fail("Malformed recovery ownership was consumed"),
+    )
+    monkeypatch.setattr(
+        main, "issue_access_token",
+        lambda *args, **kwargs: pytest.fail("Malformed recovery ownership rotated a token"),
+    )
+
+    resp = client.post("/recover-access", data={"token": raw_token})
+
+    assert resp.status_code == 400
+    assert resp.data == b""
+    assert raw_token.encode() not in resp.data
+    assert fake_airtable.get(main.T_RECOVERY, recovery["id"]) == recovery_before
+    assert fake_airtable.get(main.T_CLIENTS, participant["id"]) == participant_before
+    assert not any(
+        header.startswith("cbd_token=")
+        for header in resp.headers.get_all("Set-Cookie")
+    )
+    assert resp.headers["Cache-Control"] == "no-store"
+    assert resp.headers["Referrer-Policy"] == "no-referrer"
+    assert resp.headers["Content-Security-Policy"] == main.REDEMPTION_CSP
+    assert resp.headers["X-Content-Type-Options"] == "nosniff"
+
+
 def test_recovery_query_token_and_expired_post_token_fail_generically(
     client, fake_airtable, make_client_record
 ):
@@ -498,6 +643,14 @@ def test_checkin_and_assess_submission_rate_limits_precede_processing(
     now = time.time()
     main._rate_buckets["checkin:127.0.0.1"].extend(
         [now] * main.IP_RATE_LIMIT["checkin"][0])
+    monkeypatch.setattr(
+        main, "get_current_client",
+        lambda: pytest.fail("Ordinary rate-limited check-in looked up identity"),
+    )
+    monkeypatch.setattr(
+        main, "find_client",
+        lambda *args, **kwargs: pytest.fail("Rate-limited assess looked up identity"),
+    )
     monkeypatch.setattr(
         main, "process_checkin",
         lambda *args, **kwargs: pytest.fail("Rate-limited request must not process"),
@@ -710,7 +863,8 @@ def test_multiply_linked_assessment_exposes_no_data_on_either_endpoint(
     assert browser_resp.status_code == 200
     assert "could not finish processing" in browser_body
     assert "private multiply linked" not in browser_body
-    assert "988" not in browser_body
+    assert "your safety matters right now" not in browser_body
+    assert main.SAFETY_FOOTER.lower() in browser_body
     assert "we recorded an alert" not in browser_body
     assert machine_resp.status_code == 500
     assert machine_resp.get_json() == {"error": "internal error"}
@@ -878,6 +1032,7 @@ def test_medical_emergency_result_page_shows_911_not_988(client, fake_airtable, 
     assert "911" in body
     assert "medical emergency" in body
     assert "988" not in body
+    assert main.SAFETY_FOOTER.lower() not in body
     assert "your check-in was saved" in body
     assert "we recorded an alert for white raven holistic to review" in body
     assert "cannot confirm that a notification was delivered or seen" in body
@@ -898,6 +1053,7 @@ def test_simultaneous_medical_and_safety_result_page_shows_both(client, fake_air
     body = resp.data.decode().lower()
     assert "911" in body
     assert "988" in body
+    assert main.SAFETY_FOOTER.lower() in body
     assert body.index("this may also be a medical emergency") < body.index("your safety matters right now")
     assert "your check-in was saved" in body
     assert "we recorded an alert for white raven holistic to review" in body
@@ -920,6 +1076,7 @@ def test_self_harm_success_shows_truthful_saved_and_alert_wording(
     body = resp.data.decode().lower()
     assert "988" in body
     assert "911" in body
+    assert main.SAFETY_FOOTER.lower() in body
     assert body.index("988") < body.index("if you are in immediate danger")
     assert "your check-in was saved" in body
     assert "we recorded an alert for white raven holistic to review" in body
@@ -1087,8 +1244,8 @@ def test_second_replay_lookup_failure_confirms_saved_and_unknown_alert(
     })
 
     monkeypatch.setattr(
-        main, "find_assessment_by_log_id",
-        lambda log_id: (_ for _ in ()).throw(
+        main, "find_assessment_for_log",
+        lambda log_record: (_ for _ in ()).throw(
             ConnectionError("private second replay endpoint detail")),
     )
     monkeypatch.setattr(
@@ -1391,7 +1548,8 @@ def test_retry_after_assessment_failure_preserves_guidance_without_duplicate_sid
     assert "your check-in was saved" in retry_body
     assert "could not finish processing" in retry_body
     assert "could not confirm whether an alert was recorded" in retry_body
-    assert "notification, delivery, review, or response is confirmed" in retry_body
+    assert "and no notification, delivery, review, or response is confirmed" in retry_body
+    assert "and notification, delivery, review, or response is confirmed" not in retry_body
     assert "private assessment detail" not in retry_body
     assert len(fake_airtable.find_all(main.T_LOGS)) == 1
     assert len(fake_airtable.find_all(main.T_CRISIS)) == 1
@@ -1405,6 +1563,7 @@ def test_retry_after_assessment_failure_preserves_guidance_without_duplicate_sid
 @pytest.mark.parametrize(
     "saved_journal,expect_988,expect_medical",
     [
+        ("An ordinary saved journal.", False, False),
         ("I want to die.", True, False),
         ("I have chest pain right now.", False, True),
         ("I want to die and I can't breathe.", True, True),
@@ -1441,7 +1600,11 @@ def test_partial_replay_endpoint_preserves_saved_emergency_guidance_and_order(
     })
     assert resp.status_code == 200
     body = resp.data.decode().lower()
-    assert ("988" in body) is expect_988
+    assert ("your safety matters right now" in body) is expect_988
+    if expect_988:
+        assert "988" in body
+    elif expect_medical:
+        assert "988" not in body
     if expect_medical:
         medical_heading = (
             "this may also be a medical emergency" if expect_988
@@ -1450,7 +1613,12 @@ def test_partial_replay_endpoint_preserves_saved_emergency_guidance_and_order(
         assert medical_heading in body
     assert "could not finish processing" in body
     assert "your check-in was saved" in body
-    assert "notification, delivery, review, or response is confirmed" in body
+    assert "and no notification, delivery, review, or response is confirmed" in body
+    assert "and notification, delivery, review, or response is confirmed" not in body
+    if expect_medical and not expect_988:
+        assert main.SAFETY_FOOTER.lower() not in body
+    else:
+        assert main.SAFETY_FOOTER.lower() in body
     if expect_988 and expect_medical:
         assert body.index("this may also be a medical emergency") < body.index(
             "your safety matters right now")

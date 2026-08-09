@@ -179,7 +179,7 @@ gcloud run deploy cbd-assess \
 
 ## 19. Verified behavior (this session)
 
-- **pytest: 230/230 passing** against mocked Airtable and Gemini in an isolated temporary environment, with outbound sockets blocked. No live application service or participant data was accessed.
+- **pytest: 265/265 passing** against mocked Airtable and Gemini in an isolated temporary environment, with outbound sockets blocked. No live application service or participant data was accessed.
 - **`run_golden.py` against the real Gemini API: 19/20 passing.** The one disagreement (case G07: Gemini set `distress_signal: false` where the case expected `true`, on a physical-flare entry where the participant explicitly wrote "emotionally I'm actually okay") does not change real routing for that case - the numeric score alone already places it in Heightened Support regardless of that boolean. Worth revisiting the case's expectation, not a code defect.
 - Medical-emergency and self-harm signals confirmed independent of each other in both directions, at both the keyword-backstop level and the combined-routing level.
 - Generic error page confirmed for a simulated Airtable outage; no credential or stack trace shown to the participant.
@@ -191,6 +191,7 @@ gcloud run deploy cbd-assess \
 - Mobile/browser rendering (no browser was driven this session).
 - Cross-device recovery.
 - Cloud Run deployment of this version (not deployed this session).
+- Deployed Python runtime and compatibility of every dependency declared in `requirements.txt`; rerun the mocked suite and `pip check` in that runtime before live verification.
 - Cloud Run request-log verification for the fragment-to-POST bearer redemption flow and direct remote-address rate-limit behavior.
 - The `Recovery Link` field being cleared via an empty-string PATCH against the real Airtable API (only verified against the test fake).
 

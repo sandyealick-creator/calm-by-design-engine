@@ -97,7 +97,7 @@
 {% else %}
 <p class="muted" style="margin-top:24px;">We could not confirm whether this check-in was saved. The emergency resources above are still available. Please do not wait for a response from us.</p>
 {% endif %}
-{% if response_route != "MEDICAL_EMERGENCY_ROUTE" and not processing_incomplete %}
+{% if response_route != "MEDICAL_EMERGENCY_ROUTE" %}
 <p class="muted" style="font-size:0.75rem;">{{ safety_footer }}</p>
 {% endif %}
 {% endblock %}
