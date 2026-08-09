@@ -372,7 +372,12 @@ const vm = require("vm");
 const source = fs.readFileSync(process.argv[1], "utf8");
 
 async function runCase(pathname, hash, search, fetchOk = true) {
-  const state = {destinations: [], fetchCount: 0, cleanedPath: null};
+  const state = {
+    destinations: [],
+    fetchCount: 0,
+    fetchRequest: null,
+    cleanedPath: null,
+  };
   const context = {
     URLSearchParams,
     window: {
@@ -386,8 +391,16 @@ async function runCase(pathname, hash, search, fetchOk = true) {
         replaceState: (_state, _title, path) => { state.cleanedPath = path; },
       },
     },
-    fetch: () => {
+    fetch: (url, options) => {
       state.fetchCount += 1;
+      state.fetchRequest = {
+        url,
+        method: options.method,
+        credentials: options.credentials,
+        contentType: options.headers["Content-Type"],
+        body: options.body,
+        redirect: options.redirect,
+      };
       return Promise.resolve({ok: fetchOk});
     },
   };
@@ -397,6 +410,7 @@ async function runCase(pathname, hash, search, fetchOk = true) {
   return {
     destination: state.destinations.at(-1),
     fetchCount: state.fetchCount,
+    fetchRequest: state.fetchRequest,
     cleanedPath: state.cleanedPath,
   };
 }
@@ -427,21 +441,36 @@ async function runCase(pathname, hash, search, fetchOk = true) {
         assert results[case] == {
             "destination": "/link-invalid",
             "fetchCount": 0,
+            "fetchRequest": None,
             "cleanedPath": "/access",
         }
-    assert results["decode"] == {
-        "destination": "/link-invalid",
-        "fetchCount": 1,
-        "cleanedPath": "/access",
-    }
+    assert results["decode"]["destination"] == "/link-invalid"
+    assert results["decode"]["fetchCount"] == 1
+    assert results["decode"]["cleanedPath"] == "/access"
     assert results["valid"] == {
         "destination": "/checkin",
         "fetchCount": 1,
+        "fetchRequest": {
+            "url": "/access",
+            "method": "POST",
+            "credentials": "same-origin",
+            "contentType": "application/x-www-form-urlencoded",
+            "body": "token=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "redirect": "error",
+        },
         "cleanedPath": "/access",
     }
     assert results["validRecovery"] == {
         "destination": "/checkin",
         "fetchCount": 1,
+        "fetchRequest": {
+            "url": "/recover-access",
+            "method": "POST",
+            "credentials": "same-origin",
+            "contentType": "application/x-www-form-urlencoded",
+            "body": "token=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "redirect": "error",
+        },
         "cleanedPath": "/recover-access",
     }
 

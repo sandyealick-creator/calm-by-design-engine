@@ -21,7 +21,7 @@ Participant browser                          GoHighLevel (existing, separate)
                                                          +--> Daily Log (Airtable)
                                                          +--> Gemini structured classification
                                                          |      + deterministic keyword backstops
-                                                         |      (safety_rules.py), run on every submission
+                                                         |      (safety_rules.py), independent of Gemini
                                                          +--> support score + tier (routing_config.py)
                                                          +--> response route decision
                                                          |      +--> AI Assessment record (Airtable)
@@ -73,7 +73,7 @@ Grounding/Heightened routes select one of five elements (Earth, Air, Fire, Water
 
 A **separate safety override**, not a sixth wellness tier - `routing_config.route()` itself is unchanged. `process_checkin()` checks for a medical-emergency signal before calling `route()`:
 
-- Detected independently via Gemini's `medical_emergency_signal` (boolean, added to the structured schema) **and** a deterministic keyword backstop (`safety_rules.check_medical_emergency()`) that runs on every submission, not just as a Gemini-outage fallback. Narrow phrase list: chest pain, can't breathe, stroke signs, severe bleeding, anaphylaxis, active seizure, loss of consciousness. Excludes negated, historical/past-tense, third-person ("my dad had..."), and quoted language.
+- Detected independently via Gemini's `medical_emergency_signal` (boolean, added to the structured schema) **and** a deterministic keyword backstop (`safety_rules.check_medical_emergency()`) that is independent of Gemini, not just a Gemini-outage fallback. Gemini may run on normal eligible assessment paths when available; emergency, validation-failure, replay, rate-limit, and other short-circuit paths may return without calling it. Narrow phrase list: chest pain, can't breathe, stroke signs, severe bleeding, anaphylaxis, active seizure, loss of consciousness. Excludes negated, historical/past-tense, third-person ("my dad had..."), and quoted language.
 - **Routing:** if a medical-emergency signal is present and self-harm/suicide language is *not*, the route is `MEDICAL_EMERGENCY_ROUTE`: on-screen 911/emergency-care guidance, **no 988 mention anywhere on that page** (including the small-print safety footer, which is suppressed specifically on this route since it otherwise mentions 988), and **no grounding/element practice at all** (not even as a secondary option - movement/breathing practices are treated as inappropriate advice mid-emergency). No curriculum movement.
 - If self-harm language **is also** present, `SAFETY_ROUTE` wins for routing and curriculum purposes (unchanged self-harm behavior), but the medical signal is still recorded and the result page shows **both** the 911 medical block and the 988 self-harm block.
 - A Crisis Alert record is created for both the medical-only and the combined case (reusing the existing Crisis Alerts table), with the alert ID and reasoning prefixed `MEDICAL_EMERGENCY`, `SELF_HARM`, or `SELF_HARM_AND_MEDICAL_EMERGENCY` so a human reading the alert can tell which occurred. Owner notification is explicitly framed as supplemental, not guaranteed or real-time monitored, in both code comments and participant-facing copy.
@@ -81,7 +81,7 @@ A **separate safety override**, not a sixth wellness tier - `routing_config.rout
 
 ## 7. Suicide/self-harm safety override (unchanged in this session)
 
-`safety_rules.check_safety()` plus Gemini's `safety_signal` (`none`/`ambiguous`/`direct_self_harm`/`imminent_danger`), combined so the strongest of the two wins; `Safety Trigger Source` records which one fired (`gemini`/`keyword_rule`/`both`). Runs on every submission. Distinguishes negation, third person, historical/resolved, and quoted language from direct current first-person intent. A high support score alone never triggers this route.
+On normal eligible assessment paths where Gemini is available, `safety_rules.check_safety()` and Gemini's `safety_signal` (`none`/`ambiguous`/`direct_self_harm`/`imminent_danger`) are combined so the strongest wins; `Safety Trigger Source` records which one fired (`gemini`/`keyword_rule`/`both`). The deterministic rule is independent of Gemini and remains available on supported emergency and fallback paths. Validation-failure, replay, rate-limit, and other short-circuit paths may return without calling Gemini. The rule distinguishes negation, third person, historical/resolved, and quoted language from direct current first-person intent. A high support score alone never triggers this route.
 
 ## 8. Curriculum progression and timing safeguards
 
@@ -90,7 +90,7 @@ A **separate safety override**, not a sixth wellness tier - `routing_config.rout
 ## 9. Participant token, cookie, recovery-link, expiration, revocation
 
 - **Access token**: `secrets.token_urlsafe(32)`, never stored raw - only its SHA-256 hash, on `Clients.Access Token Hash`, with `Access Token Issued At` / `Access Token Expires At` (90-day TTL). The cookie (`cbd_token`, HttpOnly/Secure/SameSite=Lax) holds the raw token directly. Saved access links use `/access#t=...`; the fragment is removed with `history.replaceState` before a same-origin POST-body exchange. Query-token redemption is rejected. Controlled Cloud Run verification must still confirm the deployed request-log behavior.
-- **Revocation**: requesting a new link via `/recover` rotates (overwrites) the stored hash, immediately invalidating the previous token - no separate revoke action exists or is needed.
+- **Revocation**: requesting a link via `/recover` creates a separate short-lived Recovery Request and does not rotate, replace, or revoke the durable access token. Only after the recovery link is successfully redeemed and its required validation succeeds does the app rotate the stored durable access-token hash, invalidating the previous durable token.
 - **Recovery token**: separate, single-use, 30-minute TTL, stored hashed on the `Recovery Requests` table, plus a plaintext `Recovery Link` field (the full URL) that the pending GHL workflow reads to email it - see field notes below for why this one field is deliberately plaintext.
 - **CSRF token**: a per-page-load random value, set as a matching cookie and hidden form field (double-submit pattern), generated via `SESSION_SECRET`.
 - **Rate limiting**: in-process, per-IP, on `/enroll` and `/recover` (10/hour each); resets on instance restart and doesn't share state across multiple Cloud Run instances - a documented tradeoff for current traffic levels, not a production guarantee.
@@ -120,7 +120,7 @@ Fields added this build cycle (all additive, created via the Airtable MCP with e
 |---|---|
 | `main.py` | Flask app: all routes, the shared `process_checkin()` core, token/session/CSRF, Airtable I/O, curriculum state machine, error handling. |
 | `routing_config.py` | Support score formula, tiers, the five wellness routes' `route()` function, curriculum constants. Medical-emergency route constant lives here but the override logic itself lives in `main.py`. |
-| `safety_rules.py` | Deterministic keyword backstops: `check_safety()` (self-harm) and `check_medical_emergency()` (medical), both independent, both run on every submission. |
+| `safety_rules.py` | Deterministic keyword backstops: `check_safety()` (self-harm) and `check_medical_emergency()` (medical), both independent of Gemini and used on supported shared-core emergency and fallback paths. |
 | `elements_content.py` | Earth/Air/Fire/Water/Spirit practice content and anti-repeat element selection. |
 | `system_prompt.txt` | Gemini system instruction; defines the structured output schema's intent field by field. |
 | `templates/*.html` | Participant-facing pages: enroll, checkin, recover, result (all five routes + medical emergency + combined case), link_invalid, error, base layout. |
