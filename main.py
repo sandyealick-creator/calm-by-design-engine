@@ -547,10 +547,37 @@ def process_checkin(client_rec, physical, anxiety, energy, sleep, journal, submi
     cf = client_rec["fields"]
     client_name = cf.get(F_CLIENT["name"], "Unknown")
 
+    # Run both deterministic backstops before any Airtable operation in this
+    # shared core. If persistence is unavailable, clear current emergency
+    # language must still produce the participant-facing 988/911 resources.
+    keyword_signal, _keyword_phrase = check_safety(journal)
+    keyword_medical, keyword_medical_phrase = check_medical_emergency(journal)
+    keyword_safety_triggered = is_safety_triggering(keyword_signal)
+
     if submission_id:
-        existing_log = find_log_by_submission_id(submission_id)
+        try:
+            existing_log = find_log_by_submission_id(submission_id)
+        except Exception as exc:
+            if keyword_safety_triggered or keyword_medical:
+                return _build_early_emergency_result(
+                    None, physical, anxiety, energy, sleep,
+                    keyword_safety_triggered, keyword_medical,
+                    checkin_saved=None, crisis_alert_created=None,
+                    failure_event="checkin_replay_log_lookup_failed",
+                    error_type=type(exc).__name__)
+            raise
         if existing_log:
-            existing_assessment = find_assessment_by_log_id(existing_log["id"])
+            try:
+                existing_assessment = find_assessment_by_log_id(existing_log["id"])
+            except Exception as exc:
+                if keyword_safety_triggered or keyword_medical:
+                    return _build_early_emergency_result(
+                        None, physical, anxiety, energy, sleep,
+                        keyword_safety_triggered, keyword_medical,
+                        checkin_saved=True, crisis_alert_created=None,
+                        failure_event="checkin_replay_assessment_lookup_failed",
+                        error_type=type(exc).__name__)
+                raise
             if existing_assessment:
                 return _result_from_assessment(existing_assessment)
 
@@ -559,21 +586,27 @@ def process_checkin(client_rec, physical, anxiety, energy, sleep, journal, submi
     tier = score_tier(score)
     submission_id = submission_id or str(uuid.uuid4())
 
-    log_rec = at_create(T_LOGS, {
-        F_LOG["log_id"]: f"{client_name}-{today}-{submission_id[:8]}",
-        F_LOG["date"]: today,
-        F_LOG["journal"]: journal,
-        F_LOG["sleep"]: sleep,
-        F_LOG["energy"]: energy,
-        F_LOG["anxiety"]: anxiety,
-        F_LOG["physical"]: physical,
-        F_LOG["source"]: source,
-        F_LOG["client"]: [client_id],
-        F_LOG["submission_id"]: submission_id,
-    })
-
-    keyword_signal, _keyword_phrase = check_safety(journal)
-    keyword_medical, keyword_medical_phrase = check_medical_emergency(journal)
+    try:
+        log_rec = at_create(T_LOGS, {
+            F_LOG["log_id"]: f"{client_name}-{today}-{submission_id[:8]}",
+            F_LOG["date"]: today,
+            F_LOG["journal"]: journal,
+            F_LOG["sleep"]: sleep,
+            F_LOG["energy"]: energy,
+            F_LOG["anxiety"]: anxiety,
+            F_LOG["physical"]: physical,
+            F_LOG["source"]: source,
+            F_LOG["client"]: [client_id],
+            F_LOG["submission_id"]: submission_id,
+        })
+    except Exception as exc:
+        if keyword_safety_triggered or keyword_medical:
+            return _build_early_emergency_result(
+                client_rec, physical, anxiety, energy, sleep,
+                keyword_safety_triggered, keyword_medical,
+                checkin_saved=False, failure_event="daily_log_create_failed",
+                error_type=type(exc).__name__, attempt_crisis_alert=True)
+        raise
 
     fallback_mode = False
     fallback_reason = ""
@@ -615,7 +648,7 @@ def process_checkin(client_rec, physical, anxiety, energy, sleep, journal, submi
         confidence = 0.0
         summary = "Gemini was unavailable or returned an invalid response; deterministic fallback used."
 
-    safety_triggered = is_safety_triggering(gemini_safety) or is_safety_triggering(keyword_signal)
+    safety_triggered = is_safety_triggering(gemini_safety) or keyword_safety_triggered
     if is_safety_triggering(gemini_safety) and is_safety_triggering(keyword_signal):
         safety_source = "both"
     elif is_safety_triggering(gemini_safety):
@@ -689,7 +722,6 @@ def process_checkin(client_rec, physical, anxiety, energy, sleep, journal, submi
             "Yes" if response_route in (ROUTE_SAFETY, ROUTE_MEDICAL_EMERGENCY) else "No"),
         F_ASSESS["buffer_element"]: element,
         F_ASSESS["app_version"]: APP_VERSION,
-        F_ASSESS["owner_alert_status"]: "not_applicable",
         F_ASSESS["ghl_action"]: "",
     }
 
@@ -709,33 +741,52 @@ def process_checkin(client_rec, physical, anxiety, energy, sleep, journal, submi
             alert_category = "SELF_HARM"
 
         assess_fields[F_ASSESS["crisis"]] = True
-        crisis_rec = None
-        try:
-            crisis_rec = at_create(T_CRISIS, {
-                F_CRISIS["alert_id"]: f"{client_name}-{today}-{alert_category}",
-                F_CRISIS["client"]: [client_id],
-                F_CRISIS["client_name"]: client_name,
-                F_CRISIS["client_email"]: cf.get(F_CLIENT["email"]),
-                F_CRISIS["reasoning"]: f"[{alert_category}] {(summary or '')[:480]}",
-                F_CRISIS["flagged_at"]: datetime.now(timezone.utc).isoformat(),
-            })
-            assess_fields[F_ASSESS["owner_alert_status"]] = "sent"
+        crisis_rec = _try_create_crisis_alert(client_rec, alert_category, summary)
+        crisis_alert_created = crisis_rec is not None
+        assess_fields[F_ASSESS["crisis_alert"]] = "Yes" if crisis_alert_created else "No"
+
+        if crisis_alert_created:
             hook = os.environ.get("GHL_CRISIS_WEBHOOK")
             if hook and cf.get(F_CLIENT["sms_consent"]):
-                requests.post(hook, json={"type": alert_category, "client": client_name,
-                                          "email": cf.get(F_CLIENT["email"])}, timeout=15)
-                assess_fields[F_ASSESS["ghl_action"]] = "crisis_webhook_sent"
-        except Exception:
-            assess_fields[F_ASSESS["owner_alert_status"]] = "failed"
-            log.info(json.dumps({"event": "owner_alert_failed", "client": client_name,
-                                 "category": alert_category}))
+                try:
+                    hook_response = requests.post(
+                        hook,
+                        json={"type": alert_category, "client": client_name,
+                              "email": cf.get(F_CLIENT["email"])},
+                        timeout=15,
+                    )
+                    hook_response.raise_for_status()
+                    # This records only that the webhook endpoint accepted the
+                    # request. It is never treated as proof of email/SMS delivery.
+                    assess_fields[F_ASSESS["ghl_action"]] = "crisis_webhook_sent"
+                except Exception as exc:
+                    _log_persistence_failure("crisis_webhook_failed", type(exc).__name__)
 
-        assess_rec = at_create(T_ASSESS, assess_fields)
-        if crisis_rec:
-            at_update(T_CRISIS, crisis_rec["id"], {F_CRISIS["assessment"]: [assess_rec["id"]]})
-        at_update(T_LOGS, log_rec["id"], {F_LOG["processed"]: True})
+        assess_rec = None
+        later_processing_failed = False
+        try:
+            assess_rec = at_create(T_ASSESS, assess_fields)
+        except Exception as exc:
+            later_processing_failed = True
+            _log_persistence_failure("ai_assessment_create_failed", type(exc).__name__)
+        if assess_rec:
+            if crisis_rec:
+                try:
+                    at_update(T_CRISIS, crisis_rec["id"], {
+                        F_CRISIS["assessment"]: [assess_rec["id"]]})
+                except Exception as exc:
+                    later_processing_failed = True
+                    _log_persistence_failure("crisis_alert_link_failed", type(exc).__name__)
+            try:
+                at_update(T_LOGS, log_rec["id"], {F_LOG["processed"]: True})
+            except Exception as exc:
+                later_processing_failed = True
+                _log_persistence_failure("daily_log_processed_update_failed", type(exc).__name__)
         return _build_result(response_route, score, tier, element, summary, trigger_reasons,
-                             fallback_mode, medical_emergency_triggered=medical_triggered)
+                             fallback_mode, medical_emergency_triggered=medical_triggered,
+                             checkin_saved=True,
+                             crisis_alert_created=crisis_alert_created,
+                             later_processing_failed=later_processing_failed)
 
     # -- curriculum update --
     action = curriculum_action(response_route)
@@ -777,6 +828,7 @@ def process_checkin(client_rec, physical, anxiety, energy, sleep, journal, submi
         except Exception:
             ghl_action = "routing_webhook_failed"
     assess_fields[F_ASSESS["ghl_action"]] = ghl_action
+    assess_fields[F_ASSESS["owner_alert_status"]] = "not_applicable"
 
     at_create(T_ASSESS, assess_fields)
     at_update(T_LOGS, log_rec["id"], {F_LOG["processed"]: True})
@@ -791,7 +843,9 @@ def process_checkin(client_rec, physical, anxiety, energy, sleep, journal, submi
 
 
 def _build_result(response_route, score, tier, element, summary, trigger_reasons, fallback_mode,
-                  medical_emergency_triggered=False):
+                  medical_emergency_triggered=False, checkin_saved=True,
+                  crisis_alert_created=False, owner_notification_confirmed=False,
+                  http_status=200, later_processing_failed=False):
     return {
         "response_route": response_route,
         "response_route_label": ROUTE_LABELS[response_route],
@@ -804,8 +858,77 @@ def _build_result(response_route, score, tier, element, summary, trigger_reasons
         "trigger_reasons": trigger_reasons,
         "fallback_mode": fallback_mode,
         "medical_emergency_triggered": medical_emergency_triggered,
+        "checkin_saved": checkin_saved,
+        "crisis_alert_created": crisis_alert_created,
+        "owner_notification_confirmed": owner_notification_confirmed,
+        "http_status": http_status,
+        "later_processing_failed": later_processing_failed,
         "safety_footer": SAFETY_FOOTER,
     }
+
+
+def _log_persistence_failure(event, error_type):
+    """Log only operational state, never participant identity or content."""
+    log.info(json.dumps({"event": event, "error_type": error_type}))
+
+
+def _try_create_crisis_alert(client_rec, alert_category, summary):
+    """Best-effort Crisis Alert creation.
+
+    A returned record proves only that Airtable accepted the alert record. It
+    does not prove that GHL delivered a notification or that a person saw it.
+    """
+    cf = client_rec["fields"]
+    client_name = cf.get(F_CLIENT["name"], "Unknown")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        return at_create(T_CRISIS, {
+            F_CRISIS["alert_id"]: f"{client_name}-{today}-{alert_category}",
+            F_CRISIS["client"]: [client_rec["id"]],
+            F_CRISIS["client_name"]: client_name,
+            F_CRISIS["client_email"]: cf.get(F_CLIENT["email"]),
+            F_CRISIS["reasoning"]: f"[{alert_category}] {(summary or '')[:480]}",
+            F_CRISIS["flagged_at"]: datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as exc:
+        _log_persistence_failure("crisis_alert_create_failed", type(exc).__name__)
+        return None
+
+
+def _build_early_emergency_result(client_rec, physical, anxiety, energy, sleep,
+                                  safety_triggered, medical_triggered,
+                                  checkin_saved, failure_event, error_type,
+                                  crisis_alert_created=False,
+                                  attempt_crisis_alert=False):
+    """Build deterministic emergency guidance when Airtable blocks the
+    normal assessment flow. Gemini is deliberately not called here."""
+    _log_persistence_failure(failure_event, error_type)
+    score = support_score(physical, anxiety, energy, sleep)
+    tier = score_tier(score)
+    response_route = (
+        ROUTE_SAFETY if safety_triggered else ROUTE_MEDICAL_EMERGENCY)
+    if safety_triggered and medical_triggered:
+        alert_category = "SELF_HARM_AND_MEDICAL_EMERGENCY"
+    elif safety_triggered:
+        alert_category = "SELF_HARM"
+    else:
+        alert_category = "MEDICAL_EMERGENCY"
+
+    if attempt_crisis_alert and client_rec is not None:
+        crisis_alert_created = _try_create_crisis_alert(
+            client_rec, alert_category,
+            "Deterministic emergency backstop triggered while check-in persistence was unavailable.") is not None
+
+    return _build_result(
+        response_route, score, tier, None, "",
+        ["deterministic emergency backstop used during persistence outage"],
+        fallback_mode=False,
+        medical_emergency_triggered=medical_triggered,
+        checkin_saved=checkin_saved,
+        crisis_alert_created=crisis_alert_created,
+        owner_notification_confirmed=False,
+        http_status=503,
+    )
 
 
 def _result_from_assessment(assess_record):
@@ -825,10 +948,21 @@ def _result_from_assessment(assess_record):
     # duplicate-submission replay still renders the medical banner correctly.
     medical_emergency_triggered = any(
         isinstance(r, str) and r.startswith("medical_emergency_signal: true") for r in reasons)
+    owner_status = f.get(F_ASSESS["owner_alert_status"])
+    if owner_status == "sent":
+        crisis_alert_created = True  # legacy records: set only after alert creation
+    elif owner_status == "failed":
+        # Historical "failed" could mean either Crisis Alert creation failed
+        # or a later optional webhook failed after the record was created.
+        crisis_alert_created = None
+    else:
+        crisis_alert_created = f.get(F_ASSESS["crisis_alert"]) == "Yes"
     return _build_result(route_key, f.get(F_ASSESS["support_score"], 0), tier_key, element,
                          f.get(F_ASSESS["reasoning"], ""), reasons,
                          bool(f.get(F_ASSESS["fallback_mode"])),
-                         medical_emergency_triggered=medical_emergency_triggered)
+                         medical_emergency_triggered=medical_emergency_triggered,
+                         checkin_saved=True,
+                         crisis_alert_created=crisis_alert_created)
 
 
 # ---------------------------------------------------------------------------
@@ -866,7 +1000,16 @@ def assess():
                              scores["energy"], scores["sleep"], journal,
                              data.get("submission_id") or str(uuid.uuid4()),
                              data.get("source", "GHL Form"))
-    return jsonify({"status": "ok", **{k: v for k, v in result.items() if k != "element"}}), 200
+    if result.get("http_status", 200) != 200 or result.get("later_processing_failed", False):
+        # Preserve the established /assess failure contract. Participant-facing
+        # emergency rendering and endpoint-specific status handling belong to /checkin.
+        return jsonify({"error": "internal error"}), 500
+    internal_keys = {
+        "element", "checkin_saved", "crisis_alert_created",
+        "owner_notification_confirmed", "http_status", "later_processing_failed",
+    }
+    return jsonify({"status": "ok",
+                    **{k: v for k, v in result.items() if k not in internal_keys}}), 200
 
 
 # ---------------------------------------------------------------------------
@@ -955,14 +1098,19 @@ def checkin_form():
 
 @app.post("/checkin")
 def checkin_submit():
-    client_rec = get_current_client()
-    if not client_rec:
+    identity_error = None
+    try:
+        client_rec = get_current_client()
+    except Exception as exc:
+        client_rec = None
+        identity_error = exc
+
+    if identity_error is None and not client_rec:
         return no_store(redirect("/recover"))
 
     if not valid_csrf():
         return no_store(make_response(render_template("link_invalid.html"), 400))
 
-    name = client_rec["fields"].get(F_CLIENT["name"], "there")
     submission_id = request.form.get("submission_id") or str(uuid.uuid4())
     journal = (request.form.get("journal") or "").strip()
 
@@ -976,13 +1124,35 @@ def checkin_submit():
         if not journal:
             raise ValueError
     except ValueError:
+        if identity_error is not None:
+            raise identity_error
+        name = client_rec["fields"].get(F_CLIENT["name"], "there")
         return no_store(csrf_render(
             "checkin.html", name=name, submission_id=submission_id,
             error="Please enter a whole number from 1 to 10 for each rating, and a journal entry."))
 
+    if identity_error is not None:
+        keyword_signal, _ = check_safety(journal)
+        keyword_medical, _ = check_medical_emergency(journal)
+        keyword_safety_triggered = is_safety_triggering(keyword_signal)
+        if keyword_safety_triggered or keyword_medical:
+            result = _build_early_emergency_result(
+                None, physical, anxiety, energy, sleep,
+                keyword_safety_triggered, keyword_medical,
+                checkin_saved=False,
+                failure_event="checkin_identity_lookup_failed",
+                error_type=type(identity_error).__name__)
+            http_status = result.pop("http_status", 503)
+            result.pop("later_processing_failed", None)
+            return no_store(make_response(
+                render_template("result.html", **result), http_status))
+        raise identity_error
+
     result = process_checkin(client_rec, physical, anxiety, energy, sleep, journal,
                              submission_id, "Flask Web")
-    return no_store(make_response(render_template("result.html", **result)))
+    http_status = result.pop("http_status", 200)
+    result.pop("later_processing_failed", None)
+    return no_store(make_response(render_template("result.html", **result), http_status))
 
 
 # ---------------------------------------------------------------------------

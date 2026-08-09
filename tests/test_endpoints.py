@@ -1,5 +1,7 @@
 import re
 
+import pytest
+
 import main
 
 CSRF_RE = re.compile(r'name="csrf_token" value="([^"]+)"')
@@ -233,7 +235,110 @@ def test_assess_webhook_happy_path(client, fake_airtable, mock_gemini, make_clie
                        json={"journal_text": "GHL entry", "email": "ghl@example.com",
                              "sleep": 5, "energy": 5, "anxiety": 5, "physical_symptoms": 5})
     assert resp.status_code == 200
-    assert resp.get_json()["status"] == "ok"
+    payload = resp.get_json()
+    assert payload["status"] == "ok"
+    assert set(payload) == {
+        "status", "response_route", "response_route_label", "score", "tier",
+        "tier_label", "element_name", "summary", "trigger_reasons",
+        "fallback_mode", "medical_emergency_triggered", "safety_footer",
+    }
+
+
+def test_assess_webhook_persistence_failure_preserves_previous_error_contract(
+    client, fake_airtable, make_client_record, monkeypatch
+):
+    make_client_record(email="ghl-outage@example.com")
+    original_create = main.at_create
+
+    def fail_daily_log(table, fields):
+        if table == main.T_LOGS:
+            raise ConnectionError("private GHL persistence detail")
+        return original_create(table, fields)
+
+    monkeypatch.setattr(main, "at_create", fail_daily_log)
+    monkeypatch.setattr(
+        main, "run_assessment",
+        lambda *args, **kwargs: pytest.fail("Gemini must not run after Daily Log failure"),
+    )
+    resp = client.post(
+        "/assess",
+        headers={"X-Webhook-Secret": "test-webhook-secret"},
+        json={
+            "journal_text": "I want to die.", "email": "ghl-outage@example.com",
+            "sleep": 5, "energy": 5, "anxiety": 5, "physical_symptoms": 5,
+            "submission_id": "sub-ghl-outage",
+        },
+    )
+
+    assert resp.status_code == 500
+    assert resp.get_json() == {"error": "internal error"}
+    assert b"private GHL persistence detail" not in resp.data
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    ["assessment_create", "crisis_link", "processed_update"],
+)
+def test_assess_later_persistence_failure_preserves_generic_error_contract(
+    client, fake_airtable, mock_gemini, make_client_record, monkeypatch, caplog,
+    failure_point,
+):
+    participant_email = f"assess-{failure_point}@example.com"
+    journal = "I want to die."
+    sensitive_token = "test-sensitive-access-token"
+    sensitive_record_id = "rec-sensitive-record-id"
+    raw_exception = (
+        f"private later persistence detail Jane Doe {participant_email} "
+        f"{journal} {sensitive_token} {sensitive_record_id}"
+    )
+    make_client_record(email=participant_email, **{
+        main.F_CLIENT["access_token_hash"]: sensitive_token,
+    })
+    original_create = main.at_create
+    original_update = main.at_update
+
+    def maybe_fail_create(table, fields):
+        if failure_point == "assessment_create" and table == main.T_ASSESS:
+            raise ConnectionError(raw_exception)
+        return original_create(table, fields)
+
+    def maybe_fail_update(table, record_id, fields):
+        if failure_point == "crisis_link" and table == main.T_CRISIS:
+            raise ConnectionError(f"{raw_exception} {record_id}")
+        if (failure_point == "processed_update" and table == main.T_LOGS
+                and fields.get(main.F_LOG["processed"])):
+            raise ConnectionError(f"{raw_exception} {record_id}")
+        return original_update(table, record_id, fields)
+
+    monkeypatch.setattr(main, "at_create", maybe_fail_create)
+    monkeypatch.setattr(main, "at_update", maybe_fail_update)
+    resp = client.post(
+        "/assess",
+        headers={"X-Webhook-Secret": "test-webhook-secret"},
+        json={
+            "journal_text": journal, "email": participant_email,
+            "sleep": 5, "energy": 5, "anxiety": 5, "physical_symptoms": 5,
+            "submission_id": f"sub-assess-{failure_point}",
+        },
+    )
+
+    assert resp.status_code == 500
+    payload = resp.get_json()
+    assert payload == {"error": "internal error"}
+    assert "status" not in payload
+    for internal_key in (
+        "checkin_saved", "crisis_alert_created", "owner_notification_confirmed",
+        "later_processing_failed", "http_status",
+    ):
+        assert internal_key not in payload
+    response_text = resp.data.decode()
+    log_output = caplog.text
+    for sensitive_value in (
+        "Jane Doe", participant_email, journal, sensitive_token,
+        sensitive_record_id, raw_exception,
+    ):
+        assert sensitive_value not in response_text
+        assert sensitive_value not in log_output
 
 
 def test_airtable_unavailable_shows_generic_error(client, fake_airtable, monkeypatch):
@@ -271,6 +376,11 @@ def test_medical_emergency_result_page_shows_911_not_988(client, fake_airtable, 
     assert "911" in body
     assert "medical emergency" in body
     assert "988" not in body
+    assert "your check-in was saved" in body
+    assert "we recorded an alert for white raven holistic to review" in body
+    assert "cannot confirm that a notification was delivered or seen" in body
+    assert "we've also let white raven holistic know" not in body
+    assert "if it helps while you reach out" not in body
 
 
 def test_simultaneous_medical_and_safety_result_page_shows_both(client, fake_airtable, mock_gemini):
@@ -286,3 +396,478 @@ def test_simultaneous_medical_and_safety_result_page_shows_both(client, fake_air
     body = resp.data.decode().lower()
     assert "911" in body
     assert "988" in body
+    assert body.index("this may also be a medical emergency") < body.index("your safety matters right now")
+    assert "your check-in was saved" in body
+    assert "we recorded an alert for white raven holistic to review" in body
+    assert "cannot confirm that a notification was delivered or seen" in body
+    assert "we've also let white raven holistic know" not in body
+
+
+def test_self_harm_success_shows_truthful_saved_and_alert_wording(
+    client, fake_airtable, mock_gemini
+):
+    enroll(client, email="self-harm-success@example.com")
+    csrf = extract_csrf(client.get("/checkin").data)
+    resp = client.post("/checkin", data={
+        "csrf_token": csrf, "submission_id": "sub-self-harm-success",
+        "physical_symptoms": "5", "anxiety": "5", "energy": "5", "sleep": "5",
+        "journal": "I want to die.",
+    })
+
+    assert resp.status_code == 200
+    body = resp.data.decode().lower()
+    assert "988" in body
+    assert "911" in body
+    assert body.index("988") < body.index("if you are in immediate danger")
+    assert "your check-in was saved" in body
+    assert "we recorded an alert for white raven holistic to review" in body
+    assert "cannot confirm that a notification was delivered or seen" in body
+    assert "we've also let white raven holistic know" not in body
+    assert "white raven holistic was notified" not in body
+
+
+@pytest.mark.parametrize(
+    "journal,expect_988,expect_combined",
+    [
+        ("I want to die.", True, False),
+        ("I have chest pain right now.", False, False),
+        ("I want to die and I can't breathe.", True, True),
+    ],
+)
+def test_identity_lookup_failure_preserves_deterministic_emergency_resources(
+    client, fake_airtable, mock_gemini, monkeypatch, caplog,
+    journal, expect_988, expect_combined,
+):
+    enroll(client, email="identity-outage@example.com")
+    csrf = extract_csrf(client.get("/checkin").data)
+
+    monkeypatch.setattr(
+        main, "get_current_client",
+        lambda: (_ for _ in ()).throw(ConnectionError("private identity lookup detail")),
+    )
+    monkeypatch.setattr(
+        main, "run_assessment",
+        lambda *args, **kwargs: pytest.fail("Gemini must not run for identity outage fallback"),
+    )
+
+    resp = client.post("/checkin", data={
+        "csrf_token": csrf, "submission_id": "sub-identity-outage",
+        "physical_symptoms": "5", "anxiety": "5", "energy": "5", "sleep": "5",
+        "journal": journal,
+    })
+
+    assert resp.status_code == 503
+    body = resp.data.decode().lower()
+    assert "911" in body
+    assert ("988" in body) is expect_988
+    if expect_combined:
+        assert body.index("this may also be a medical emergency") < body.index("your safety matters right now")
+    assert "we could not save this check-in" in body
+    assert "we could not record an alert for white raven holistic" in body
+    assert "no notification is confirmed" in body
+    assert "we've also let white raven holistic know" not in body
+    assert "identity-outage@example.com" not in body
+    assert "jane doe" not in body
+    assert "private identity lookup detail" not in body
+    assert "private identity lookup detail" not in caplog.text
+    assert "identity-outage@example.com" not in caplog.text
+    assert "Jane Doe" not in caplog.text
+    assert len(fake_airtable.find_all(main.T_LOGS)) == 0
+    assert len(fake_airtable.find_all(main.T_CRISIS)) == 0
+    assert len(fake_airtable.find_all(main.T_ASSESS)) == 0
+
+
+def test_identity_lookup_failure_still_requires_valid_csrf(
+    client, fake_airtable, mock_gemini, monkeypatch
+):
+    enroll(client, email="identity-csrf@example.com")
+    monkeypatch.setattr(
+        main, "get_current_client",
+        lambda: (_ for _ in ()).throw(ConnectionError("private identity lookup detail")),
+    )
+    monkeypatch.setattr(
+        main, "run_assessment",
+        lambda *args, **kwargs: pytest.fail("Gemini must not run when CSRF is invalid"),
+    )
+
+    resp = client.post("/checkin", data={
+        "submission_id": "sub-identity-csrf",
+        "physical_symptoms": "5", "anxiety": "5", "energy": "5", "sleep": "5",
+        "journal": "I want to die.",
+    })
+    assert resp.status_code == 400
+    assert b"988" not in resp.data
+
+
+@pytest.mark.parametrize(
+    "journal,expect_988,expect_combined",
+    [
+        ("I want to die.", True, False),
+        ("I have chest pain right now.", False, False),
+        ("I want to die and I can't breathe.", True, True),
+    ],
+)
+def test_first_replay_lookup_failure_renders_unknown_states_without_side_effects(
+    client, fake_airtable, mock_gemini, monkeypatch, caplog,
+    journal, expect_988, expect_combined,
+):
+    enroll(client, email="first-replay-outage@example.com")
+    csrf = extract_csrf(client.get("/checkin").data)
+
+    monkeypatch.setattr(
+        main, "find_log_by_submission_id",
+        lambda submission_id: (_ for _ in ()).throw(
+            ConnectionError("private first replay endpoint detail")),
+    )
+    monkeypatch.setattr(
+        main, "at_create",
+        lambda *args, **kwargs: pytest.fail("First replay failure must not write Airtable"),
+    )
+    monkeypatch.setattr(
+        main, "run_assessment",
+        lambda *args, **kwargs: pytest.fail("First replay failure must not call Gemini"),
+    )
+    monkeypatch.setattr(
+        main.requests, "post",
+        lambda *args, **kwargs: pytest.fail("First replay failure must not call GHL"),
+    )
+
+    resp = client.post("/checkin", data={
+        "csrf_token": csrf, "submission_id": "sub-first-replay-outage",
+        "physical_symptoms": "5", "anxiety": "5", "energy": "5", "sleep": "5",
+        "journal": journal,
+    })
+
+    assert resp.status_code == 503
+    body = resp.data.decode().lower()
+    assert "911" in body
+    assert ("988" in body) is expect_988
+    if expect_combined:
+        assert body.index("this may also be a medical emergency") < body.index("your safety matters right now")
+    assert "we could not confirm whether this check-in was saved" in body
+    assert "we could not confirm whether an alert was recorded" in body
+    assert "no notification, delivery, or review is confirmed" in body
+    assert "your check-in was saved" not in body
+    assert "we could not save this check-in" not in body
+    assert "we recorded an alert for white raven holistic" not in body
+    assert "we could not record an alert for white raven holistic" not in body
+    assert "first-replay-outage@example.com" not in body
+    assert "jane doe" not in body
+    assert "private first replay endpoint detail" not in body
+    assert len(fake_airtable.find_all(main.T_LOGS)) == 0
+    assert len(fake_airtable.find_all(main.T_CRISIS)) == 0
+    assert len(fake_airtable.find_all(main.T_ASSESS)) == 0
+    log_output = caplog.text
+    assert "first-replay-outage@example.com" not in log_output
+    assert "Jane Doe" not in log_output
+    assert journal not in log_output
+    assert "private first replay endpoint detail" not in log_output
+
+
+@pytest.mark.parametrize(
+    "journal,expect_988,expect_combined",
+    [
+        ("I want to die.", True, False),
+        ("I have chest pain right now.", False, False),
+        ("I want to die and I can't breathe.", True, True),
+    ],
+)
+def test_second_replay_lookup_failure_confirms_saved_and_unknown_alert(
+    client, fake_airtable, mock_gemini, monkeypatch, caplog,
+    journal, expect_988, expect_combined,
+):
+    enroll(client, email="second-replay-outage@example.com")
+    csrf = extract_csrf(client.get("/checkin").data)
+    client_rec = fake_airtable.find_all(main.T_CLIENTS)[0]
+    fake_airtable.create(main.T_LOGS, {
+        main.F_LOG["submission_id"]: "sub-second-replay-outage",
+        main.F_LOG["client"]: [client_rec["id"]],
+    })
+
+    monkeypatch.setattr(
+        main, "find_assessment_by_log_id",
+        lambda log_id: (_ for _ in ()).throw(
+            ConnectionError("private second replay endpoint detail")),
+    )
+    monkeypatch.setattr(
+        main, "at_create",
+        lambda *args, **kwargs: pytest.fail("Second replay failure must not write Airtable"),
+    )
+    monkeypatch.setattr(
+        main, "run_assessment",
+        lambda *args, **kwargs: pytest.fail("Second replay failure must not call Gemini"),
+    )
+    monkeypatch.setattr(
+        main.requests, "post",
+        lambda *args, **kwargs: pytest.fail("Second replay failure must not call GHL"),
+    )
+
+    resp = client.post("/checkin", data={
+        "csrf_token": csrf, "submission_id": "sub-second-replay-outage",
+        "physical_symptoms": "5", "anxiety": "5", "energy": "5", "sleep": "5",
+        "journal": journal,
+    })
+
+    assert resp.status_code == 503
+    body = resp.data.decode().lower()
+    assert "911" in body
+    assert ("988" in body) is expect_988
+    if expect_combined:
+        assert body.index("this may also be a medical emergency") < body.index("your safety matters right now")
+    assert "your check-in was saved" in body
+    assert "we could not confirm whether an alert was recorded" in body
+    assert "no notification, delivery, or review is confirmed" in body
+    assert "we recorded an alert for white raven holistic" not in body
+    assert "we could not record an alert for white raven holistic" not in body
+    assert "second-replay-outage@example.com" not in body
+    assert "jane doe" not in body
+    assert "private second replay endpoint detail" not in body
+    assert len(fake_airtable.find_all(main.T_LOGS)) == 1
+    assert len(fake_airtable.find_all(main.T_CRISIS)) == 0
+    assert len(fake_airtable.find_all(main.T_ASSESS)) == 0
+    log_output = caplog.text
+    assert "second-replay-outage@example.com" not in log_output
+    assert "Jane Doe" not in log_output
+    assert journal not in log_output
+    assert "private second replay endpoint detail" not in log_output
+
+
+def test_historical_failed_replay_uses_unknown_alert_wording(
+    client, fake_airtable, mock_gemini, monkeypatch
+):
+    enroll(client, email="historical-failed@example.com")
+    csrf = extract_csrf(client.get("/checkin").data)
+    client_rec = fake_airtable.find_all(main.T_CLIENTS)[0]
+    log_rec = fake_airtable.create(main.T_LOGS, {
+        main.F_LOG["submission_id"]: "sub-historical-failed",
+        main.F_LOG["client"]: [client_rec["id"]],
+    })
+    fake_airtable.create(main.T_ASSESS, {
+        main.F_ASSESS["daily_log"]: [log_rec["id"]],
+        main.F_ASSESS["response_route"]: main.ROUTE_LABELS[main.ROUTE_SAFETY],
+        main.F_ASSESS["score_tier"]: main.TIER_LABELS["STEADY"],
+        main.F_ASSESS["support_score"]: 12,
+        main.F_ASSESS["trigger_reasons"]: "[]",
+        main.F_ASSESS["fallback_mode"]: False,
+        main.F_ASSESS["crisis_alert"]: "Yes",
+        main.F_ASSESS["owner_alert_status"]: "failed",
+    })
+    monkeypatch.setattr(
+        main, "run_assessment",
+        lambda *args, **kwargs: pytest.fail("Historical replay must not call Gemini"),
+    )
+    monkeypatch.setattr(
+        main.requests, "post",
+        lambda *args, **kwargs: pytest.fail("Historical replay must not call GHL"),
+    )
+
+    resp = client.post("/checkin", data={
+        "csrf_token": csrf, "submission_id": "sub-historical-failed",
+        "physical_symptoms": "5", "anxiety": "5", "energy": "5", "sleep": "5",
+        "journal": "I want to die.",
+    })
+
+    assert resp.status_code == 200
+    body = resp.data.decode().lower()
+    assert "988" in body and "911" in body
+    assert "your check-in was saved" in body
+    assert "we could not confirm whether an alert was recorded" in body
+    assert "no notification, delivery, or review is confirmed" in body
+    assert "we recorded an alert for white raven holistic" not in body
+    assert "we could not record an alert for white raven holistic" not in body
+    assert "notification was delivered" not in body
+    assert "white raven was informed" not in body
+    assert "someone reviewed" not in body
+    assert "will respond" not in body
+
+
+@pytest.mark.parametrize(
+    "journal,expect_988,expect_combined",
+    [
+        ("I want to die.", True, False),
+        ("I have chest pain right now.", False, False),
+        ("I want to die and I can't breathe.", True, True),
+    ],
+)
+def test_first_daily_log_write_failure_renders_each_emergency_with_503(
+    client, fake_airtable, mock_gemini, monkeypatch,
+    journal, expect_988, expect_combined,
+):
+    enroll(client, email="log-outage@example.com")
+    csrf = extract_csrf(client.get("/checkin").data)
+    original_create = main.at_create
+
+    def fail_daily_log(table, fields):
+        if table == main.T_LOGS:
+            raise ConnectionError("private Daily Log detail")
+        return original_create(table, fields)
+
+    monkeypatch.setattr(main, "at_create", fail_daily_log)
+    monkeypatch.setattr(
+        main, "run_assessment",
+        lambda *args, **kwargs: pytest.fail("Gemini must not run for early persistence fallback"),
+    )
+
+    resp = client.post("/checkin", data={
+        "csrf_token": csrf, "submission_id": "sub-log-outage",
+        "physical_symptoms": "5", "anxiety": "5", "energy": "5", "sleep": "5",
+        "journal": journal,
+    })
+
+    assert resp.status_code == 503
+    body = resp.data.decode().lower()
+    assert "911" in body
+    assert ("988" in body) is expect_988
+    if expect_combined:
+        assert body.index("this may also be a medical emergency") < body.index("your safety matters right now")
+    assert "we could not save this check-in" in body
+    assert "we recorded an alert for white raven holistic to review" in body
+    assert "cannot confirm that a notification was delivered or seen" in body
+    assert "we've also let white raven holistic know" not in body
+    assert "private daily log detail" not in body
+
+
+def test_crisis_alert_creation_failure_renders_saved_emergency_truthfully(
+    client, fake_airtable, mock_gemini, monkeypatch
+):
+    enroll(client, email="alert-outage@example.com")
+    csrf = extract_csrf(client.get("/checkin").data)
+    original_create = main.at_create
+
+    def fail_crisis_alert(table, fields):
+        if table == main.T_CRISIS:
+            raise ConnectionError("private Crisis Alert detail")
+        return original_create(table, fields)
+
+    monkeypatch.setattr(main, "at_create", fail_crisis_alert)
+    resp = client.post("/checkin", data={
+        "csrf_token": csrf, "submission_id": "sub-alert-outage",
+        "physical_symptoms": "5", "anxiety": "5", "energy": "5", "sleep": "5",
+        "journal": "I want to die.",
+    })
+
+    assert resp.status_code == 200
+    body = resp.data.decode().lower()
+    assert "988" in body and "911" in body
+    assert "your check-in was saved" in body
+    assert "we could not record an alert for white raven holistic" in body
+    assert "no notification is confirmed" in body
+    assert "private crisis alert detail" not in body
+    assert "we've also let white raven holistic know" not in body
+
+
+def test_daily_log_and_crisis_alert_failure_render_both_truthful_failures(
+    client, fake_airtable, mock_gemini, monkeypatch
+):
+    enroll(client, email="both-persistence-outage@example.com")
+    csrf = extract_csrf(client.get("/checkin").data)
+    original_create = main.at_create
+
+    def fail_log_and_alert(table, fields):
+        if table in (main.T_LOGS, main.T_CRISIS):
+            raise ConnectionError("private combined persistence detail")
+        return original_create(table, fields)
+
+    monkeypatch.setattr(main, "at_create", fail_log_and_alert)
+    resp = client.post("/checkin", data={
+        "csrf_token": csrf, "submission_id": "sub-both-persistence-outage",
+        "physical_symptoms": "5", "anxiety": "5", "energy": "5", "sleep": "5",
+        "journal": "I want to die.",
+    })
+
+    assert resp.status_code == 503
+    body = resp.data.decode().lower()
+    assert "988" in body and "911" in body
+    assert "we could not save this check-in" in body
+    assert "we could not record an alert for white raven holistic" in body
+    assert "private combined persistence detail" not in body
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    ["assessment_create", "crisis_link", "processed_update"],
+)
+def test_later_persistence_failures_never_replace_emergency_page(
+    client, fake_airtable, mock_gemini, monkeypatch, caplog, failure_point
+):
+    participant_email = f"{failure_point}@example.com"
+    journal = "I want to die."
+    sensitive_token = "test-sensitive-access-token"
+    sensitive_record_id = "rec-sensitive-record-id"
+    raw_exception = (
+        f"private later persistence detail Jane Doe {participant_email} "
+        f"{journal} {sensitive_token} {sensitive_record_id}"
+    )
+    enroll(client, email=participant_email)
+    csrf = extract_csrf(client.get("/checkin").data)
+    original_create = main.at_create
+    original_update = main.at_update
+
+    def maybe_fail_create(table, fields):
+        if failure_point == "assessment_create" and table == main.T_ASSESS:
+            raise ConnectionError(raw_exception)
+        return original_create(table, fields)
+
+    def maybe_fail_update(table, record_id, fields):
+        if failure_point == "crisis_link" and table == main.T_CRISIS:
+            raise ConnectionError(f"{raw_exception} {record_id}")
+        if (failure_point == "processed_update" and table == main.T_LOGS
+                and fields.get(main.F_LOG["processed"])):
+            raise ConnectionError(f"{raw_exception} {record_id}")
+        return original_update(table, record_id, fields)
+
+    monkeypatch.setattr(main, "at_create", maybe_fail_create)
+    monkeypatch.setattr(main, "at_update", maybe_fail_update)
+    resp = client.post("/checkin", data={
+        "csrf_token": csrf, "submission_id": f"sub-{failure_point}",
+        "physical_symptoms": "5", "anxiety": "5", "energy": "5", "sleep": "5",
+        "journal": journal,
+    })
+
+    assert resp.status_code == 200
+    body = resp.data.decode().lower()
+    assert "988" in body and "911" in body
+    assert "your check-in was saved" in body
+    assert "we recorded an alert for white raven holistic to review" in body
+    assert "cannot confirm that a notification was delivered or seen" in body
+    assert "white raven holistic was notified" not in body
+    assert "the alert was reviewed" not in body
+    assert "someone reviewed" not in body
+    assert "will respond" not in body
+    assert "will follow up" not in body
+    assert "processing completed" not in body
+    assert "fully processed" not in body
+    assert "later_processing_failed" not in body
+    log_output = caplog.text
+    for sensitive_value in (
+        "jane doe", participant_email, journal.lower(), sensitive_token,
+        sensitive_record_id, raw_exception.lower(),
+    ):
+        assert sensitive_value not in body
+        assert sensitive_value not in log_output.lower()
+
+
+def test_ordinary_checkin_daily_log_failure_keeps_generic_error_page(
+    client, fake_airtable, mock_gemini, monkeypatch
+):
+    enroll(client, email="ordinary-outage@example.com")
+    csrf = extract_csrf(client.get("/checkin").data)
+    original_create = main.at_create
+
+    def fail_daily_log(table, fields):
+        if table == main.T_LOGS:
+            raise ConnectionError("private ordinary check-in detail")
+        return original_create(table, fields)
+
+    monkeypatch.setattr(main, "at_create", fail_daily_log)
+    resp = client.post("/checkin", data={
+        "csrf_token": csrf, "submission_id": "sub-ordinary-outage",
+        "physical_symptoms": "5", "anxiety": "5", "energy": "5", "sleep": "5",
+        "journal": "An ordinary steady day.",
+    })
+
+    assert resp.status_code == 500
+    body = resp.data.decode().lower()
+    assert "went wrong" in body
+    assert "private ordinary check-in detail" not in body
+    assert "988" not in body

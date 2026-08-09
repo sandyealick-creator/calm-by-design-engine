@@ -9,7 +9,13 @@
     <p><strong>Please don't wait for a reply from us.</strong> If this feels urgent, call 911 or go to the nearest emergency room now.</p>
     <a class="button-link" href="tel:911">Call 911</a>
   </div>
-  <p class="muted">We've also let White Raven Holistic know so a real person can follow up, but calling 911 or getting emergency care is the immediate step, not waiting to hear from us.</p>
+  {% if crisis_alert_created is sameas true %}
+  <p class="muted">We recorded an alert for White Raven Holistic to review, but this app cannot confirm that a notification was delivered or seen. Please do not wait for a response.</p>
+  {% elif crisis_alert_created is sameas false %}
+  <p class="muted">We could not record an alert for White Raven Holistic, and no notification is confirmed. Please do not wait for a response.</p>
+  {% else %}
+  <p class="muted">We could not confirm whether an alert was recorded. No notification, delivery, or review is confirmed. Please do not wait for a response.</p>
+  {% endif %}
 
 {% elif response_route == "SAFETY_ROUTE" %}
   {% if medical_emergency_triggered %}
@@ -27,7 +33,13 @@
     <a class="button-link" href="sms:988">Text 988</a>
     <p style="margin-top:12px;">If you are in immediate danger, cannot stay safe, or an attempt is already in progress, call <strong>911</strong> or go to the nearest emergency room now.</p>
   </div>
-  <p class="muted">We've also let White Raven Holistic know so a real person can follow up, but 988 or 911 is the immediate next step, not waiting to hear from us.</p>
+  {% if crisis_alert_created is sameas true %}
+  <p class="muted">We recorded an alert for White Raven Holistic to review, but this app cannot confirm that a notification was delivered or seen. Please do not wait for a response.</p>
+  {% elif crisis_alert_created is sameas false %}
+  <p class="muted">We could not record an alert for White Raven Holistic, and no notification is confirmed. Please do not wait for a response.</p>
+  {% else %}
+  <p class="muted">We could not confirm whether an alert was recorded. No notification, delivery, or review is confirmed. Please do not wait for a response.</p>
+  {% endif %}
 
   {% if element %}
   <h2>If it helps while you reach out</h2>
@@ -74,7 +86,13 @@
   <p>Nothing more needed from you today. Keep noticing how things feel, that's the practice.</p>
 {% endif %}
 
-<p class="muted" style="margin-top:24px;">Your check-in was saved.{% if fallback_mode %} (Our AI reader was briefly unavailable, so this was routed using your ratings only, nothing was lost.){% endif %}</p>
+{% if checkin_saved is sameas true %}
+<p class="muted" style="margin-top:24px;">Your check-in was saved.{% if fallback_mode %} The AI reader was unavailable, so deterministic fallback routing was used.{% endif %}</p>
+{% elif checkin_saved is sameas false %}
+<p class="muted" style="margin-top:24px;">We could not save this check-in. The emergency resources above are still available. Please do not wait for a response from us.</p>
+{% else %}
+<p class="muted" style="margin-top:24px;">We could not confirm whether this check-in was saved. The emergency resources above are still available. Please do not wait for a response from us.</p>
+{% endif %}
 {% if response_route != "MEDICAL_EMERGENCY_ROUTE" %}
 <p class="muted" style="font-size:0.75rem;">{{ safety_footer }}</p>
 {% endif %}

@@ -1,5 +1,7 @@
 import datetime as dt
 
+import pytest
+
 import main
 from routing_config import (
     ROUTE_GROUNDING_SUPPORT,
@@ -220,6 +222,9 @@ def test_clear_medical_emergency_language_routes_to_medical_emergency(
     assert result["response_route"] == ROUTE_MEDICAL_EMERGENCY
     assert result["medical_emergency_triggered"] is True
     assert result["element"] is None  # no grounding practice as the primary/only response
+    assert result["checkin_saved"] is True
+    assert result["crisis_alert_created"] is True
+    assert result["owner_notification_confirmed"] is False
 
     alerts = fake_airtable.find_all(main.T_CRISIS)
     assert len(alerts) == 1
@@ -257,6 +262,12 @@ def test_direct_self_harm_language_still_routes_to_safety(fake_airtable, mock_ge
     result = _checkin(client_rec, STEADY, "I want to kill myself.", "sub-direct")
     assert result["response_route"] == ROUTE_SAFETY
     assert result["medical_emergency_triggered"] is False
+    assert result["checkin_saved"] is True
+    assert result["crisis_alert_created"] is True
+    assert result["owner_notification_confirmed"] is False
+
+    assess = fake_airtable.find_all(main.T_ASSESS)[-1]
+    assert main.F_ASSESS["owner_alert_status"] not in assess["fields"]
 
 
 def test_imminent_self_harm_danger_still_routes_to_safety(fake_airtable, mock_gemini, make_client_record):
@@ -279,6 +290,9 @@ def test_simultaneous_medical_emergency_and_self_harm(fake_airtable, mock_gemini
                       "sub-both")
     assert result["response_route"] == ROUTE_SAFETY
     assert result["medical_emergency_triggered"] is True
+    assert result["checkin_saved"] is True
+    assert result["crisis_alert_created"] is True
+    assert result["owner_notification_confirmed"] is False
 
     alerts = fake_airtable.find_all(main.T_CRISIS)
     assert len(alerts) == 1
@@ -296,3 +310,420 @@ def test_medical_emergency_replay_preserves_medical_flag(fake_airtable, mock_gem
     assert result1["medical_emergency_triggered"] is True
     assert result2["medical_emergency_triggered"] is True
     assert result1["response_route"] == result2["response_route"] == ROUTE_MEDICAL_EMERGENCY
+    assert result2["checkin_saved"] is True
+    assert result2["crisis_alert_created"] is True
+    assert result2["owner_notification_confirmed"] is False
+
+
+@pytest.mark.parametrize(
+    "journal,expected_route,medical_triggered",
+    [
+        ("I want to die.", ROUTE_SAFETY, False),
+        ("I have chest pain right now.", ROUTE_MEDICAL_EMERGENCY, True),
+        ("I want to die and I can't breathe.", ROUTE_SAFETY, True),
+    ],
+)
+def test_replay_log_lookup_failure_preserves_emergency_with_unknown_state(
+    fake_airtable, make_client_record, monkeypatch, caplog,
+    journal, expected_route, medical_triggered,
+):
+    sensitive_token = "test-sensitive-access-token"
+    client_rec = make_client_record(**{
+        main.F_CLIENT["access_token_hash"]: sensitive_token,
+    })
+    raw_exception = (
+        f"private first replay lookup detail Jane Doe jane@example.com "
+        f"{journal} {sensitive_token} {client_rec['id']}"
+    )
+
+    monkeypatch.setattr(
+        main, "find_log_by_submission_id",
+        lambda submission_id: (_ for _ in ()).throw(
+            ConnectionError(raw_exception)),
+    )
+    monkeypatch.setattr(
+        main, "at_create",
+        lambda *args, **kwargs: pytest.fail("Replay lookup failure must not create records"),
+    )
+    monkeypatch.setattr(
+        main, "run_assessment",
+        lambda *args, **kwargs: pytest.fail("Replay lookup failure must not call Gemini"),
+    )
+    monkeypatch.setattr(
+        main.requests, "post",
+        lambda *args, **kwargs: pytest.fail("Replay lookup failure must not call GHL"),
+    )
+
+    result = _checkin(client_rec, STEADY, journal, "sub-replay-log-lookup-failure")
+
+    assert result["response_route"] == expected_route
+    assert result["medical_emergency_triggered"] is medical_triggered
+    assert result["checkin_saved"] is None
+    assert result["crisis_alert_created"] is None
+    assert result["owner_notification_confirmed"] is False
+    assert result["http_status"] == 503
+    assert result["later_processing_failed"] is False
+    assert len(fake_airtable.find_all(main.T_LOGS)) == 0
+    assert len(fake_airtable.find_all(main.T_CRISIS)) == 0
+    log_output = caplog.text
+    assert "Jane Doe" not in log_output
+    assert "jane@example.com" not in log_output
+    assert journal not in log_output
+    assert sensitive_token not in log_output
+    assert client_rec["id"] not in log_output
+    assert raw_exception not in log_output
+
+
+@pytest.mark.parametrize(
+    "journal,expected_route,medical_triggered",
+    [
+        ("I want to die.", ROUTE_SAFETY, False),
+        ("I have chest pain right now.", ROUTE_MEDICAL_EMERGENCY, True),
+        ("I want to die and I can't breathe.", ROUTE_SAFETY, True),
+    ],
+)
+def test_replay_assessment_lookup_failure_confirms_saved_but_not_alert_state(
+    fake_airtable, make_client_record, monkeypatch, caplog,
+    journal, expected_route, medical_triggered,
+):
+    sensitive_token = "test-sensitive-access-token"
+    client_rec = make_client_record(**{
+        main.F_CLIENT["access_token_hash"]: sensitive_token,
+    })
+    fake_airtable.create(main.T_LOGS, {
+        main.F_LOG["submission_id"]: "sub-replay-assessment-lookup-failure",
+        main.F_LOG["client"]: [client_rec["id"]],
+    })
+    raw_exception = (
+        f"private second replay lookup detail Jane Doe jane@example.com "
+        f"{journal} {sensitive_token} {client_rec['id']}"
+    )
+
+    monkeypatch.setattr(
+        main, "find_assessment_by_log_id",
+        lambda log_id: (_ for _ in ()).throw(
+            ConnectionError(raw_exception)),
+    )
+    monkeypatch.setattr(
+        main, "at_create",
+        lambda *args, **kwargs: pytest.fail("Assessment lookup failure must not create records"),
+    )
+    monkeypatch.setattr(
+        main, "run_assessment",
+        lambda *args, **kwargs: pytest.fail("Assessment lookup failure must not call Gemini"),
+    )
+    monkeypatch.setattr(
+        main.requests, "post",
+        lambda *args, **kwargs: pytest.fail("Assessment lookup failure must not call GHL"),
+    )
+
+    result = _checkin(
+        client_rec, STEADY, journal,
+        "sub-replay-assessment-lookup-failure",
+    )
+
+    assert result["response_route"] == expected_route
+    assert result["medical_emergency_triggered"] is medical_triggered
+    assert result["checkin_saved"] is True
+    assert result["crisis_alert_created"] is None
+    assert result["owner_notification_confirmed"] is False
+    assert result["http_status"] == 503
+    assert result["later_processing_failed"] is False
+    assert len(fake_airtable.find_all(main.T_LOGS)) == 1
+    assert len(fake_airtable.find_all(main.T_CRISIS)) == 0
+    log_output = caplog.text
+    assert "Jane Doe" not in log_output
+    assert "jane@example.com" not in log_output
+    assert journal not in log_output
+    assert sensitive_token not in log_output
+    assert client_rec["id"] not in log_output
+    assert raw_exception not in log_output
+
+
+@pytest.mark.parametrize(
+    "owner_status,crisis_alert_value,expected_alert_state",
+    [
+        ("sent", "Yes", True),
+        ("failed", "Yes", None),
+        (None, "Yes", True),
+        (None, "No", False),
+    ],
+)
+def test_replay_reconstructs_only_supported_alert_record_state(
+    owner_status, crisis_alert_value, expected_alert_state
+):
+    fields = {
+        main.F_ASSESS["response_route"]: main.ROUTE_LABELS[ROUTE_SAFETY],
+        main.F_ASSESS["score_tier"]: main.TIER_LABELS["STEADY"],
+        main.F_ASSESS["support_score"]: 12,
+        main.F_ASSESS["trigger_reasons"]: "[]",
+        main.F_ASSESS["fallback_mode"]: False,
+        main.F_ASSESS["crisis_alert"]: crisis_alert_value,
+    }
+    if owner_status is not None:
+        fields[main.F_ASSESS["owner_alert_status"]] = owner_status
+
+    result = main._result_from_assessment({"fields": fields})
+
+    assert result["checkin_saved"] is True
+    assert result["crisis_alert_created"] is expected_alert_state
+    assert result["owner_notification_confirmed"] is False
+
+
+@pytest.mark.parametrize(
+    "journal,expected_route,medical_triggered",
+    [
+        ("I want to die.", ROUTE_SAFETY, False),
+        ("I have chest pain right now.", ROUTE_MEDICAL_EMERGENCY, True),
+        ("I want to die and I can't breathe.", ROUTE_SAFETY, True),
+    ],
+)
+def test_first_daily_log_failure_preserves_each_deterministic_emergency(
+    fake_airtable, make_client_record, monkeypatch, journal, expected_route,
+    medical_triggered,
+):
+    client_rec = make_client_record()
+    original_create = main.at_create
+
+    def fail_daily_log(table, fields):
+        if table == main.T_LOGS:
+            raise ConnectionError("private Airtable detail")
+        return original_create(table, fields)
+
+    def gemini_must_not_run(*args, **kwargs):
+        raise AssertionError("Gemini must not run for an early deterministic outage fallback")
+
+    monkeypatch.setattr(main, "at_create", fail_daily_log)
+    monkeypatch.setattr(main, "run_assessment", gemini_must_not_run)
+
+    result = _checkin(client_rec, STEADY, journal, "sub-log-failure")
+
+    assert result["response_route"] == expected_route
+    assert result["medical_emergency_triggered"] is medical_triggered
+    assert result["checkin_saved"] is False
+    assert result["crisis_alert_created"] is True
+    assert result["owner_notification_confirmed"] is False
+    assert result["http_status"] == 503
+    assert result["later_processing_failed"] is False
+    assert len(fake_airtable.find_all(main.T_LOGS)) == 0
+    assert len(fake_airtable.find_all(main.T_CRISIS)) == 1
+    assert len(fake_airtable.find_all(main.T_ASSESS)) == 0
+
+
+def test_crisis_alert_failure_does_not_replace_emergency_result(
+    fake_airtable, mock_gemini, make_client_record, monkeypatch
+):
+    client_rec = make_client_record()
+    original_create = main.at_create
+
+    def fail_crisis_alert(table, fields):
+        if table == main.T_CRISIS:
+            raise ConnectionError("private Crisis Alert detail")
+        return original_create(table, fields)
+
+    monkeypatch.setattr(main, "at_create", fail_crisis_alert)
+    result = _checkin(client_rec, STEADY, "I want to die.", "sub-alert-failure")
+
+    assert result["response_route"] == ROUTE_SAFETY
+    assert result["checkin_saved"] is True
+    assert result["crisis_alert_created"] is False
+    assert result["owner_notification_confirmed"] is False
+    assert result["http_status"] == 200
+    assert result["later_processing_failed"] is False
+    assess = fake_airtable.find_all(main.T_ASSESS)[-1]
+    assert assess["fields"][main.F_ASSESS["crisis_alert"]] == "No"
+    assert main.F_ASSESS["owner_alert_status"] not in assess["fields"]
+
+
+def test_daily_log_and_crisis_alert_failure_preserve_emergency_result(
+    fake_airtable, make_client_record, monkeypatch
+):
+    client_rec = make_client_record()
+    original_create = main.at_create
+
+    def fail_log_and_alert(table, fields):
+        if table in (main.T_LOGS, main.T_CRISIS):
+            raise ConnectionError("private persistence detail")
+        return original_create(table, fields)
+
+    monkeypatch.setattr(main, "at_create", fail_log_and_alert)
+    monkeypatch.setattr(
+        main, "run_assessment",
+        lambda *args, **kwargs: pytest.fail("Gemini must not run during early outage fallback"),
+    )
+
+    result = _checkin(client_rec, STEADY, "I want to die.", "sub-both-fail")
+    assert result["response_route"] == ROUTE_SAFETY
+    assert result["checkin_saved"] is False
+    assert result["crisis_alert_created"] is False
+    assert result["http_status"] == 503
+    assert result["later_processing_failed"] is False
+
+
+def test_ai_assessment_failure_keeps_saved_emergency_result_unprocessed(
+    fake_airtable, mock_gemini, make_client_record, monkeypatch
+):
+    client_rec = make_client_record()
+    original_create = main.at_create
+
+    def fail_assessment(table, fields):
+        if table == main.T_ASSESS:
+            raise ConnectionError("private assessment detail")
+        return original_create(table, fields)
+
+    monkeypatch.setattr(main, "at_create", fail_assessment)
+    result = _checkin(client_rec, STEADY, "I want to die.", "sub-assess-failure")
+
+    assert result["response_route"] == ROUTE_SAFETY
+    assert result["checkin_saved"] is True
+    assert result["crisis_alert_created"] is True
+    assert result["http_status"] == 200
+    assert result["later_processing_failed"] is True
+    log_record = fake_airtable.find_all(main.T_LOGS)[0]
+    assert main.F_LOG["processed"] not in log_record["fields"]
+
+
+def test_crisis_alert_link_failure_keeps_emergency_result(
+    fake_airtable, mock_gemini, make_client_record, monkeypatch
+):
+    client_rec = make_client_record()
+    original_update = main.at_update
+
+    def fail_crisis_link(table, record_id, fields):
+        if table == main.T_CRISIS:
+            raise ConnectionError("private link detail")
+        return original_update(table, record_id, fields)
+
+    monkeypatch.setattr(main, "at_update", fail_crisis_link)
+    result = _checkin(client_rec, STEADY, "I want to die.", "sub-link-failure")
+
+    assert result["response_route"] == ROUTE_SAFETY
+    assert result["checkin_saved"] is True
+    assert result["crisis_alert_created"] is True
+    assert result["http_status"] == 200
+    assert result["later_processing_failed"] is True
+    assert fake_airtable.find_all(main.T_LOGS)[0]["fields"][main.F_LOG["processed"]] is True
+
+
+def test_daily_log_processed_update_failure_keeps_emergency_result(
+    fake_airtable, mock_gemini, make_client_record, monkeypatch
+):
+    client_rec = make_client_record()
+    original_update = main.at_update
+
+    def fail_processed_update(table, record_id, fields):
+        if table == main.T_LOGS and fields.get(main.F_LOG["processed"]):
+            raise ConnectionError("private processed detail")
+        return original_update(table, record_id, fields)
+
+    monkeypatch.setattr(main, "at_update", fail_processed_update)
+    result = _checkin(client_rec, STEADY, "I want to die.", "sub-processed-failure")
+
+    assert result["response_route"] == ROUTE_SAFETY
+    assert result["checkin_saved"] is True
+    assert result["crisis_alert_created"] is True
+    assert result["http_status"] == 200
+    assert result["later_processing_failed"] is True
+
+
+@pytest.mark.parametrize("non_success", [False, True])
+def test_crisis_webhook_failure_does_not_claim_delivery_or_log_identity(
+    fake_airtable, mock_gemini, make_client_record, monkeypatch, caplog, non_success
+):
+    client_rec = make_client_record()
+    monkeypatch.setenv("GHL_CRISIS_WEBHOOK", "https://example.invalid/crisis")
+
+    if non_success:
+        class NonSuccessResponse:
+            def raise_for_status(self):
+                raise RuntimeError("private webhook response detail")
+
+        monkeypatch.setattr(main.requests, "post", lambda *args, **kwargs: NonSuccessResponse())
+    else:
+        def webhook_exception(*args, **kwargs):
+            raise ConnectionError("private webhook connection detail")
+
+        monkeypatch.setattr(main.requests, "post", webhook_exception)
+
+    result = _checkin(client_rec, STEADY, "I want to die.", "sub-webhook-failure")
+
+    assert result["response_route"] == ROUTE_SAFETY
+    assert result["checkin_saved"] is True
+    assert result["crisis_alert_created"] is True
+    assert result["owner_notification_confirmed"] is False
+    assert result["later_processing_failed"] is False
+    assess = fake_airtable.find_all(main.T_ASSESS)[-1]
+    assert assess["fields"][main.F_ASSESS["ghl_action"]] == ""
+    assert main.F_ASSESS["owner_alert_status"] not in assess["fields"]
+    log_output = caplog.text
+    assert "Jane Doe" not in log_output
+    assert "jane@example.com" not in log_output
+    assert "I want to die" not in log_output
+    assert "private webhook" not in log_output
+
+
+def test_successful_optional_crisis_webhook_keeps_preexisting_action_value(
+    fake_airtable, mock_gemini, make_client_record, monkeypatch
+):
+    client_rec = make_client_record()
+    monkeypatch.setenv("GHL_CRISIS_WEBHOOK", "https://example.invalid/crisis")
+    calls = []
+
+    class SuccessResponse:
+        def raise_for_status(self):
+            return None
+
+    def successful_webhook(*args, **kwargs):
+        calls.append((args, kwargs))
+        return SuccessResponse()
+
+    monkeypatch.setattr(main.requests, "post", successful_webhook)
+    result = _checkin(client_rec, STEADY, "I want to die.", "sub-webhook-success")
+
+    assert len(calls) == 1
+    assert result["checkin_saved"] is True
+    assert result["crisis_alert_created"] is True
+    assert result["owner_notification_confirmed"] is False
+    assert result["later_processing_failed"] is False
+    assess = fake_airtable.find_all(main.T_ASSESS)[-1]
+    assert assess["fields"][main.F_ASSESS["ghl_action"]] == "crisis_webhook_sent"
+    assert main.F_ASSESS["owner_alert_status"] not in assess["fields"]
+
+
+def test_ordinary_wellness_success_still_calls_gemini_and_saves_normally(
+    fake_airtable, mock_gemini, make_client_record, monkeypatch
+):
+    client_rec = make_client_record()
+    original_run_assessment = main.run_assessment
+    calls = []
+
+    def tracked_assessment(*args, **kwargs):
+        calls.append(True)
+        return original_run_assessment(*args, **kwargs)
+
+    monkeypatch.setattr(main, "run_assessment", tracked_assessment)
+    result = _checkin(client_rec, STEADY, "An ordinary steady day.", "sub-ordinary-success")
+
+    assert calls == [True]
+    assert result["response_route"] == ROUTE_STEADY
+    assert result["checkin_saved"] is True
+    assert result["http_status"] == 200
+    assert result["later_processing_failed"] is False
+    assert len(fake_airtable.find_all(main.T_LOGS)) == 1
+    assert len(fake_airtable.find_all(main.T_ASSESS)) == 1
+
+
+def test_ordinary_initial_daily_log_failure_preserves_generic_exception_behavior(
+    fake_airtable, mock_gemini, make_client_record, monkeypatch
+):
+    client_rec = make_client_record()
+    original_create = main.at_create
+
+    def fail_daily_log(table, fields):
+        if table == main.T_LOGS:
+            raise ConnectionError("private ordinary outage detail")
+        return original_create(table, fields)
+
+    monkeypatch.setattr(main, "at_create", fail_daily_log)
+    with pytest.raises(ConnectionError, match="private ordinary outage detail"):
+        _checkin(client_rec, STEADY, "An ordinary steady day.", "sub-ordinary-failure")
