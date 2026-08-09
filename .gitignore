@@ -6,3 +6,27 @@ __pycache__/
 env.yaml
 .venv/
 venv/
+
+# Credentials / service accounts - never commit real values
+*credentials*.json
+service-account*.json
+*-key.json
+*.pem
+*.p12
+
+# Python test/tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Local logs
+*.log
+logs/
+
+# Local exports / scratch data that may contain participant info
+*_export.csv
+*_export.json
+participant_data/
+scratch/
+tmp/

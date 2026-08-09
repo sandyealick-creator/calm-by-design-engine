@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Daily check-in{% endblock %}
+{% block content %}
+<h1>Hi {{ name }}, how are you today?</h1>
+<p class="muted">Rate each from 1 (lowest) to 10 (highest), then share what's on your mind.</p>
+
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+<form method="post" action="/checkin" id="checkinForm">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="submission_id" value="{{ submission_id }}">
+
+  <label for="physical_symptoms">Physical symptoms (1 = none, 10 = severe)</label>
+  <input type="number" id="physical_symptoms" name="physical_symptoms" min="1" max="10" step="1" required>
+
+  <label for="anxiety">Anxiety (1 = calm, 10 = very anxious)</label>
+  <input type="number" id="anxiety" name="anxiety" min="1" max="10" step="1" required>
+
+  <label for="energy">Energy (1 = depleted, 10 = energized)</label>
+  <input type="number" id="energy" name="energy" min="1" max="10" step="1" required>
+
+  <label for="sleep">Sleep quality (1 = poor, 10 = excellent)</label>
+  <input type="number" id="sleep" name="sleep" min="1" max="10" step="1" required>
+
+  <label for="journal">What's going on today?</label>
+  <textarea id="journal" name="journal" required></textarea>
+
+  <button type="submit" id="submitBtn">Submit check-in</button>
+</form>
+
+<script>
+  // Disable the button after the first submit to avoid accidental double
+  // taps; the server also de-duplicates by submission_id, so a network
+  // retry after this still resolves to the same result.
+  document.getElementById('checkinForm').addEventListener('submit', function () {
+    var btn = document.getElementById('submitBtn');
+    btn.disabled = true;
+    btn.textContent = 'Submitting…';
+  });
+</script>
+{% endblock %}

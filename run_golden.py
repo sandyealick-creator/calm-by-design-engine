@@ -15,35 +15,42 @@ RESULTS_PATH = "golden_results.json"
 def check_case(case, result):
     """Returns (passed, notes) for one golden case."""
     notes = []
-    if case.get("expected_crisis"):
-        passed = bool(result.get("crisis_flag"))
-        if not passed:
-            notes.append("expected crisis_flag=true")
-        return passed, notes
-
     passed = True
-    if result.get("crisis_flag"):
-        passed = False
-        notes.append("unexpected crisis_flag=true")
 
-    expected_state = case.get("expected_state")
-    if expected_state and result.get("nervous_system_state") != expected_state:
+    expected_safety = case.get("expected_safety_signal")
+    if expected_safety and result.get("safety_signal") != expected_safety:
         passed = False
         notes.append(
-            f"state: expected {expected_state}, got {result.get('nervous_system_state')}"
+            f"safety_signal: expected {expected_safety}, got {result.get('safety_signal')}"
         )
 
-    expected_action = case.get("expected_action")
-    if expected_action and result.get("recommended_action") != expected_action:
+    expected_sentiment = case.get("expected_sentiment")
+    if expected_sentiment and result.get("sentiment") != expected_sentiment:
         passed = False
         notes.append(
-            f"action: expected {expected_action}, got {result.get('recommended_action')}"
+            f"sentiment: expected {expected_sentiment}, got {result.get('sentiment')}"
         )
+
+    if case.get("expected_progress_signal") is not None:
+        if bool(result.get("progress_signal")) != case["expected_progress_signal"]:
+            passed = False
+            notes.append(
+                f"progress_signal: expected {case['expected_progress_signal']}, "
+                f"got {result.get('progress_signal')}"
+            )
+
+    if case.get("expected_distress_signal") is not None:
+        if bool(result.get("distress_signal")) != case["expected_distress_signal"]:
+            passed = False
+            notes.append(
+                f"distress_signal: expected {case['expected_distress_signal']}, "
+                f"got {result.get('distress_signal')}"
+            )
 
     expected_element = case.get("expected_element")
-    if expected_element and result.get("buffer_element") != expected_element:
+    if expected_element and result.get("suggested_element") != expected_element:
         notes.append(
-            f"element: expected {expected_element}, got {result.get('buffer_element')} (soft check)"
+            f"element: expected {expected_element}, got {result.get('suggested_element')} (soft check)"
         )
 
     return passed, notes
