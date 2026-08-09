@@ -1,7 +1,9 @@
 import itertools
+import hashlib
 import os
 import sys
 import types
+import uuid
 
 os.environ.setdefault("AIRTABLE_API_KEY", "test-airtable-key")
 os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
@@ -13,6 +15,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 
 import main
+
+
+def submission_id_for(label):
+    """Stable canonical UUIDv4 values for readable replay test fixtures."""
+    raw = bytearray(hashlib.sha256(label.encode()).digest()[:16])
+    raw[6] = (raw[6] & 0x0F) | 0x40
+    raw[8] = (raw[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(raw)))
 
 
 class FakeAirtable:
@@ -86,11 +96,15 @@ def fake_airtable(monkeypatch):
             return None
         return rec
 
-    def find_log_by_submission_id(submission_id):
+    def find_log_by_submission_id(submission_id, client_record_id):
         if not submission_id:
             return None
         return store.find(
-            main.T_LOGS, lambda f: f.get(main.F_LOG["submission_id"]) == submission_id
+            main.T_LOGS,
+            lambda f: (
+                f.get(main.F_LOG["submission_id"]) == submission_id
+                and client_record_id in (f.get(main.F_LOG["client"]) or [])
+            ),
         )
 
     def find_assessment_by_log_id(log_record_id):

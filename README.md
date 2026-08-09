@@ -2,12 +2,12 @@
 
 AI-native adaptive routing service for the **Calm by Design** nervous system regulation program (White Raven Holistic). Built for the Build with Gemini XPRIZE, May–Aug 2026.
 
-**What it does:** lets a participant enroll once, then check in daily (symptom ratings + journal) through a branded web page. A deterministic, non-clinical support score plus a Gemini structured classification (sentiment, distress/progress signals, safety signal) decide one of five response routes — Positive/Progress, Steady, Grounding Support, Heightened Support, or the Safety Route — and every answer, score, classification, and routing decision is written to Airtable. Direct self-harm or imminent-danger language (checked on every submission by both Gemini and a narrow deterministic keyword backstop) triggers an immediate on-screen 988/911 safety message and a human owner alert, independent of the score. The original GoHighLevel form + webhook path (`/assess`) keeps working unchanged for participants still on that flow, sharing the same underlying assessment logic.
+**What it does:** lets a participant enroll once, then check in daily (symptom ratings + journal) through a branded web page. A deterministic, non-clinical support score plus a Gemini structured classification (sentiment, distress/progress signals, safety signal) decide one of five response routes — Positive/Progress, Steady, Grounding Support, Heightened Support, or the Safety Route — and write the check-in and routing audit trail to Airtable when persistence is available. Direct self-harm or imminent-danger language (checked on every submission by both Gemini and a narrow deterministic keyword backstop) triggers an immediate on-screen 988/911 safety message and a best-effort Crisis Alert record, independent of the score. Record creation does not prove notification delivery or human review. The original GoHighLevel form + webhook path (`/assess`) continues to use the same underlying assessment logic.
 
 ```
 Participant browser                              GoHighLevel (existing, unchanged)
   /enroll ──▶ Client record (Airtable)              GHL form ──▶ POST /assess ──┐
-  /checkin/verify ──▶ session cookie                                            │
+  /access#t=... ──▶ same-origin POST ──▶ session cookie                        │
   /checkin ──▶──────────────────────────────────────────────────────────────────┤
                                                                                  ▼
                                                             process_checkin() (shared core)
@@ -37,11 +37,11 @@ GHL's Crisis Alert Notification and Safety Buffer Routing workflows continue to 
 - [x] Airtable base ("CBD Core") built and populated, extended with participant/consent, scoring, and routing audit fields
 - [x] Gemini assessment engine (`main.py`) rewritten around a deterministic support score + 5-route model, with a shared core used by both the new web pages and the existing GHL webhook
 - [x] Participant-facing enrollment, check-in, recovery, and result/safety pages (`templates/`)
-- [x] Deployed to Google Cloud Run (`cbd-assess`, `us-east1`)
-- [x] End-to-end test verified: enroll → check-in → Gemini classification → Airtable records → state transition
+- [ ] Deploy and verify this version on Google Cloud Run (`cbd-assess`, `us-east1`)
+- [ ] Complete controlled end-to-end verification with test-only records before participant enrollment
 - [x] Credentials rotated after being briefly exposed in a shared doc during setup
 - [x] GitHub repo created and pushed *(this repo)*
-- [x] Existing GHL "Daily Check-In - Assessment" webhook workflow kept active against `/assess`, unchanged
+- [x] Existing GHL "Daily Check-In - Assessment" webhook workflow retained against `/assess`; controlled testing must verify its payload against the new length, rate, and optional submission-ID validation
 - [ ] New GHL "Send Check-in Link" workflow (Recovery Requests polling) — manual, see `MANUAL_TEST_CHECKLIST.md`
 - [x] Golden test set run and results archived (`golden_results.json`)
 - [ ] Devpost submission finalized
@@ -63,10 +63,15 @@ gcloud run deploy cbd-assess \
   --source . \
   --region us-east1 \
   --allow-unauthenticated \
-  --set-env-vars "GEMINI_API_KEY=...,AIRTABLE_API_KEY=...,WEBHOOK_SECRET=..."
+  --set-env-vars "GEMINI_API_KEY=...,AIRTABLE_API_KEY=...,WEBHOOK_SECRET=...,SESSION_SECRET=..."
 ```
 
-`--allow-unauthenticated` is safe here because every request must still carry a valid `X-Webhook-Secret` header — requests without it are rejected by the app itself.
+The participant enrollment, recovery, token-redemption, and check-in routes are
+intentionally public at the Cloud Run layer and enforce their own cookie, CSRF,
+token, and rate-limit controls. Only the machine-facing `/assess` route requires
+the `X-Webhook-Secret`. Controlled deployment testing must verify Cloud Run
+request-log behavior, proxy addressing, cookies, and all required environment
+variables before participant enrollment.
 
 ## Test
 

@@ -2,6 +2,8 @@
 
 Everything not marked "done locally" below needs a live Cloud Run deployment (or `python main.py` locally against real Airtable/Gemini) with real `GEMINI_API_KEY` / `AIRTABLE_API_KEY` / `WEBHOOK_SECRET` / `SESSION_SECRET` set, and must be run against **test data only**. Before starting: enroll every test participant with **Test Record** checked on the Clients table, and use email addresses you control — never a real participant's contact info. **Never trigger the safety route or medical-emergency route against a real phone number or email you don't own.**
 
+The replay/token remediation was validated locally with 162 mocked tests passing and outbound sockets blocked. This confirms mocked logic only; live Airtable, GHL, Gemini, Cloud Run, browser, and delivery behavior still require the approvals and manual checks below.
+
 ## Status legend
 
 - ✅ **Done locally** — verified this session via `pytest` (Airtable/Gemini mocked) and/or `run_golden.py` (real Gemini, no Airtable writes). Logic-level verification only.
@@ -13,8 +15,8 @@ Everything not marked "done locally" below needs a live Cloud Run deployment (or
 ## Before you start
 
 - [ ] 🔲 Needs live Airtable/Cloud Run. `SESSION_SECRET` and `WEBHOOK_SECRET` are set to long random strings, distinct from each other, not committed anywhere.
-- [ ] 🔲 Needs GHL workflow (not yet created). Create the new GHL workflow **"Send Check-in Link"**: Trigger = Airtable "New Record Created" on the `Recovery Requests` table, filtered to records where `Recovery Link` is not empty → Find Contact by email → Send Email containing the `Recovery Link` field value directly. That field holds the full, single-use, 30-minute link (`/recover/confirm?rt=...`); it's cleared automatically once the link is used.
-- [ ] 🔲 Needs live Airtable/Cloud Run. The existing "Daily Check-In - Assessment" GHL workflow and its webhook to `/assess` are still active and untouched (code-level: confirmed unchanged, `/assess` still calls the same shared `process_checkin()` core as before).
+- [ ] 🔲 Needs GHL workflow (not yet created). Create the new GHL workflow **"Send Check-in Link"**: Trigger = Airtable "New Record Created" on the `Recovery Requests` table, filtered to records where `Recovery Link` is not empty → Find Contact by email → Send Email containing the `Recovery Link` field value directly. That field holds the full, single-use, 30-minute fragment link (`/recover-access#rt=...`); the browser removes the fragment before same-origin POST redemption, and the Airtable field is cleared once used.
+- [ ] 🔲 Needs live Airtable/Cloud Run. The existing "Daily Check-In - Assessment" GHL workflow still targets `/assess`, which continues to call the shared `process_checkin()` core. Verify the real payload stays within the journal limit and either omits `submission_id` or supplies a canonical UUIDv4; malformed IDs now fail closed.
 - [ ] 🔲 Needs live Airtable/Cloud Run. The existing "Crisis Alert Notification" and "Safety Buffer Routing" GHL workflows are still active and untouched.
 
 ## A. Enrollment and identity
@@ -26,6 +28,7 @@ Everything not marked "done locally" below needs a live Cloud Run deployment (or
 - [x] ✅ Done locally. **Identity recovery, logic**: generic message regardless of match, real link only created for a matched email, single-use enforcement, full round trip (`test_recover_generic_message_regardless_of_match`, `test_recover_creates_token_only_for_matched_email`, `test_recover_confirm_full_round_trip`).
 - [ ] 🔲 Needs GHL workflow + live Airtable. **Identity recovery, email delivery**: confirm the actual email arrives and the link logs you back in, in a real inbox.
 - [ ] 🔲 Needs manual browser/phone. **Lost link / new device recovery path**: repeat from a second device/browser to confirm cross-device recovery works end-to-end.
+- [ ] 🔲 Needs Cloud Run. Confirm request logs do not contain access or recovery bearer tokens during `/access#t=...` and `/recover-access#rt=...` redemption. Fragments should never reach the HTTP request line; do not enroll participants if deployed logging contradicts this expectation.
 
 ## B–E. Daily check-in, scoring, routing
 
@@ -39,6 +42,7 @@ Everything not marked "done locally" below needs a live Cloud Run deployment (or
 - [x] ✅ Done locally. **Two legitimate same-day check-ins** save independently and can land in different tiers (`test_two_legitimate_same_day_checkins_are_independent`).
 - [ ] 🔲 Needs live Airtable. Confirm the on-screen result **and** the real Airtable `AI Assessments` row match (field-ID correctness against the actual base, not the test fake).
 - [ ] 🔲 Needs manual browser/phone. **Mobile layout**: run enrollment and check-in on an actual phone/emulator. No horizontal scrolling, inputs usable, 988/911/911-medical links tappable.
+- [ ] 🔲 Needs Cloud Run. Confirm `request.remote_addr` provides a useful participant/GHL boundary behind Cloud Run before relying on submission rate limits. Do not enable trust of `X-Forwarded-For` without an explicitly verified proxy-hop configuration.
 
 ## Safety and medical-emergency language (use only against your own test contact info)
 

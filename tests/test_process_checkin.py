@@ -3,6 +3,7 @@ import datetime as dt
 import pytest
 
 import main
+from conftest import submission_id_for
 from routing_config import (
     ROUTE_GROUNDING_SUPPORT,
     ROUTE_HEIGHTENED_SUPPORT,
@@ -19,6 +20,8 @@ HEIGHTENED = dict(physical=8, anxiety=8, energy=3, sleep=3)  # score 32 -> HEIGH
 
 
 def _checkin(client_rec, scores, journal, submission_id, source="Flask Web"):
+    if submission_id.startswith("sub-"):
+        submission_id = submission_id_for(submission_id)
     return main.process_checkin(
         client_rec, scores["physical"], scores["anxiety"], scores["energy"],
         scores["sleep"], journal, submission_id, source,
@@ -65,6 +68,130 @@ def test_idempotent_replay_same_submission_id_no_duplicate(fake_airtable, mock_g
     assert len(logs_after_second) == 1  # no new Daily Log created on retry
     assert result1["response_route"] == result2["response_route"]
     assert result1["score"] == result2["score"]
+
+
+def test_replay_is_scoped_to_authenticated_participant(
+    fake_airtable, mock_gemini, make_client_record
+):
+    participant_a = make_client_record(email="a@example.com", name="Participant A")
+    participant_b = make_client_record(email="b@example.com", name="Participant B")
+    replay_id = submission_id_for("cross-participant-replay")
+
+    mock_gemini.set(sentiment="distressed", distress_signal=True, summary="private b summary")
+    result_b = main.process_checkin(
+        participant_b, STEADY["physical"], STEADY["anxiety"], STEADY["energy"],
+        STEADY["sleep"], "Private B journal", replay_id, "Flask Web")
+    assert result_b["summary"] == "private b summary"
+
+    mock_gemini.set(sentiment="neutral", summary="participant a summary")
+    result_a = main.process_checkin(
+        participant_a, STEADY["physical"], STEADY["anxiety"], STEADY["energy"],
+        STEADY["sleep"], "Participant A journal", replay_id, "Flask Web")
+
+    assert result_a["summary"] == "participant a summary"
+    assert "private b" not in result_a["summary"]
+    logs = fake_airtable.find_all(main.T_LOGS)
+    assert len(logs) == 2
+    assert {tuple(r["fields"][main.F_LOG["client"]]) for r in logs} == {
+        (participant_a["id"],), (participant_b["id"],),
+    }
+
+
+def test_replay_rejects_unexpected_client_link_after_scoped_lookup(
+    fake_airtable, mock_gemini, make_client_record, monkeypatch
+):
+    participant_a = make_client_record(email="a-link@example.com")
+    participant_b = make_client_record(email="b-link@example.com")
+    replay_id = submission_id_for("unexpected-client-link")
+    foreign_log = fake_airtable.create(main.T_LOGS, {
+        main.F_LOG["submission_id"]: replay_id,
+        main.F_LOG["client"]: [participant_b["id"]],
+    })
+    monkeypatch.setattr(main, "find_log_by_submission_id", lambda *_: foreign_log)
+    mock_gemini.set(summary="owned result")
+
+    result = main.process_checkin(
+        participant_a, STEADY["physical"], STEADY["anxiety"], STEADY["energy"],
+        STEADY["sleep"], "Owned journal", replay_id, "Flask Web")
+
+    assert result["summary"] == "owned result"
+    owned_logs = [
+        r for r in fake_airtable.find_all(main.T_LOGS)
+        if participant_a["id"] in (r["fields"].get(main.F_LOG["client"]) or [])
+    ]
+    assert len(owned_logs) == 1
+
+
+def test_replay_rejects_assessment_linked_to_another_participant(
+    fake_airtable, mock_gemini, make_client_record
+):
+    participant_a = make_client_record(email="a-assessment@example.com")
+    participant_b = make_client_record(email="b-assessment@example.com")
+    replay_id = submission_id_for("foreign-assessment-link")
+    owned_log = fake_airtable.create(main.T_LOGS, {
+        main.F_LOG["submission_id"]: replay_id,
+        main.F_LOG["client"]: [participant_a["id"]],
+    })
+    fake_airtable.create(main.T_ASSESS, {
+        main.F_ASSESS["daily_log"]: [owned_log["id"]],
+        main.F_ASSESS["client"]: [participant_b["id"]],
+        main.F_ASSESS["reasoning"]: "private participant b summary",
+        main.F_ASSESS["response_route"]: main.ROUTE_LABELS[ROUTE_SAFETY],
+    })
+
+    result = main.process_checkin(
+        participant_a, STEADY["physical"], STEADY["anxiety"], STEADY["energy"],
+        STEADY["sleep"], "Participant A ordinary journal", replay_id, "Flask Web")
+
+    assert result["processing_incomplete"] is True
+    assert result["summary"] == ""
+    assert "private participant b" not in str(result).lower()
+    assert len(fake_airtable.find_all(main.T_LOGS)) == 1
+
+
+def test_submission_id_validation_rejects_airtable_special_characters_before_lookup(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        main.requests, "get",
+        lambda *args, **kwargs: pytest.fail("Malformed ID must not reach Airtable"),
+    )
+    with pytest.raises(ValueError, match="invalid submission_id"):
+        main.find_log_by_submission_id("x'\\) OR(TRUE())", "rec-client")
+
+
+def test_airtable_string_literal_escapes_quotes_and_backslashes():
+    assert main._airtable_string_literal("a'b\\c") == "a\\'b\\\\c"
+
+
+def test_production_replay_formula_is_client_scoped_and_escaped(monkeypatch):
+    replay_id = submission_id_for("scoped-production-formula")
+    client_id = "rec'client\\value"
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"records": [{
+                "id": "rec-log",
+                "fields": {main.F_LOG["client"]: [client_id]},
+            }]}
+
+    def fake_get(*args, **kwargs):
+        captured.update(kwargs["params"])
+        return Response()
+
+    monkeypatch.setattr(main.requests, "get", fake_get)
+    result = main.find_log_by_submission_id(replay_id, client_id)
+
+    assert result["id"] == "rec-log"
+    formula = captured["filterByFormula"]
+    assert formula.startswith("AND(")
+    assert replay_id in formula
+    assert "rec\\'client\\\\value" in formula
+    assert "ARRAYJOIN({Client})" in formula
 
 
 def test_two_legitimate_same_day_checkins_are_independent(fake_airtable, mock_gemini, make_client_record):
@@ -147,6 +274,26 @@ def test_gemini_unavailable_still_routes_by_score(fake_airtable, mock_gemini, ma
     result = _checkin(client_rec, GROUNDING, "Rough day, nothing dangerous though.", "sub-fallback-score")
     assert result["fallback_mode"] is True
     assert result["response_route"] == ROUTE_GROUNDING_SUPPORT
+
+
+def test_gemini_fallback_log_excludes_identity_content_and_raw_exception(
+    fake_airtable, mock_gemini, make_client_record, caplog
+):
+    journal = "private fallback journal content"
+    raw_exception = "private fallback exception detail"
+    client_rec = make_client_record(
+        email="fallback-private@example.com", name="Private Participant")
+    mock_gemini.fail(RuntimeError(raw_exception))
+
+    _checkin(client_rec, STEADY, journal, "sub-fallback-private-log")
+
+    output = caplog.text
+    assert "gemini_fallback" in output
+    for prohibited in (
+        "Private Participant", "fallback-private@example.com", journal,
+        raw_exception, client_rec["id"],
+    ):
+        assert prohibited not in output
 
 
 def test_malformed_gemini_response_triggers_fallback(fake_airtable, mock_gemini, make_client_record):
@@ -338,7 +485,7 @@ def test_replay_log_lookup_failure_preserves_emergency_with_unknown_state(
 
     monkeypatch.setattr(
         main, "find_log_by_submission_id",
-        lambda submission_id: (_ for _ in ()).throw(
+        lambda submission_id, client_record_id: (_ for _ in ()).throw(
             ConnectionError(raw_exception)),
     )
     monkeypatch.setattr(
@@ -391,7 +538,8 @@ def test_replay_assessment_lookup_failure_confirms_saved_but_not_alert_state(
         main.F_CLIENT["access_token_hash"]: sensitive_token,
     })
     fake_airtable.create(main.T_LOGS, {
-        main.F_LOG["submission_id"]: "sub-replay-assessment-lookup-failure",
+        main.F_LOG["submission_id"]: submission_id_for(
+            "sub-replay-assessment-lookup-failure"),
         main.F_LOG["client"]: [client_rec["id"]],
     })
     raw_exception = (
@@ -583,6 +731,73 @@ def test_ai_assessment_failure_keeps_saved_emergency_result_unprocessed(
     assert main.F_LOG["processed"] not in log_record["fields"]
 
 
+def test_retry_after_assessment_failure_never_duplicates_emergency_side_effects(
+    fake_airtable, mock_gemini, make_client_record, monkeypatch
+):
+    client_rec = make_client_record()
+    replay_id = "sub-assessment-failure-retry"
+    original_create = main.at_create
+    webhook_calls = []
+    monkeypatch.setenv("GHL_CRISIS_WEBHOOK", "https://example.invalid/crisis")
+
+    class AcceptedResponse:
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(
+        main.requests, "post",
+        lambda *args, **kwargs: webhook_calls.append((args, kwargs)) or AcceptedResponse(),
+    )
+
+    def fail_assessment(table, fields):
+        if table == main.T_ASSESS:
+            raise ConnectionError("private assessment detail")
+        return original_create(table, fields)
+
+    monkeypatch.setattr(main, "at_create", fail_assessment)
+
+    first = _checkin(client_rec, STEADY, "I want to die.", replay_id)
+    retry = _checkin(client_rec, STEADY, "I want to die.", replay_id)
+
+    assert first["later_processing_failed"] is True
+    assert retry["response_route"] == ROUTE_SAFETY
+    assert retry["processing_incomplete"] is True
+    assert retry["checkin_saved"] is True
+    assert retry["crisis_alert_created"] is None
+    assert len(fake_airtable.find_all(main.T_LOGS)) == 1
+    assert len(fake_airtable.find_all(main.T_CRISIS)) == 1
+    assert len(fake_airtable.find_all(main.T_ASSESS)) == 0
+    assert len(webhook_calls) == 1
+    crisis = fake_airtable.find_all(main.T_CRISIS)[0]
+    assert main.F_CRISIS["assessment"] not in crisis["fields"]
+
+
+def test_non_emergency_partial_replay_does_not_duplicate_daily_log(
+    fake_airtable, mock_gemini, make_client_record, monkeypatch
+):
+    client_rec = make_client_record()
+    replay_id = "sub-ordinary-assessment-failure-retry"
+    original_create = main.at_create
+
+    def fail_assessment(table, fields):
+        if table == main.T_ASSESS:
+            raise ConnectionError("private assessment detail")
+        return original_create(table, fields)
+
+    monkeypatch.setattr(main, "at_create", fail_assessment)
+    with pytest.raises(ConnectionError):
+        _checkin(client_rec, STEADY, "An ordinary steady day.", replay_id)
+
+    retry = _checkin(client_rec, STEADY, "An ordinary steady day.", replay_id)
+
+    assert retry["response_route"] is None
+    assert retry["processing_incomplete"] is True
+    assert retry["checkin_saved"] is True
+    assert len(fake_airtable.find_all(main.T_LOGS)) == 1
+    assert len(fake_airtable.find_all(main.T_CRISIS)) == 0
+    assert len(fake_airtable.find_all(main.T_ASSESS)) == 0
+
+
 def test_crisis_alert_link_failure_keeps_emergency_result(
     fake_airtable, mock_gemini, make_client_record, monkeypatch
 ):
@@ -711,6 +926,24 @@ def test_ordinary_wellness_success_still_calls_gemini_and_saves_normally(
     assert result["later_processing_failed"] is False
     assert len(fake_airtable.find_all(main.T_LOGS)) == 1
     assert len(fake_airtable.find_all(main.T_ASSESS)) == 1
+
+
+def test_ordinary_success_log_excludes_participant_identity_and_content(
+    fake_airtable, mock_gemini, make_client_record, caplog
+):
+    journal = "private ordinary journal content"
+    client_rec = make_client_record(
+        email="ordinary-private@example.com", name="Private Participant")
+
+    _checkin(client_rec, STEADY, journal, "sub-ordinary-private-log")
+
+    output = caplog.text
+    assert '"event": "assessment"' in output
+    for prohibited in (
+        "Private Participant", "ordinary-private@example.com", journal,
+        client_rec["id"], submission_id_for("sub-ordinary-private-log"),
+    ):
+        assert prohibited not in output
 
 
 def test_ordinary_initial_daily_log_failure_preserves_generic_exception_behavior(

@@ -2,7 +2,11 @@
 {% block title %}Your check-in{% endblock %}
 {% block content %}
 
-{% if response_route == "MEDICAL_EMERGENCY_ROUTE" %}
+{% if processing_incomplete and not response_route %}
+  <h1>Your check-in was saved.</h1>
+  <p>We could not finish processing it right now, so no response route or follow-up is confirmed. Please do not submit the same check-in again.</p>
+
+{% elif response_route == "MEDICAL_EMERGENCY_ROUTE" %}
   <div class="safety-box">
     <h2>This may be a medical emergency</h2>
     <p>What you shared may describe a medical emergency. This app is not emergency care and is not monitored in real time.</p>
@@ -87,13 +91,13 @@
 {% endif %}
 
 {% if checkin_saved is sameas true %}
-<p class="muted" style="margin-top:24px;">Your check-in was saved.{% if fallback_mode %} The AI reader was unavailable, so deterministic fallback routing was used.{% endif %}</p>
+<p class="muted" style="margin-top:24px;">Your check-in was saved.{% if processing_incomplete %} We could not finish processing it, and no notification, delivery, review, or response is confirmed.{% elif fallback_mode %} The AI reader was unavailable, so deterministic fallback routing was used.{% endif %}</p>
 {% elif checkin_saved is sameas false %}
 <p class="muted" style="margin-top:24px;">We could not save this check-in. The emergency resources above are still available. Please do not wait for a response from us.</p>
 {% else %}
 <p class="muted" style="margin-top:24px;">We could not confirm whether this check-in was saved. The emergency resources above are still available. Please do not wait for a response from us.</p>
 {% endif %}
-{% if response_route != "MEDICAL_EMERGENCY_ROUTE" %}
+{% if response_route != "MEDICAL_EMERGENCY_ROUTE" and not processing_incomplete %}
 <p class="muted" style="font-size:0.75rem;">{{ safety_footer }}</p>
 {% endif %}
 {% endblock %}

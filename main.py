@@ -207,7 +207,16 @@ with open(os.path.join(os.path.dirname(__file__), "system_prompt.txt")) as f:
 ACCESS_TOKEN_TTL_DAYS = 90
 RECOVERY_TOKEN_TTL_MINUTES = 30
 RECOVERY_RATE_LIMIT_PER_HOUR = 5
-IP_RATE_LIMIT = {"enroll": (10, 3600), "recover": (10, 3600)}
+MAX_JOURNAL_LENGTH = 5000
+IP_RATE_LIMIT = {
+    "enroll": (10, 3600),
+    "recover": (10, 3600),
+    "checkin": (30, 3600),
+    # GHL may submit multiple participants from one egress address. This is a
+    # high enough operational ceiling to avoid normal batching while still
+    # bounding a leaked webhook secret within one app instance.
+    "assess": (300, 60),
+}
 SESSION_COOKIE = "cbd_token"
 CSRF_COOKIE = "cbd_csrf"
 
@@ -236,13 +245,38 @@ def rate_limited(bucket, ip):
 
 
 def client_ip():
-    fwd = request.headers.get("X-Forwarded-For", "")
-    return fwd.split(",")[0].strip() if fwd else (request.remote_addr or "unknown")
+    # Do not trust a caller-controlled X-Forwarded-For chain without an
+    # explicitly verified ProxyFix hop count. Cloud Run proxy behavior must be
+    # confirmed during controlled deployment testing before changing this.
+    return request.remote_addr or "unknown"
 
 
 # ---------------------------------------------------------------------------
 # Airtable helpers
 # ---------------------------------------------------------------------------
+def _airtable_string_literal(value):
+    """Escape a value embedded inside a single-quoted Airtable formula."""
+    return str(value).replace("\\", "\\\\").replace("'", "\\'")
+
+
+def new_submission_id():
+    """Return the one accepted replay-key format: a canonical UUIDv4."""
+    return str(uuid.uuid4())
+
+
+def validate_submission_id(value):
+    """Return a canonical UUIDv4 or raise without contacting Airtable."""
+    if not isinstance(value, str) or len(value) != 36:
+        raise ValueError("invalid submission_id")
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError):
+        raise ValueError("invalid submission_id") from None
+    if parsed.version != 4 or str(parsed) != value:
+        raise ValueError("invalid submission_id")
+    return str(parsed)
+
+
 def at_headers():
     return {"Authorization": f"Bearer {os.environ['AIRTABLE_API_KEY']}",
             "Content-Type": "application/json"}
@@ -271,9 +305,9 @@ def at_get(table, record_id):
 
 def find_client(email=None, ghl_id=None):
     if ghl_id:
-        formula = f"{{GHL Contact ID}}='{ghl_id}'"
+        formula = "{GHL Contact ID}='%s'" % _airtable_string_literal(ghl_id)
     else:
-        formula = f"LOWER({{Email}})='{(email or '').lower()}'"
+        formula = "LOWER({Email})='%s'" % _airtable_string_literal((email or "").lower())
     r = requests.get(f"{AT_URL}/{T_CLIENTS}", headers=at_headers(),
                      params={"filterByFormula": formula, "maxRecords": 1,
                              "returnFieldsByFieldId": "true"}, timeout=30)
@@ -286,7 +320,7 @@ def find_client_by_access_token(raw_token):
     if not raw_token:
         return None
     token_hash = hash_token(raw_token)
-    formula = f"{{Access Token Hash}}='{token_hash}'"
+    formula = "{Access Token Hash}='%s'" % _airtable_string_literal(token_hash)
     r = requests.get(f"{AT_URL}/{T_CLIENTS}", headers=at_headers(),
                      params={"filterByFormula": formula, "maxRecords": 1,
                              "returnFieldsByFieldId": "true"}, timeout=30)
@@ -301,23 +335,34 @@ def find_client_by_access_token(raw_token):
     return rec
 
 
-def find_log_by_submission_id(submission_id):
-    if not submission_id:
-        return None
-    formula = f"{{Submission ID}}='{submission_id}'"
+def _record_links_to_client(record, field_id, client_record_id):
+    links = (record or {}).get("fields", {}).get(field_id) or []
+    return isinstance(links, list) and client_record_id in links
+
+
+def find_log_by_submission_id(submission_id, client_record_id):
+    submission_id = validate_submission_id(submission_id)
+    escaped_submission = _airtable_string_literal(submission_id)
+    escaped_client = _airtable_string_literal(client_record_id)
+    formula = (
+        "AND({Submission ID}='%s',FIND('%s',ARRAYJOIN({Client})))"
+        % (escaped_submission, escaped_client)
+    )
     r = requests.get(f"{AT_URL}/{T_LOGS}", headers=at_headers(),
                      params={"filterByFormula": formula, "maxRecords": 1,
                              "returnFieldsByFieldId": "true"}, timeout=30)
     r.raise_for_status()
     recs = r.json().get("records", [])
-    return recs[0] if recs else None
+    if not recs or not _record_links_to_client(recs[0], F_LOG["client"], client_record_id):
+        return None
+    return recs[0]
 
 
 def find_assessment_by_log_id(log_record_id):
     """Look up the AI Assessment for a Daily Log directly via the
     assessment's own Daily Log link field, rather than relying on the log's
     reverse-link field having been populated yet."""
-    formula = f"FIND('{log_record_id}', ARRAYJOIN({{Daily Log}}))"
+    formula = "FIND('%s', ARRAYJOIN({Daily Log}))" % _airtable_string_literal(log_record_id)
     r = requests.get(f"{AT_URL}/{T_ASSESS}", headers=at_headers(),
                      params={"filterByFormula": formula, "maxRecords": 1,
                              "returnFieldsByFieldId": "true"}, timeout=30)
@@ -327,7 +372,7 @@ def find_assessment_by_log_id(log_record_id):
 
 
 def prior_assessments(client_record_id, n=3):
-    formula = f"FIND('{client_record_id}', ARRAYJOIN({{Client}}))"
+    formula = "FIND('%s', ARRAYJOIN({Client}))" % _airtable_string_literal(client_record_id)
     r = requests.get(f"{AT_URL}/{T_ASSESS}", headers=at_headers(),
                      params={"filterByFormula": formula, "maxRecords": n,
                              "returnFieldsByFieldId": "true",
@@ -345,7 +390,7 @@ def prior_assessments(client_record_id, n=3):
 
 
 def find_recovery_by_token_hash(token_hash):
-    formula = f"{{Recovery Token Hash}}='{token_hash}'"
+    formula = "{Recovery Token Hash}='%s'" % _airtable_string_literal(token_hash)
     r = requests.get(f"{AT_URL}/{T_RECOVERY}", headers=at_headers(),
                      params={"filterByFormula": formula, "maxRecords": 1,
                              "returnFieldsByFieldId": "true"}, timeout=30)
@@ -384,6 +429,23 @@ def _session_secret():
 
 def new_random_token():
     return secrets.token_urlsafe(32)
+
+
+def access_fragment_path(raw_token):
+    """Build a bearer link for separate trusted delivery, never HTML output."""
+    if not valid_bearer_token(raw_token):
+        raise ValueError("invalid access token")
+    return f"/access#t={raw_token}"
+
+
+def recovery_fragment_path(raw_token):
+    if not valid_bearer_token(raw_token):
+        raise ValueError("invalid recovery token")
+    return f"/recover-access#rt={raw_token}"
+
+
+def valid_bearer_token(raw_token):
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]{43}", raw_token or ""))
 
 
 def hash_token(raw_token):
@@ -441,6 +503,21 @@ def valid_csrf():
 
 def no_store(resp):
     resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+REDEMPTION_CSP = (
+    "default-src 'none'; script-src 'self'; connect-src 'self'; "
+    "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+)
+
+
+def protect_redemption_response(resp):
+    """Prevent token-redemption documents and responses from being retained."""
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Content-Security-Policy"] = REDEMPTION_CSP
+    resp.headers["X-Content-Type-Options"] = "nosniff"
     return resp
 
 
@@ -546,6 +623,8 @@ def process_checkin(client_rec, physical, anxiety, energy, sleep, journal, submi
     client_id = client_rec["id"]
     cf = client_rec["fields"]
     client_name = cf.get(F_CLIENT["name"], "Unknown")
+    submission_id = (
+        validate_submission_id(submission_id) if submission_id else new_submission_id())
 
     # Run both deterministic backstops before any Airtable operation in this
     # shared core. If persistence is unavailable, clear current emergency
@@ -554,38 +633,47 @@ def process_checkin(client_rec, physical, anxiety, energy, sleep, journal, submi
     keyword_medical, keyword_medical_phrase = check_medical_emergency(journal)
     keyword_safety_triggered = is_safety_triggering(keyword_signal)
 
-    if submission_id:
+    try:
+        existing_log = find_log_by_submission_id(submission_id, client_id)
+    except Exception as exc:
+        if keyword_safety_triggered or keyword_medical:
+            return _build_early_emergency_result(
+                None, physical, anxiety, energy, sleep,
+                keyword_safety_triggered, keyword_medical,
+                checkin_saved=None, crisis_alert_created=None,
+                failure_event="checkin_replay_log_lookup_failed",
+                error_type=type(exc).__name__)
+        raise
+    # The production query is client-scoped, but independently enforce the
+    # returned relationship so a malformed or stale Airtable response cannot
+    # cross participant boundaries.
+    if existing_log and not _record_links_to_client(
+            existing_log, F_LOG["client"], client_id):
+        existing_log = None
+    if existing_log:
         try:
-            existing_log = find_log_by_submission_id(submission_id)
+            existing_assessment = find_assessment_by_log_id(existing_log["id"])
         except Exception as exc:
             if keyword_safety_triggered or keyword_medical:
                 return _build_early_emergency_result(
                     None, physical, anxiety, energy, sleep,
                     keyword_safety_triggered, keyword_medical,
-                    checkin_saved=None, crisis_alert_created=None,
-                    failure_event="checkin_replay_log_lookup_failed",
+                    checkin_saved=True, crisis_alert_created=None,
+                    failure_event="checkin_replay_assessment_lookup_failed",
                     error_type=type(exc).__name__)
             raise
-        if existing_log:
-            try:
-                existing_assessment = find_assessment_by_log_id(existing_log["id"])
-            except Exception as exc:
-                if keyword_safety_triggered or keyword_medical:
-                    return _build_early_emergency_result(
-                        None, physical, anxiety, energy, sleep,
-                        keyword_safety_triggered, keyword_medical,
-                        checkin_saved=True, crisis_alert_created=None,
-                        failure_event="checkin_replay_assessment_lookup_failed",
-                        error_type=type(exc).__name__)
-                raise
-            if existing_assessment:
-                return _result_from_assessment(existing_assessment)
+        if existing_assessment and _record_links_to_client(
+                existing_assessment, F_ASSESS["client"], client_id):
+            return _result_from_assessment(existing_assessment)
+        # A saved log without a provably owned assessment is a partial prior
+        # submission. Never fall through to duplicate writes or webhooks.
+        return _build_incomplete_replay_result(
+            physical, anxiety, energy, sleep,
+            keyword_safety_triggered, keyword_medical)
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     score = support_score(physical, anxiety, energy, sleep)
     tier = score_tier(score)
-    submission_id = submission_id or str(uuid.uuid4())
-
     try:
         log_rec = at_create(T_LOGS, {
             F_LOG["log_id"]: f"{client_name}-{today}-{submission_id[:8]}",
@@ -622,9 +710,8 @@ def process_checkin(client_rec, physical, anxiety, energy, sleep, journal, submi
         validate_gemini_result(gemini_result)
     except Exception as exc:  # Gemini unavailable, timed out, or malformed output
         fallback_mode = True
-        fallback_reason = f"{type(exc).__name__}: {exc}"[:200]
-        log.info(json.dumps({"event": "gemini_fallback", "reason": type(exc).__name__,
-                             "client": client_name}))
+        fallback_reason = type(exc).__name__
+        log.info(json.dumps({"event": "gemini_fallback", "reason": type(exc).__name__}))
         gemini_result = None
 
     if gemini_result:
@@ -833,7 +920,7 @@ def process_checkin(client_rec, physical, anxiety, energy, sleep, journal, submi
     at_create(T_ASSESS, assess_fields)
     at_update(T_LOGS, log_rec["id"], {F_LOG["processed"]: True})
 
-    log.info(json.dumps({"event": "assessment", "client": client_name,
+    log.info(json.dumps({"event": "assessment",
                          "score_tier": tier, "response_route": response_route,
                          "fallback_mode": fallback_mode, "latency_ms": latency_ms,
                          "tokens_in": tok_in, "tokens_out": tok_out, "model": GEMINI_MODEL}))
@@ -845,10 +932,11 @@ def process_checkin(client_rec, physical, anxiety, energy, sleep, journal, submi
 def _build_result(response_route, score, tier, element, summary, trigger_reasons, fallback_mode,
                   medical_emergency_triggered=False, checkin_saved=True,
                   crisis_alert_created=False, owner_notification_confirmed=False,
-                  http_status=200, later_processing_failed=False):
+                  http_status=200, later_processing_failed=False,
+                  processing_incomplete=False):
     return {
         "response_route": response_route,
-        "response_route_label": ROUTE_LABELS[response_route],
+        "response_route_label": ROUTE_LABELS.get(response_route, ""),
         "score": score,
         "tier": tier,
         "tier_label": TIER_LABELS[tier],
@@ -863,8 +951,38 @@ def _build_result(response_route, score, tier, element, summary, trigger_reasons
         "owner_notification_confirmed": owner_notification_confirmed,
         "http_status": http_status,
         "later_processing_failed": later_processing_failed,
+        "processing_incomplete": processing_incomplete,
         "safety_footer": SAFETY_FOOTER,
     }
+
+
+def _build_incomplete_replay_result(physical, anxiety, energy, sleep,
+                                    safety_triggered, medical_triggered):
+    """Represent an owned saved log whose assessment is not provable.
+
+    No persistence, Gemini, alert, or webhook operation is retried here.
+    """
+    log.info(json.dumps({"event": "replay_processing_incomplete"}))
+    score = support_score(physical, anxiety, energy, sleep)
+    tier = score_tier(score)
+    if safety_triggered:
+        response_route = ROUTE_SAFETY
+    elif medical_triggered:
+        response_route = ROUTE_MEDICAL_EMERGENCY
+    else:
+        response_route = None
+    return _build_result(
+        response_route, score, tier, None, "",
+        ["saved check-in assessment unavailable during replay"],
+        fallback_mode=False,
+        medical_emergency_triggered=medical_triggered,
+        checkin_saved=True,
+        crisis_alert_created=None,
+        owner_notification_confirmed=False,
+        http_status=200,
+        later_processing_failed=True,
+        processing_incomplete=True,
+    )
 
 
 def _log_persistence_failure(event, error_type):
@@ -978,12 +1096,16 @@ def health():
 def assess():
     if request.headers.get("X-Webhook-Secret") != os.environ["WEBHOOK_SECRET"]:
         return jsonify({"error": "unauthorized"}), 401
+    if rate_limited("assess", client_ip()):
+        return jsonify({"error": "too many requests"}), 429
 
     body = request.get_json(force=True, silent=True) or {}
     data = body.get("customData") or body
     journal = (data.get("journal_text") or "").strip()
     if not journal:
         return jsonify({"error": "journal_text required"}), 400
+    if len(journal) > MAX_JOURNAL_LENGTH:
+        return jsonify({"error": "journal_text too long"}), 400
 
     try:
         scores = {k: int(data.get(k)) for k in ("sleep", "energy", "anxiety", "physical_symptoms")}
@@ -992,13 +1114,19 @@ def assess():
     except (TypeError, ValueError):
         return jsonify({"error": "sleep, energy, anxiety, physical_symptoms must be integers 1-10"}), 400
 
+    try:
+        submission_id = validate_submission_id(
+            data.get("submission_id") or new_submission_id())
+    except ValueError:
+        return jsonify({"error": "invalid submission_id"}), 400
+
     client_rec = find_client(email=data.get("email"), ghl_id=data.get("ghl_contact_id"))
     if not client_rec:
         return jsonify({"error": "client not found"}), 404
 
     result = process_checkin(client_rec, scores["physical_symptoms"], scores["anxiety"],
                              scores["energy"], scores["sleep"], journal,
-                             data.get("submission_id") or str(uuid.uuid4()),
+                             submission_id,
                              data.get("source", "GHL Form"))
     if result.get("http_status", 200) != 200 or result.get("later_processing_failed", False):
         # Preserve the established /assess failure contract. Participant-facing
@@ -1007,6 +1135,7 @@ def assess():
     internal_keys = {
         "element", "checkin_saved", "crisis_alert_created",
         "owner_notification_confirmed", "http_status", "later_processing_failed",
+        "processing_incomplete",
     }
     return jsonify({"status": "ok",
                     **{k: v for k, v in result.items() if k not in internal_keys}}), 200
@@ -1063,26 +1192,43 @@ def enroll_submit():
     client_id = created["id"]
 
     raw_token, expires = issue_access_token(client_id)
-    checkin_link = f"{request.url_root.rstrip('/')}/checkin/verify?t={raw_token}"
-
-    resp = make_response(render_template("enroll_success.html", checkin_link=checkin_link))
+    resp = make_response(redirect("/checkin"))
     resp = set_access_cookie(resp, raw_token, expires)
+    resp.headers["Referrer-Policy"] = "no-referrer"
     return no_store(resp)
 
 
 # ---------------------------------------------------------------------------
 # Routes - check-in
 # ---------------------------------------------------------------------------
-@app.get("/checkin/verify")
-def checkin_verify():
-    raw_token = request.args.get("t", "")
+@app.get("/access")
+def access_redeem_page():
+    return protect_redemption_response(make_response(render_template("redeem.html")))
+
+
+@app.post("/access")
+def access_redeem_submit():
+    raw_token = request.form.get("token", "")
+    if not valid_bearer_token(raw_token):
+        return protect_redemption_response(make_response("", 400))
     client_rec = find_client_by_access_token(raw_token)
     if not client_rec:
-        return no_store(make_response(render_template("link_invalid.html"), 400))
+        return protect_redemption_response(make_response("", 400))
     expires = _parse_iso(client_rec["fields"][F_CLIENT["access_token_expires_at"]])
-    resp = make_response(redirect("/checkin"))
+    resp = make_response("", 204)
     resp = set_access_cookie(resp, raw_token, expires)
-    return no_store(resp)
+    return protect_redemption_response(resp)
+
+
+@app.get("/checkin/verify")
+def legacy_checkin_verify_rejected():
+    """Bearer query parameters are intentionally no longer accepted."""
+    return no_store(make_response(render_template("link_invalid.html"), 400))
+
+
+@app.get("/link-invalid")
+def link_invalid():
+    return no_store(make_response(render_template("link_invalid.html"), 400))
 
 
 @app.get("/checkin")
@@ -1090,7 +1236,7 @@ def checkin_form():
     client_rec = get_current_client()
     if not client_rec:
         return no_store(redirect("/recover"))
-    submission_id = str(uuid.uuid4())
+    submission_id = new_submission_id()
     name = client_rec["fields"].get(F_CLIENT["name"], "there")
     return no_store(csrf_render("checkin.html", name=name,
                                 submission_id=submission_id, error=None))
@@ -1098,20 +1244,23 @@ def checkin_form():
 
 @app.post("/checkin")
 def checkin_submit():
-    identity_error = None
-    try:
-        client_rec = get_current_client()
-    except Exception as exc:
-        client_rec = None
-        identity_error = exc
-
-    if identity_error is None and not client_rec:
-        return no_store(redirect("/recover"))
-
     if not valid_csrf():
         return no_store(make_response(render_template("link_invalid.html"), 400))
 
-    submission_id = request.form.get("submission_id") or str(uuid.uuid4())
+    if rate_limited("checkin", client_ip()):
+        return no_store(csrf_render(
+            "checkin.html", status=429, name="there",
+            submission_id=new_submission_id(),
+            error="Too many check-ins were submitted. Please wait a bit and try again."))
+
+    raw_submission_id = request.form.get("submission_id", "")
+    try:
+        submission_id = validate_submission_id(raw_submission_id)
+    except ValueError:
+        return no_store(csrf_render(
+            "checkin.html", status=400, name="there",
+            submission_id=new_submission_id(),
+            error="This check-in form expired. Please try again."))
     journal = (request.form.get("journal") or "").strip()
 
     try:
@@ -1121,15 +1270,27 @@ def checkin_submit():
         sleep = int(request.form.get("sleep", ""))
         if not all(1 <= v <= 10 for v in (physical, anxiety, energy, sleep)):
             raise ValueError
-        if not journal:
+        if not journal or len(journal) > MAX_JOURNAL_LENGTH:
             raise ValueError
     except ValueError:
-        if identity_error is not None:
-            raise identity_error
-        name = client_rec["fields"].get(F_CLIENT["name"], "there")
         return no_store(csrf_render(
-            "checkin.html", name=name, submission_id=submission_id,
-            error="Please enter a whole number from 1 to 10 for each rating, and a journal entry."))
+            "checkin.html", name="there", submission_id=submission_id,
+            error=(
+                "Please enter a whole number from 1 to 10 for each rating, and a journal entry "
+                f"of no more than {MAX_JOURNAL_LENGTH} characters.")))
+
+    # Identity is deliberately resolved only after CSRF, replay-key, score,
+    # and journal-length validation, so malformed or oversized submissions do
+    # not reach Airtable.
+    identity_error = None
+    try:
+        client_rec = get_current_client()
+    except Exception as exc:
+        client_rec = None
+        identity_error = exc
+
+    if identity_error is None and not client_rec:
+        return no_store(redirect("/recover"))
 
     if identity_error is not None:
         keyword_signal, _ = check_safety(journal)
@@ -1158,7 +1319,8 @@ def checkin_submit():
 # ---------------------------------------------------------------------------
 # Routes - recovery
 # ---------------------------------------------------------------------------
-GENERIC_RECOVERY_MESSAGE = "If that email is enrolled, a check-in link is on its way."
+GENERIC_RECOVERY_MESSAGE = (
+    "If recovery delivery is available for that account, instructions will be sent.")
 
 
 def create_recovery_request(email, client_rec=None):
@@ -1187,11 +1349,11 @@ def create_recovery_request(email, client_rec=None):
         # The GHL "Send Check-in Link" workflow reads this field to email the
         # link. It cannot be reconstructed from the hash, so the raw,
         # single-use, 30-minute link is stored here and cleared on redemption
-        # (see recover_confirm). Airtable is already the trust boundary for
+        # (see recovery_redeem_submit). Airtable is already the trust boundary for
         # this app, so a short-lived recovery link is consistent with the
         # existing recovery design.
         fields[F_RECOVERY["recovery_link"]] = (
-            f"{request.url_root.rstrip('/')}/recover/confirm?rt={raw_recovery_token}")
+            f"{request.url_root.rstrip('/')}{recovery_fragment_path(raw_recovery_token)}")
     at_create(T_RECOVERY, fields)
 
 
@@ -1212,32 +1374,43 @@ def recover_submit():
     return no_store(csrf_render("recover.html", message=GENERIC_RECOVERY_MESSAGE))
 
 
-@app.get("/recover/confirm")
-def recover_confirm():
-    raw_token = request.args.get("rt", "")
-    if not raw_token:
-        return no_store(make_response(render_template("link_invalid.html"), 400))
+@app.get("/recover-access")
+def recovery_redeem_page():
+    return protect_redemption_response(make_response(render_template("redeem.html")))
+
+
+@app.post("/recover-access")
+def recovery_redeem_submit():
+    raw_token = request.form.get("token", "")
+    if not valid_bearer_token(raw_token):
+        return protect_redemption_response(make_response("", 400))
 
     token_hash = hash_token(raw_token)
     rec = find_recovery_by_token_hash(token_hash)
     if not rec:
-        return no_store(make_response(render_template("link_invalid.html"), 400))
+        return protect_redemption_response(make_response("", 400))
 
     f = rec["fields"]
     now = datetime.now(timezone.utc)
     if f.get(F_RECOVERY["used_at"]) or _parse_iso(f[F_RECOVERY["expires_at"]]) < now:
-        return no_store(make_response(render_template("link_invalid.html"), 400))
+        return protect_redemption_response(make_response("", 400))
 
     links = f.get(F_RECOVERY["client"]) or []
     if not links:
-        return no_store(make_response(render_template("link_invalid.html"), 400))
+        return protect_redemption_response(make_response("", 400))
 
     at_update(T_RECOVERY, rec["id"], {F_RECOVERY["used_at"]: now.isoformat(),
                                        F_RECOVERY["recovery_link"]: ""})
     raw_access_token, expires = issue_access_token(links[0])
-    resp = make_response(redirect("/checkin"))
+    resp = make_response("", 204)
     resp = set_access_cookie(resp, raw_access_token, expires)
-    return no_store(resp)
+    return protect_redemption_response(resp)
+
+
+@app.get("/recover/confirm")
+def legacy_recovery_confirm_rejected():
+    """Bearer query parameters are intentionally no longer accepted."""
+    return no_store(make_response(render_template("link_invalid.html"), 400))
 
 
 # ---------------------------------------------------------------------------

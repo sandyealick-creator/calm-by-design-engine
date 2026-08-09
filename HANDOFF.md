@@ -8,12 +8,12 @@ Calm by Design is a nervous system regulation program for White Raven Holistic. 
 
 ## 2. Architecture and data flow
 
-Single Flask service (`main.py`), no separate frontend build. Deployed on Google Cloud Run. Two entry paths share one core:
+Single Flask service (`main.py`), no separate frontend build. Designed for Google Cloud Run; the current version is not deployed. Two entry paths share one core:
 
 ```
 Participant browser                          GoHighLevel (existing, separate)
   /enroll -> Client record (Airtable)           GHL form -> POST /assess --+
-  /checkin/verify -> session cookie                                       |
+  /access#t=... -> same-origin POST -> session cookie                     |
   /checkin -> ----------------------------------------------------------->|
                                                                            v
                                                     process_checkin() (shared core, main.py)
@@ -37,10 +37,10 @@ GHL's existing "Crisis Alert Notification" and "Safety Buffer Routing" workflows
 
 ## 3. Enrollment, identity, check-in, recovery flow
 
-- **Enrollment** (`GET/POST /enroll`): first name, last name, email, phone required. SMS consent (operational, non-marketing) and marketing consent are two independent optional checkboxes; neither is required to enroll. Submitting an existing email does not update the Client, rotate its access token, or authenticate the browser; it creates the same generic recovery request as `/recover`. A genuinely new enrollment receives a random access token, stored (hashed) on the Client record, set as a cookie, and the participant is taken straight to `/checkin`. The raw check-in link is also shown once on the success page for the participant to save.
-- **Identity**: no name/email/phone/consent re-entry on return visits. Identity is resolved via an HttpOnly, Secure, SameSite=Lax session cookie holding the raw access token; the server only ever stores its SHA-256 hash.
-- **Check-in** (`GET/POST /checkin`): requires a valid session (redirects to `/recover` otherwise). Four integer 1-10 ratings (physical symptoms, anxiety, energy, sleep) plus a journal entry. A client-generated `submission_id` (UUID, hidden form field, regenerated each page load) makes retries/double-clicks idempotent without blocking a second genuine same-day entry that uses a new `submission_id`.
-- **Recovery** (`GET/POST /recover`, `GET /recover/confirm`): always shows the same generic message regardless of whether the submitted email is enrolled. If matched, creates a short-lived (30 minute), single-use recovery link (stored as both a SHA-256 hash for verification and, separately, the full link in plaintext in a `Recovery Link` field so GHL can actually email it - see field notes below). Redeeming the link rotates the participant's durable access token and clears the `Recovery Link` field.
+- **Enrollment** (`GET/POST /enroll`): first name, last name, email, phone required. SMS consent (operational, non-marketing) and marketing consent are two independent optional checkboxes; neither is required to enroll. Submitting an existing email does not update the Client, rotate its access token, or authenticate the browser; it creates the same generic recovery request as `/recover`. A genuinely new enrollment receives a random access token stored only as a hash and set directly in a Secure, HttpOnly cookie, then redirects to the clean `/checkin` path. The raw token is never rendered into HTML or placed in the redirect URL. Separately delivered bearer links, if used, must use `/access#t=...` and the fragment-to-POST redemption page.
+- **Identity**: no name/email/phone/consent re-entry on return visits. Identity is resolved via an HttpOnly, Secure, SameSite=Lax session cookie holding the raw access token; the server only ever stores its SHA-256 hash. Bearer links place the token in a URL fragment that a minimal same-origin page removes before POSTing it in the request body. Query-token redemption is rejected.
+- **Check-in** (`GET/POST /checkin`): requires a valid session (redirects to `/recover` otherwise). Four integer 1-10 ratings (physical symptoms, anxiety, energy, sleep) plus a journal entry of at most 5,000 characters. A server-generated canonical UUIDv4 `submission_id` (hidden form field, regenerated each page load) makes retries/double-clicks idempotent without blocking a second genuine same-day entry. Replay lookup is scoped to and independently verified against the authenticated Client relationship.
+- **Recovery** (`GET/POST /recover`, `GET/POST /recover-access`): always shows the same generic message regardless of whether the submitted email is enrolled. If matched, creates a short-lived (30 minute), single-use fragment link (stored as both a SHA-256 hash for verification and, separately, the full link in plaintext in a `Recovery Link` field so the future GHL workflow can deliver it). The browser removes the fragment and POSTs the token in the request body. Successful redemption rotates the participant's durable access token and clears the `Recovery Link` field.
 
 ## 4. Support score and thresholds
 
@@ -89,7 +89,7 @@ A **separate safety override**, not a sixth wellness tier - `routing_config.rout
 
 ## 9. Participant token, cookie, recovery-link, expiration, revocation
 
-- **Access token**: `secrets.token_urlsafe(32)`, never stored raw - only its SHA-256 hash, on `Clients.Access Token Hash`, with `Access Token Issued At` / `Access Token Expires At` (90-day TTL). The cookie (`cbd_token`, HttpOnly/Secure/SameSite=Lax) holds the raw token directly; it's exchanged once via `/checkin/verify?t=...` which immediately redirects to the clean `/checkin` URL so the token never persists in the address bar, browser history, or referrer headers.
+- **Access token**: `secrets.token_urlsafe(32)`, never stored raw - only its SHA-256 hash, on `Clients.Access Token Hash`, with `Access Token Issued At` / `Access Token Expires At` (90-day TTL). The cookie (`cbd_token`, HttpOnly/Secure/SameSite=Lax) holds the raw token directly. Saved access links use `/access#t=...`; the fragment is removed with `history.replaceState` before a same-origin POST-body exchange. Query-token redemption is rejected. Controlled Cloud Run verification must still confirm the deployed request-log behavior.
 - **Revocation**: requesting a new link via `/recover` rotates (overwrites) the stored hash, immediately invalidating the previous token - no separate revoke action exists or is needed.
 - **Recovery token**: separate, single-use, 30-minute TTL, stored hashed on the `Recovery Requests` table, plus a plaintext `Recovery Link` field (the full URL) that the pending GHL workflow reads to email it - see field notes below for why this one field is deliberately plaintext.
 - **CSRF token**: a per-page-load random value, set as a matching cookie and hidden form field (double-submit pattern), generated via `SESSION_SECRET`.
@@ -111,7 +111,7 @@ Fields added this build cycle (all additive, created via the Airtable MCP with e
 
 ## 11. GHL workflows
 
-- **Active, unchanged**: "Daily Check-In - Assessment" (form -> webhook -> `/assess`), "Crisis Alert Notification" (polls Crisis Alerts), "Safety Buffer Routing" (polls AI Assessments).
+- **Active workflows, pending controlled compatibility verification**: "Daily Check-In - Assessment" (form -> webhook -> `/assess`), "Crisis Alert Notification" (polls Crisis Alerts), "Safety Buffer Routing" (polls AI Assessments). `/assess` now applies a journal limit, rate limit, and strict UUIDv4 validation when `submission_id` is supplied; normal shared-core routing is unchanged.
 - **Still requires manual creation**: "Send Check-in Link" - trigger on `Recovery Requests` new records where `Recovery Link` is not empty, find contact by email, email that link. Not yet created.
 
 ## 12. Major files
@@ -179,7 +179,7 @@ gcloud run deploy cbd-assess \
 
 ## 19. Verified behavior (this session)
 
-- **pytest: 90/90 passing** against mocked Airtable/Gemini - covers existing-email enrollment takeover protection, idempotency, curriculum timing gate, all five elements, CSRF, rate limiting, Airtable-unavailable generic error handling, and the full medical-emergency test matrix (ordinary discomfort, heightened support without medical language, clear medical-emergency language, keyword backstop without Gemini, ambiguous self-harm, direct self-harm, imminent danger, and the simultaneous medical+self-harm case).
+- **pytest: 162/162 passing** against mocked Airtable and Gemini in an isolated temporary environment, with outbound sockets blocked. No live application service or participant data was accessed.
 - **`run_golden.py` against the real Gemini API: 19/20 passing.** The one disagreement (case G07: Gemini set `distress_signal: false` where the case expected `true`, on a physical-flare entry where the participant explicitly wrote "emotionally I'm actually okay") does not change real routing for that case - the numeric score alone already places it in Heightened Support regardless of that boolean. Worth revisiting the case's expectation, not a code defect.
 - Medical-emergency and self-harm signals confirmed independent of each other in both directions, at both the keyword-backstop level and the combined-routing level.
 - Generic error page confirmed for a simulated Airtable outage; no credential or stack trace shown to the participant.
@@ -191,6 +191,7 @@ gcloud run deploy cbd-assess \
 - Mobile/browser rendering (no browser was driven this session).
 - Cross-device recovery.
 - Cloud Run deployment of this version (not deployed this session).
+- Cloud Run request-log verification for the fragment-to-POST bearer redemption flow and direct remote-address rate-limit behavior.
 - The `Recovery Link` field being cleared via an empty-string PATCH against the real Airtable API (only verified against the test fake).
 
 ## 21. Known limitations, risks, bugs, deferred improvements
@@ -198,6 +199,8 @@ gcloud run deploy cbd-assess \
 - **Medical-emergency audit fields not yet in Airtable schema** (see section 10) - currently piggybacking on `Trigger Reasons` text and `Crisis Alerts` reasoning prefixes. Cleaner long-term: add dedicated fields, pending approval.
 - **Dead code**: the Safety Route's optional secondary grounding-element display in `result.html` (`{% if element %}` under the `SAFETY_ROUTE` branch) never actually renders, because `process_checkin()` never populates `element` for `ROUTE_SAFETY` (only for Grounding/Heightened). Pre-existing from the prior session's build, not touched here since it was out of scope for the medical-emergency correction.
 - **In-process rate limiting and CSRF state** don't survive instance restarts or scale-out to multiple Cloud Run instances. Fine at current traffic levels; not a production guarantee.
+- **Partial replay recovery is deliberately manual.** If an owned Daily Log exists but no provably owned AI Assessment can be found, the app reports that the check-in was saved but processing is incomplete and performs no new writes, Gemini call, Crisis Alert, or webhook. Repairing or completing that record requires an operator-reviewed workflow; the app does not speculate about live Airtable relationships.
+- **Gemini request timeout remains platform/SDK-dependent.** Airtable and optional GHL calls have explicit timeouts, but an explicit `google-genai` timeout was not added because no installed SDK was available to inspect and `requirements.txt` does not pin a concrete compatible API version. Verify the supported timeout option before deployment rather than guessing.
 - **`GHL_ROUTING_WEBHOOK` / `GHL_CRISIS_WEBHOOK`** remain unset/unwired in production per the prior session's findings - all real delivery currently depends on GHL's own Airtable-polling workflows.
 - **`safety_rules.py`'s `FIRST_PERSON` regex** (used by `check_safety()`, the self-harm checker) treats bare "my" as first-person without the third-party-relation exclusion that `check_medical_emergency()` now has. Self-harm phrases mostly avoid this because they embed "myself"/"my life" as objects, but it's a latent inconsistency between the two checkers worth aligning later.
 - **Golden set case G07** disagreement noted above - consider a soft-check pattern (like the existing `expected_element` soft check) for `distress_signal` rather than a hard pass/fail.

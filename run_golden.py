@@ -70,8 +70,10 @@ def main():
                 case["journal_text"], case["scores"], context
             )
         except Exception as exc:
-            print(f"{case['id']}: ERROR - {exc}")
-            results.append({"id": case["id"], "passed": False, "error": str(exc)})
+            error_type = type(exc).__name__
+            print(f"{case['id']}: ERROR - {error_type}")
+            results.append({"id": case["id"], "passed": False,
+                            "error_type": error_type})
             failures += 1
             continue
 

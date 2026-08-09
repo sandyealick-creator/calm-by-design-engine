@@ -5,14 +5,13 @@
 
 {% if message %}
   <p>{{ message }}</p>
-  <p class="muted">Check your email in a few minutes. If you don't see it, check spam, or try again.</p>
 {% else %}
-  <p>Enter the email you enrolled with and we'll get a check-in link to you.</p>
+  <p>Enter the email you enrolled with to request recovery instructions.</p>
   <form method="post" action="/recover">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label for="email">Email</label>
     <input type="email" id="email" name="email" required>
-    <button type="submit">Send my link</button>
+    <button type="submit">Request recovery</button>
   </form>
 {% endif %}
 
