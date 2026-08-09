@@ -29,6 +29,18 @@ def test_historical_past_tense_with_negation_does_not_trigger():
     assert signal == "none"
 
 
+def test_resolved_historical_direct_statement_does_not_trigger():
+    signal, _ = check_safety(
+        "Years ago I wanted to kill myself, but I am in a much better place now."
+    )
+    assert signal == "none"
+
+
+def test_historical_direct_statement_without_current_language_does_not_trigger():
+    signal, _ = check_safety("I wanted to kill myself years ago.")
+    assert not is_safety_triggering(signal)
+
+
 def test_ambiguous_hopelessness():
     signal, _ = check_safety("I can't go on like this, everything feels like too much.")
     assert signal == "ambiguous"
@@ -48,6 +60,76 @@ def test_empty_journal():
 def test_quoted_phrase_is_skipped():
     signal, _ = check_safety('The lyric goes "I want to kill myself" and it has been stuck in my head all day.')
     assert signal == "none"
+
+
+def test_third_party_single_quoted_statement_does_not_trigger():
+    signal, _ = check_safety(
+        "My coworker said 'I want to kill myself' and I am worried about them."
+    )
+    assert signal == "none"
+
+
+def test_direct_current_suicidal_statement_triggers():
+    signal, _ = check_safety("I am suicidal.")
+    assert signal == "direct_self_harm"
+    assert is_safety_triggering(signal)
+
+
+def test_direct_current_statement_shared_with_friend_still_triggers():
+    signal, _ = check_safety("I told my friend that I feel suicidal.")
+    assert signal == "direct_self_harm"
+    assert is_safety_triggering(signal)
+
+
+def test_current_statement_after_unrelated_history_still_triggers():
+    signal, _ = check_safety("Last week was hard, and I want to kill myself.")
+    assert signal == "direct_self_harm"
+    assert is_safety_triggering(signal)
+
+
+def test_current_statement_before_unrelated_history_still_triggers():
+    signal, _ = check_safety("I want to kill myself because last week was hard.")
+    assert signal == "direct_self_harm"
+    assert is_safety_triggering(signal)
+
+
+def test_recent_statement_that_is_still_current_triggers():
+    signal, _ = check_safety(
+        "Earlier today I wanted to kill myself, and I still feel that way."
+    )
+    assert is_safety_triggering(signal)
+
+
+def test_current_self_harm_after_unrelated_third_party_report_triggers():
+    signal, _ = check_safety(
+        "My friend said the day was exhausting, but I want to die."
+    )
+    assert signal == "direct_self_harm"
+    assert is_safety_triggering(signal)
+
+
+def test_third_party_self_harm_match_does_not_hide_later_direct_statement():
+    signal, _ = check_safety(
+        "My friend said she wants to die, but I want to die."
+    )
+    assert signal == "direct_self_harm"
+    assert is_safety_triggering(signal)
+
+
+def test_historical_self_harm_match_does_not_hide_later_direct_statement():
+    signal, _ = check_safety(
+        "Last year I wanted to die, but I want to die."
+    )
+    assert signal == "direct_self_harm"
+    assert is_safety_triggering(signal)
+
+
+def test_resolved_self_harm_match_does_not_hide_later_direct_statement():
+    signal, _ = check_safety(
+        "I am suicidal, but I do not feel that way now; I am suicidal."
+    )
+    assert signal == "direct_self_harm"
+    assert is_safety_triggering(signal)
 
 
 # -- medical emergency (independent of self-harm safety) --------------------
@@ -75,9 +157,44 @@ def test_historical_medical_language_does_not_trigger():
     assert triggered is False
 
 
+def test_resolved_same_day_medical_language_does_not_trigger():
+    triggered, _ = check_medical_emergency(
+        "I had chest pain earlier today, but it stopped and I feel fine now."
+    )
+    assert triggered is False
+
+
 def test_third_person_medical_language_does_not_trigger():
     triggered, _ = check_medical_emergency("My dad had chest pain and had to go to the ER last week.")
     assert triggered is False
+
+
+def test_third_party_reported_medical_language_does_not_trigger():
+    triggered, _ = check_medical_emergency(
+        "I heard my dad say I can't breathe, and I am worried about him."
+    )
+    assert triggered is False
+
+
+def test_single_quoted_medical_language_does_not_trigger():
+    triggered, _ = check_medical_emergency(
+        "My friend texted 'I can't breathe' and I called to check on them."
+    )
+    assert triggered is False
+
+
+def test_current_medical_language_after_unrelated_third_party_report_triggers():
+    triggered, _ = check_medical_emergency(
+        "My friend said the day was exhausting, but I can't breathe."
+    )
+    assert triggered is True
+
+
+def test_third_party_medical_match_does_not_hide_later_current_statement():
+    triggered, _ = check_medical_emergency(
+        "My friend said her chest feels tight, but my chest feels tight."
+    )
+    assert triggered is True
 
 
 def test_negated_medical_language_does_not_trigger():

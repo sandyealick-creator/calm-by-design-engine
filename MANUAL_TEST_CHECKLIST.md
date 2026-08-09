@@ -21,7 +21,7 @@ Everything not marked "done locally" below needs a live Cloud Run deployment (or
 
 - [x] ✅ Done locally. **New enrollment** creates one Clients row, does not require SMS/marketing consent to complete (`test_new_enrollment_creates_client_and_sets_cookie`, `test_enrollment_without_sms_consent_still_succeeds`).
 - [x] ✅ Done locally. **Consent handling**: SMS and marketing consent save independently, no cross-contamination (`test_enrollment_without_sms_consent_still_succeeds` plus the schema keeps the two fields separate).
-- [x] ✅ Done locally. **Duplicate email**: re-enrolling the same email updates the existing record rather than duplicating it (`test_duplicate_email_updates_instead_of_duplicating`).
+- [x] ✅ Done locally. **Existing email protection**: a clean browser cannot overwrite the participant profile or consent fields, rotate the durable access token, or receive an authenticated cookie; the submission uses the generic recovery process instead (`test_existing_email_enrollment_uses_generic_recovery_without_authenticating`, `test_existing_email_enrollment_cannot_overwrite_profile_or_consents`).
 - [x] ✅ Done locally. **Returning participant**: session cookie skips name/email/phone/consent fields on `/checkin` (`test_returning_participant_checkin_prefilled`).
 - [x] ✅ Done locally. **Identity recovery, logic**: generic message regardless of match, real link only created for a matched email, single-use enforcement, full round trip (`test_recover_generic_message_regardless_of_match`, `test_recover_creates_token_only_for_matched_email`, `test_recover_confirm_full_round_trip`).
 - [ ] 🔲 Needs GHL workflow + live Airtable. **Identity recovery, email delivery**: confirm the actual email arrives and the link logs you back in, in a real inbox.

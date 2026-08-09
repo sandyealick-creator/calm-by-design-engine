@@ -31,16 +31,54 @@ def test_new_enrollment_creates_client_and_sets_cookie(client, fake_airtable):
     assert any(h.startswith("cbd_token=") for h in set_cookie_headers)
 
 
-def test_duplicate_email_updates_instead_of_duplicating(client, fake_airtable):
-    enroll(client, email="dupe@example.com", phone="+15550001111")
-    # Second enrollment attempt with the same email but a different phone/session
+def test_existing_email_enrollment_uses_generic_recovery_without_authenticating(
+    client, fake_airtable, make_client_record
+):
+    existing = make_client_record(email="dupe@example.com")
+    _raw_token, _expires = main.issue_access_token(existing["id"])
+    original = fake_airtable.get(main.T_CLIENTS, existing["id"])["fields"]
+
+    # Simulate a different browser that knows only the participant's email.
     client.delete_cookie("cbd_token")
     client.delete_cookie("cbd_csrf")
-    enroll(client, email="dupe@example.com", phone="+15559998888")
+    resp = enroll(client, email="dupe@example.com", phone="+15559998888", sms=False)
 
-    clients = fake_airtable.find_all(main.T_CLIENTS)
-    assert len(clients) == 1
-    assert clients[0]["fields"][main.F_CLIENT["phone"]] == "+15559998888"
+    assert resp.status_code == 200
+    assert b"If that email is enrolled" in resp.data
+    assert not any(
+        header.startswith("cbd_token=") for header in resp.headers.get_all("Set-Cookie")
+    )
+    assert len(fake_airtable.find_all(main.T_CLIENTS)) == 1
+    assert len(fake_airtable.find_all(main.T_RECOVERY)) == 1
+
+    unchanged = fake_airtable.get(main.T_CLIENTS, existing["id"])["fields"]
+    assert unchanged[main.F_CLIENT["access_token_hash"]] == original[main.F_CLIENT["access_token_hash"]]
+    assert unchanged[main.F_CLIENT["access_token_issued_at"]] == original[main.F_CLIENT["access_token_issued_at"]]
+    assert unchanged[main.F_CLIENT["access_token_expires_at"]] == original[main.F_CLIENT["access_token_expires_at"]]
+
+
+def test_existing_email_enrollment_cannot_overwrite_profile_or_consents(
+    client, fake_airtable, make_client_record
+):
+    existing = make_client_record(
+        email="protected@example.com",
+        name="Original Participant",
+        **{
+            main.F_CLIENT["phone"]: "+15550001111",
+            main.F_CLIENT["sms_consent"]: True,
+            main.F_CLIENT["marketing_consent"]: True,
+        },
+    )
+
+    client.delete_cookie("cbd_token")
+    client.delete_cookie("cbd_csrf")
+    enroll(client, email="protected@example.com", phone="+15559998888", sms=False)
+
+    unchanged = fake_airtable.get(main.T_CLIENTS, existing["id"])["fields"]
+    assert unchanged[main.F_CLIENT["name"]] == "Original Participant"
+    assert unchanged[main.F_CLIENT["phone"]] == "+15550001111"
+    assert unchanged[main.F_CLIENT["sms_consent"]] is True
+    assert unchanged[main.F_CLIENT["marketing_consent"]] is True
 
 
 def test_enrollment_without_sms_consent_still_succeeds(client, fake_airtable):

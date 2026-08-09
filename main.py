@@ -902,6 +902,10 @@ def enroll_submit():
             "enroll.html", error="Please fill in first name, last name, a valid email, and phone."))
 
     existing = find_client(email=email)
+    if existing:
+        create_recovery_request(email, client_rec=existing)
+        return no_store(csrf_render("recover.html", message=GENERIC_RECOVERY_MESSAGE))
+
     fields = {
         F_CLIENT["name"]: f"{first} {last}",
         F_CLIENT["email"]: email,
@@ -909,15 +913,11 @@ def enroll_submit():
         F_CLIENT["sms_consent"]: sms_consent,
         F_CLIENT["marketing_consent"]: marketing_consent,
     }
-    if existing:
-        client_id = existing["id"]
-        at_update(T_CLIENTS, client_id, fields)
-    else:
-        fields[F_CLIENT["week"]] = 0
-        fields[F_CLIENT["state"]] = "On Track"
-        fields[F_CLIENT["regulated_days"]] = 0
-        created = at_create(T_CLIENTS, fields)
-        client_id = created["id"]
+    fields[F_CLIENT["week"]] = 0
+    fields[F_CLIENT["state"]] = "On Track"
+    fields[F_CLIENT["regulated_days"]] = 0
+    created = at_create(T_CLIENTS, fields)
+    client_id = created["id"]
 
     raw_token, expires = issue_access_token(client_id)
     checkin_link = f"{request.url_root.rstrip('/')}/checkin/verify?t={raw_token}"
@@ -991,6 +991,40 @@ def checkin_submit():
 GENERIC_RECOVERY_MESSAGE = "If that email is enrolled, a check-in link is on its way."
 
 
+def create_recovery_request(email, client_rec=None):
+    """Create the same non-enumerating recovery request used by /recover.
+
+    Supplying a previously resolved client avoids a second Airtable lookup
+    when /enroll discovers that the email is already registered. The response
+    remains generic, and this helper never mutates the Client or its access
+    token.
+    """
+    if count_recent_recovery_requests(email) >= RECOVERY_RATE_LIMIT_PER_HOUR:
+        return
+
+    now = datetime.now(timezone.utc)
+    client_rec = client_rec or find_client(email=email)
+    fields = {
+        F_RECOVERY["request_id"]: f"{email}-{now.isoformat()}",
+        F_RECOVERY["requested_at"]: now.isoformat(),
+    }
+    if client_rec:
+        raw_recovery_token = new_random_token()
+        fields[F_RECOVERY["client"]] = [client_rec["id"]]
+        fields[F_RECOVERY["token_hash"]] = hash_token(raw_recovery_token)
+        fields[F_RECOVERY["expires_at"]] = (
+            now + timedelta(minutes=RECOVERY_TOKEN_TTL_MINUTES)).isoformat()
+        # The GHL "Send Check-in Link" workflow reads this field to email the
+        # link. It cannot be reconstructed from the hash, so the raw,
+        # single-use, 30-minute link is stored here and cleared on redemption
+        # (see recover_confirm). Airtable is already the trust boundary for
+        # this app, so a short-lived recovery link is consistent with the
+        # existing recovery design.
+        fields[F_RECOVERY["recovery_link"]] = (
+            f"{request.url_root.rstrip('/')}/recover/confirm?rt={raw_recovery_token}")
+    at_create(T_RECOVERY, fields)
+
+
 @app.get("/recover")
 def recover_form():
     return no_store(csrf_render("recover.html", message=None))
@@ -1002,28 +1036,8 @@ def recover_submit():
         return no_store(csrf_render("recover.html", message=GENERIC_RECOVERY_MESSAGE))
 
     email = (request.form.get("email") or "").strip().lower()
-    now = datetime.now(timezone.utc)
-
-    if email and EMAIL_RE.match(email) and count_recent_recovery_requests(email) < RECOVERY_RATE_LIMIT_PER_HOUR:
-        client_rec = find_client(email=email)
-        request_id = f"{email}-{now.isoformat()}"
-        fields = {F_RECOVERY["request_id"]: request_id, F_RECOVERY["requested_at"]: now.isoformat()}
-        if client_rec:
-            raw_recovery_token = new_random_token()
-            fields[F_RECOVERY["client"]] = [client_rec["id"]]
-            fields[F_RECOVERY["token_hash"]] = hash_token(raw_recovery_token)
-            fields[F_RECOVERY["expires_at"]] = (
-                now + timedelta(minutes=RECOVERY_TOKEN_TTL_MINUTES)).isoformat()
-            # The GHL "Send Check-in Link" workflow reads this field to email the
-            # link - it can't be reconstructed from the hash, so the raw,
-            # single-use, 30-minute link is stored here and cleared on redemption
-            # (see recover_confirm). Airtable is already the trust boundary for
-            # this app - journal text and crisis reasoning are stored here in
-            # plaintext too - so a short-lived recovery link is consistent with
-            # that, not a weaker link in the chain.
-            fields[F_RECOVERY["recovery_link"]] = (
-                f"{request.url_root.rstrip('/')}/recover/confirm?rt={raw_recovery_token}")
-        at_create(T_RECOVERY, fields)
+    if email and EMAIL_RE.match(email):
+        create_recovery_request(email)
 
     return no_store(csrf_render("recover.html", message=GENERIC_RECOVERY_MESSAGE))
 
