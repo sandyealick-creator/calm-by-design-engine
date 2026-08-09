@@ -1,5 +1,7 @@
 import re
 import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -172,18 +174,17 @@ def test_participant_cannot_replay_another_participants_route_or_alert_state(
         "journal": "An ordinary steady day.",
     })
 
-    assert resp.status_code == 200
+    assert resp.status_code == 500
     body = resp.data.decode().lower()
+    assert "something went wrong" in body
     assert "your safety matters right now" not in body
     assert 'href="tel:988"' not in body
     assert 'href="sms:988"' not in body
     assert "we recorded an alert" not in body
     logs = fake_airtable.find_all(main.T_LOGS)
-    assert len(logs) == 2
-    assert any(
-        participant_a["id"] in (r["fields"].get(main.F_LOG["client"]) or [])
-        for r in logs
-    )
+    assert len(logs) == 1
+    assert logs[0]["fields"][main.F_LOG["client"]] == [participant_b["id"]]
+    assert participant_a["id"] not in logs[0]["fields"][main.F_LOG["client"]]
 
 
 def test_checkin_csrf_missing_rejected(client, fake_airtable, mock_gemini):
@@ -300,6 +301,64 @@ def test_access_query_token_is_rejected_without_authentication(client, fake_airt
     assert resp.status_code == 400
     assert not any(
         h.startswith("cbd_token=") for h in resp.headers.get_all("Set-Cookie"))
+
+
+@pytest.mark.parametrize(
+    "path,query_key",
+    [
+        ("/access", "t"), ("/access", "rt"),
+        ("/recover-access", "rt"), ("/recover-access", "t"),
+    ],
+)
+@pytest.mark.parametrize("method", ["get", "post"])
+def test_new_redemption_routes_reject_bearer_queries_generically(
+    client, fake_airtable, make_client_record, path, query_key, method,
+):
+    raw_token = main.new_random_token()
+    participant = make_client_record(email="query-bearer@example.com", **{
+        main.F_CLIENT["access_token_hash"]: main.hash_token(raw_token),
+        main.F_CLIENT["access_token_expires_at"]: (
+            datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+    })
+    if path == "/recover-access":
+        fake_airtable.create(main.T_RECOVERY, {
+            main.F_RECOVERY["request_id"]: "query-bearer-recovery",
+            main.F_RECOVERY["client"]: [participant["id"]],
+            main.F_RECOVERY["token_hash"]: main.hash_token(raw_token),
+            main.F_RECOVERY["requested_at"]: datetime.now(timezone.utc).isoformat(),
+            main.F_RECOVERY["expires_at"]: (
+                datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        })
+    before = fake_airtable.find_all(main.T_RECOVERY)
+    participant_before = fake_airtable.get(main.T_CLIENTS, participant["id"])
+    request_method = getattr(client, method)
+    kwargs = {"data": {"token": raw_token}} if method == "post" else {}
+    resp = request_method(f"{path}?{query_key}={raw_token}", **kwargs)
+
+    assert resp.status_code == 400
+    assert resp.data == b""
+    assert raw_token.encode() not in resp.data
+    assert not any(
+        header.startswith("cbd_token=")
+        for header in resp.headers.get_all("Set-Cookie")
+    )
+    assert fake_airtable.find_all(main.T_RECOVERY) == before
+    assert fake_airtable.get(main.T_CLIENTS, participant["id"]) == participant_before
+    assert resp.headers["Cache-Control"] == "no-store"
+    assert resp.headers["Referrer-Policy"] == "no-referrer"
+    assert resp.headers["Content-Security-Policy"] == main.REDEMPTION_CSP
+    assert resp.headers["X-Content-Type-Options"] == "nosniff"
+
+
+def test_redemption_script_requires_exactly_one_expected_fragment_key():
+    source = (Path(__file__).parents[1] / "static" / "redemption.js").read_text()
+    assert "params.getAll(expectedKey)" in source
+    assert "keys.length === 1" in source
+    assert "values.length === 1" in source
+    assert "keys[0] === expectedKey" in source
+    assert source.index("history.replaceState") < source.index("new URLSearchParams")
+    assert "window.location.search" not in source
+    assert "params.get(expectedKey)" not in source
 
 
 def test_invalid_and_expired_access_post_tokens_fail_without_reflection(
@@ -464,6 +523,83 @@ def test_checkin_and_assess_submission_rate_limits_precede_processing(
     assert len(fake_airtable.find_all(main.T_LOGS)) == 0
 
 
+@pytest.mark.parametrize(
+    "journal,expect_988,medical_first",
+    [
+        ("I want to die.", True, False),
+        ("I have chest pain right now.", False, False),
+        ("I want to die and I can't breathe.", True, True),
+    ],
+)
+def test_rate_limited_checkin_preserves_local_emergency_guidance_without_external_work(
+    client, fake_airtable, monkeypatch, journal, expect_988, medical_first,
+):
+    enroll(client, email="rate-emergency@example.com")
+    csrf = extract_csrf(client.get("/checkin").data)
+    now = time.time()
+    main._rate_buckets["checkin:127.0.0.1"].extend(
+        [now] * main.IP_RATE_LIMIT["checkin"][0])
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Rate-limited emergency request attempted external work")
+
+    monkeypatch.setattr(main, "get_current_client", forbidden)
+    monkeypatch.setattr(main, "process_checkin", forbidden)
+    monkeypatch.setattr(main, "at_create", forbidden)
+    monkeypatch.setattr(main, "run_assessment", forbidden)
+    monkeypatch.setattr(main.requests, "post", forbidden)
+    resp = client.post("/checkin", data={
+        "csrf_token": csrf,
+        "submission_id": submission_id_for(f"rate-{journal}"),
+        "physical_symptoms": "5", "anxiety": "5", "energy": "5", "sleep": "5",
+        "journal": journal,
+    })
+
+    assert resp.status_code == 429
+    body = resp.data.decode().lower()
+    assert "911" in body
+    assert ("988" in body) is expect_988
+    if medical_first:
+        assert body.index("this may also be a medical emergency") < body.index(
+            "your safety matters right now")
+    assert "we could not save this check-in" in body
+    assert "no notification is confirmed" in body
+    assert "your check-in was saved" not in body
+    assert len(fake_airtable.find_all(main.T_LOGS)) == 0
+    assert len(fake_airtable.find_all(main.T_CRISIS)) == 0
+
+
+@pytest.mark.parametrize(
+    "form_override,expected_status",
+    [
+        ({"physical_symptoms": "not-a-number"}, 200),
+        ({"journal": "x" * (main.MAX_JOURNAL_LENGTH + 1)}, 200),
+        ({"csrf_token": "invalid"}, 400),
+    ],
+)
+def test_rate_limited_checkin_still_validates_input_before_local_detection(
+    client, fake_airtable, monkeypatch, form_override, expected_status,
+):
+    enroll(client, email="rate-validation@example.com")
+    csrf = extract_csrf(client.get("/checkin").data)
+    now = time.time()
+    main._rate_buckets["checkin:127.0.0.1"].extend(
+        [now] * main.IP_RATE_LIMIT["checkin"][0])
+    monkeypatch.setattr(
+        main, "get_current_client",
+        lambda: pytest.fail("Invalid rate-limited input reached identity lookup"),
+    )
+    data = {
+        "csrf_token": csrf, "submission_id": submission_id_for("rate-validation"),
+        "physical_symptoms": "5", "anxiety": "5", "energy": "5", "sleep": "5",
+        "journal": "I want to die.",
+    }
+    data.update(form_override)
+    resp = client.post("/checkin", data=data)
+    assert resp.status_code == expected_status
+    assert b"988" not in resp.data
+
+
 def test_assess_webhook_invalid_scores(client, fake_airtable):
     resp = client.post("/assess", headers={"X-Webhook-Secret": "test-webhook-secret"},
                        json={"journal_text": "x", "email": "a@example.com",
@@ -508,10 +644,6 @@ def test_assess_cannot_replay_another_participants_summary_or_reasons(
         participant_b, 3, 3, 8, 8, "Private participant B journal",
         replay_id, "GHL Form")
 
-    mock_gemini.set(
-        sentiment="neutral", summary="participant a summary",
-        trigger_reasons=["participant a reason"],
-    )
     resp = client.post(
         "/assess",
         headers={"X-Webhook-Secret": "test-webhook-secret"},
@@ -522,16 +654,68 @@ def test_assess_cannot_replay_another_participants_summary_or_reasons(
         },
     )
 
-    assert resp.status_code == 200
-    payload = resp.get_json()
-    assert payload["summary"] == "participant a summary"
-    assert payload["trigger_reasons"] == ["participant a reason"]
+    assert resp.status_code == 500
+    assert resp.get_json() == {"error": "internal error"}
     assert "private participant b" not in resp.data.decode().lower()
     logs = fake_airtable.find_all(main.T_LOGS)
-    assert len(logs) == 2
-    assert {tuple(r["fields"][main.F_LOG["client"]]) for r in logs} == {
-        (participant_a["id"],), (participant_b["id"],),
-    }
+    assert len(logs) == 1
+    assert logs[0]["fields"][main.F_LOG["client"]] == [participant_b["id"]]
+
+
+def test_multiply_linked_assessment_exposes_no_data_on_either_endpoint(
+    client, fake_airtable, mock_gemini, make_client_record,
+):
+    enroll(client, email="malformed-browser@example.com")
+    participant = fake_airtable.find(
+        main.T_CLIENTS,
+        lambda f: f.get(main.F_CLIENT["email"]) == "malformed-browser@example.com",
+    )
+    foreign = make_client_record(email="malformed-foreign@example.com")
+    replay_id = submission_id_for("multiply-linked-assessment-endpoints")
+    log_rec = fake_airtable.create(main.T_LOGS, {
+        main.F_LOG["submission_id"]: replay_id,
+        main.F_LOG["client"]: [participant["id"]],
+        main.F_LOG["journal"]: "An ordinary saved journal.",
+        main.F_LOG["physical"]: 5,
+        main.F_LOG["anxiety"]: 5,
+        main.F_LOG["energy"]: 5,
+        main.F_LOG["sleep"]: 5,
+    })
+    fake_airtable.create(main.T_ASSESS, {
+        main.F_ASSESS["daily_log"]: [log_rec["id"]],
+        main.F_ASSESS["client"]: [participant["id"], foreign["id"]],
+        main.F_ASSESS["reasoning"]: "private multiply linked summary",
+        main.F_ASSESS["trigger_reasons"]: '["private multiply linked reason"]',
+        main.F_ASSESS["response_route"]: main.ROUTE_LABELS[main.ROUTE_SAFETY],
+        main.F_ASSESS["owner_alert_status"]: "sent",
+    })
+
+    csrf = extract_csrf(client.get("/checkin").data)
+    browser_resp = client.post("/checkin", data={
+        "csrf_token": csrf, "submission_id": replay_id,
+        "physical_symptoms": "5", "anxiety": "5", "energy": "5", "sleep": "5",
+        "journal": "An ordinary retry.",
+    })
+    machine_resp = client.post(
+        "/assess", headers={"X-Webhook-Secret": "test-webhook-secret"},
+        json={
+            "journal_text": "An ordinary retry.",
+            "email": "malformed-browser@example.com",
+            "sleep": 5, "energy": 5, "anxiety": 5, "physical_symptoms": 5,
+            "submission_id": replay_id,
+        },
+    )
+
+    browser_body = browser_resp.data.decode().lower()
+    assert browser_resp.status_code == 200
+    assert "could not finish processing" in browser_body
+    assert "private multiply linked" not in browser_body
+    assert "988" not in browser_body
+    assert "we recorded an alert" not in browser_body
+    assert machine_resp.status_code == 500
+    assert machine_resp.get_json() == {"error": "internal error"}
+    assert "private multiply linked" not in machine_resp.data.decode().lower()
+    assert mock_gemini.call_count() == 0
 
 
 @pytest.mark.parametrize("bad_id", [
@@ -602,12 +786,14 @@ def test_assess_later_persistence_failure_preserves_generic_error_contract(
     participant_email = f"assess-{failure_point}@example.com"
     journal = "I want to die."
     sensitive_token = "test-sensitive-access-token"
+    sensitive_phone = "+15559876545"
     sensitive_record_id = "rec-sensitive-record-id"
     raw_exception = (
         f"private later persistence detail Jane Doe {participant_email} "
         f"{journal} {sensitive_token} {sensitive_record_id}"
     )
     make_client_record(email=participant_email, **{
+        main.F_CLIENT["phone"]: sensitive_phone,
         main.F_CLIENT["access_token_hash"]: sensitive_token,
     })
     original_create = main.at_create
@@ -651,7 +837,7 @@ def test_assess_later_persistence_failure_preserves_generic_error_contract(
     log_output = caplog.text
     for sensitive_value in (
         "Jane Doe", participant_email, journal, sensitive_token,
-        sensitive_record_id, raw_exception,
+        sensitive_phone, sensitive_record_id, raw_exception,
     ):
         assert sensitive_value not in response_text
         assert sensitive_value not in log_output
@@ -1110,12 +1296,13 @@ def test_later_persistence_failures_never_replace_emergency_page(
     participant_email = f"{failure_point}@example.com"
     journal = "I want to die."
     sensitive_token = "test-sensitive-access-token"
+    sensitive_phone = "+15559876546"
     sensitive_record_id = "rec-sensitive-record-id"
     raw_exception = (
         f"private later persistence detail Jane Doe {participant_email} "
         f"{journal} {sensitive_token} {sensitive_record_id}"
     )
-    enroll(client, email=participant_email)
+    enroll(client, email=participant_email, phone=sensitive_phone)
     csrf = extract_csrf(client.get("/checkin").data)
     original_create = main.at_create
     original_update = main.at_update
@@ -1158,7 +1345,7 @@ def test_later_persistence_failures_never_replace_emergency_page(
     log_output = caplog.text
     for sensitive_value in (
         "jane doe", participant_email, journal.lower(), sensitive_token,
-        sensitive_record_id, raw_exception.lower(),
+        sensitive_phone, sensitive_record_id, raw_exception.lower(),
     ):
         assert sensitive_value not in body
         assert sensitive_value not in log_output.lower()
@@ -1210,8 +1397,93 @@ def test_retry_after_assessment_failure_preserves_guidance_without_duplicate_sid
     assert len(fake_airtable.find_all(main.T_CRISIS)) == 1
     assert len(fake_airtable.find_all(main.T_ASSESS)) == 0
     assert len(webhook_calls) == 1
+    assert mock_gemini.call_count() == 1
     crisis = fake_airtable.find_all(main.T_CRISIS)[0]
     assert main.F_CRISIS["assessment"] not in crisis["fields"]
+
+
+@pytest.mark.parametrize(
+    "saved_journal,expect_988,expect_medical",
+    [
+        ("I want to die.", True, False),
+        ("I have chest pain right now.", False, True),
+        ("I want to die and I can't breathe.", True, True),
+    ],
+)
+def test_partial_replay_endpoint_preserves_saved_emergency_guidance_and_order(
+    client, fake_airtable, mock_gemini, monkeypatch,
+    saved_journal, expect_988, expect_medical,
+):
+    enroll(client, email="partial-saved-emergency@example.com")
+    csrf = extract_csrf(client.get("/checkin").data)
+    participant = fake_airtable.find_all(main.T_CLIENTS)[0]
+    replay_id = submission_id_for(f"partial-endpoint-{saved_journal}")
+    fake_airtable.create(main.T_LOGS, {
+        main.F_LOG["submission_id"]: replay_id,
+        main.F_LOG["client"]: [participant["id"]],
+        main.F_LOG["journal"]: saved_journal,
+        main.F_LOG["physical"]: 5,
+        main.F_LOG["anxiety"]: 5,
+        main.F_LOG["energy"]: 5,
+        main.F_LOG["sleep"]: 5,
+    })
+    monkeypatch.setattr(
+        main, "at_create", lambda *a, **k: pytest.fail("Partial replay created a record"))
+    monkeypatch.setattr(
+        main, "at_update", lambda *a, **k: pytest.fail("Partial replay updated a record"))
+    monkeypatch.setattr(
+        main.requests, "post", lambda *a, **k: pytest.fail("Partial replay called webhook"))
+
+    resp = client.post("/checkin", data={
+        "csrf_token": csrf, "submission_id": replay_id,
+        "physical_symptoms": "5", "anxiety": "5", "energy": "5", "sleep": "5",
+        "journal": "An ordinary retry.",
+    })
+    assert resp.status_code == 200
+    body = resp.data.decode().lower()
+    assert ("988" in body) is expect_988
+    if expect_medical:
+        medical_heading = (
+            "this may also be a medical emergency" if expect_988
+            else "this may be a medical emergency"
+        )
+        assert medical_heading in body
+    assert "could not finish processing" in body
+    assert "your check-in was saved" in body
+    assert "notification, delivery, review, or response is confirmed" in body
+    if expect_988 and expect_medical:
+        assert body.index("this may also be a medical emergency") < body.index(
+            "your safety matters right now")
+    assert len(fake_airtable.find_all(main.T_LOGS)) == 1
+    assert len(fake_airtable.find_all(main.T_CRISIS)) == 0
+    assert mock_gemini.call_count() == 0
+
+
+def test_assess_partial_replay_returns_only_generic_internal_error(
+    client, fake_airtable, mock_gemini, make_client_record,
+):
+    participant = make_client_record(email="assess-partial@example.com")
+    replay_id = submission_id_for("assess-partial")
+    fake_airtable.create(main.T_LOGS, {
+        main.F_LOG["submission_id"]: replay_id,
+        main.F_LOG["client"]: [participant["id"]],
+        main.F_LOG["journal"]: "I want to die.",
+        main.F_LOG["physical"]: 5,
+        main.F_LOG["anxiety"]: 5,
+        main.F_LOG["energy"]: 5,
+        main.F_LOG["sleep"]: 5,
+    })
+    resp = client.post(
+        "/assess", headers={"X-Webhook-Secret": "test-webhook-secret"},
+        json={
+            "journal_text": "An ordinary retry.", "email": "assess-partial@example.com",
+            "sleep": 5, "energy": 5, "anxiety": 5, "physical_symptoms": 5,
+            "submission_id": replay_id,
+        },
+    )
+    assert resp.status_code == 500
+    assert resp.get_json() == {"error": "internal error"}
+    assert mock_gemini.call_count() == 0
 
 
 def test_ordinary_checkin_daily_log_failure_keeps_generic_error_page(

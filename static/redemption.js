@@ -3,10 +3,21 @@
 
   const recovery = window.location.pathname === "/recover-access";
   const expectedKey = recovery ? "rt" : "t";
-  const params = new URLSearchParams(window.location.hash.slice(1));
-  const token = params.get(expectedKey) || "";
+  const fragment = window.location.hash.slice(1);
 
   window.history.replaceState(null, "", window.location.pathname);
+
+  let token = "";
+  try {
+    const params = new URLSearchParams(fragment);
+    const keys = Array.from(params.keys());
+    const values = params.getAll(expectedKey);
+    if (keys.length === 1 && keys[0] === expectedKey && values.length === 1) {
+      token = values[0];
+    }
+  } catch (_error) {
+    token = "";
+  }
 
   if (!token) {
     window.location.replace("/link-invalid");

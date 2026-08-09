@@ -277,6 +277,18 @@ def validate_submission_id(value):
     return str(parsed)
 
 
+AIRTABLE_RECORD_ID_RE = re.compile(r"^rec[A-Za-z0-9]{14}$")
+MAX_REPLAY_CANDIDATES = 10
+
+
+class ReplayLookupUnavailable(Exception):
+    """A replay key exists, but no unique, safely owned record can be used."""
+
+
+def _valid_airtable_record_id(value):
+    return isinstance(value, str) and bool(AIRTABLE_RECORD_ID_RE.fullmatch(value))
+
+
 def at_headers():
     return {"Authorization": f"Bearer {os.environ['AIRTABLE_API_KEY']}",
             "Content-Type": "application/json"}
@@ -335,27 +347,80 @@ def find_client_by_access_token(raw_token):
     return rec
 
 
+def _single_client_link(record, field_id):
+    """Return one valid Client record ID, or None for any malformed shape."""
+    if not isinstance(record, dict):
+        return None
+    fields = record.get("fields")
+    if not isinstance(fields, dict):
+        return None
+    links = fields.get(field_id)
+    if not isinstance(links, list) or len(links) != 1:
+        return None
+    link = links[0]
+    return link if _valid_airtable_record_id(link) else None
+
+
 def _record_links_to_client(record, field_id, client_record_id):
-    links = (record or {}).get("fields", {}).get(field_id) or []
-    return isinstance(links, list) and client_record_id in links
+    return (
+        _valid_airtable_record_id(client_record_id)
+        and _single_client_link(record, field_id) == client_record_id
+    )
+
+
+def _select_owned_log_candidate(records, submission_id, client_record_id, truncated=False):
+    """Select one exact owned replay candidate or fail closed.
+
+    Airtable REST responses expose raw linked-record IDs in the fields object,
+    so ownership is enforced here rather than through linked-field formula
+    display values.
+    """
+    submission_id = validate_submission_id(submission_id)
+    if not _valid_airtable_record_id(client_record_id):
+        raise ReplayLookupUnavailable()
+    if truncated or not isinstance(records, list):
+        raise ReplayLookupUnavailable()
+    if not records:
+        return None
+
+    owned = []
+    malformed = False
+    for record in records:
+        if not isinstance(record, dict) or not _valid_airtable_record_id(record.get("id")):
+            malformed = True
+            continue
+        fields = record.get("fields")
+        if not isinstance(fields, dict) or fields.get(F_LOG["submission_id"]) != submission_id:
+            malformed = True
+            continue
+        link = _single_client_link(record, F_LOG["client"])
+        if link is None:
+            malformed = True
+        elif link == client_record_id:
+            owned.append(record)
+
+    if malformed or len(owned) != 1:
+        raise ReplayLookupUnavailable()
+    return owned[0]
 
 
 def find_log_by_submission_id(submission_id, client_record_id):
     submission_id = validate_submission_id(submission_id)
     escaped_submission = _airtable_string_literal(submission_id)
-    escaped_client = _airtable_string_literal(client_record_id)
-    formula = (
-        "AND({Submission ID}='%s',FIND('%s',ARRAYJOIN({Client})))"
-        % (escaped_submission, escaped_client)
-    )
+    formula = "{Submission ID}='%s'" % escaped_submission
     r = requests.get(f"{AT_URL}/{T_LOGS}", headers=at_headers(),
-                     params={"filterByFormula": formula, "maxRecords": 1,
+                     params={"filterByFormula": formula,
+                             "maxRecords": MAX_REPLAY_CANDIDATES,
+                             "pageSize": MAX_REPLAY_CANDIDATES,
                              "returnFieldsByFieldId": "true"}, timeout=30)
     r.raise_for_status()
-    recs = r.json().get("records", [])
-    if not recs or not _record_links_to_client(recs[0], F_LOG["client"], client_record_id):
-        return None
-    return recs[0]
+    payload = r.json()
+    if not isinstance(payload, dict):
+        raise ReplayLookupUnavailable()
+    return _select_owned_log_candidate(
+        payload.get("records"), submission_id, client_record_id,
+        truncated=bool(payload.get("offset")),
+    )
 
 
 def find_assessment_by_log_id(log_record_id):
@@ -521,6 +586,11 @@ def protect_redemption_response(resp):
     return resp
 
 
+def _bearer_query_present():
+    """Reject bearer-shaped query parameters without reading their values."""
+    return "t" in request.args or "rt" in request.args
+
+
 # ---------------------------------------------------------------------------
 # Gemini
 # ---------------------------------------------------------------------------
@@ -644,12 +714,19 @@ def process_checkin(client_rec, physical, anxiety, energy, sleep, journal, submi
                 failure_event="checkin_replay_log_lookup_failed",
                 error_type=type(exc).__name__)
         raise
-    # The production query is client-scoped, but independently enforce the
-    # returned relationship so a malformed or stale Airtable response cannot
-    # cross participant boundaries.
+    # Independently enforce the returned relationship so a malformed or stale
+    # lookup implementation cannot cross participant boundaries or fall
+    # through to a duplicate create.
     if existing_log and not _record_links_to_client(
             existing_log, F_LOG["client"], client_id):
-        existing_log = None
+        if keyword_safety_triggered or keyword_medical:
+            return _build_early_emergency_result(
+                None, physical, anxiety, energy, sleep,
+                keyword_safety_triggered, keyword_medical,
+                checkin_saved=None, crisis_alert_created=None,
+                failure_event="checkin_replay_log_ownership_failed",
+                error_type="ReplayLookupUnavailable")
+        raise ReplayLookupUnavailable()
     if existing_log:
         try:
             existing_assessment = find_assessment_by_log_id(existing_log["id"])
@@ -668,7 +745,7 @@ def process_checkin(client_rec, physical, anxiety, energy, sleep, journal, submi
         # A saved log without a provably owned assessment is a partial prior
         # submission. Never fall through to duplicate writes or webhooks.
         return _build_incomplete_replay_result(
-            physical, anxiety, energy, sleep,
+            existing_log, physical, anxiety, energy, sleep, journal,
             keyword_safety_triggered, keyword_medical)
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -956,14 +1033,39 @@ def _build_result(response_route, score, tier, element, summary, trigger_reasons
     }
 
 
-def _build_incomplete_replay_result(physical, anxiety, energy, sleep,
-                                    safety_triggered, medical_triggered):
+def _saved_rating(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if int(value) != value or not 1 <= int(value) <= 10:
+        return None
+    return int(value)
+
+
+def _build_incomplete_replay_result(existing_log, physical, anxiety, energy, sleep,
+                                    journal, safety_triggered, medical_triggered):
     """Represent an owned saved log whose assessment is not provable.
 
     No persistence, Gemini, alert, or webhook operation is retried here.
     """
     log.info(json.dumps({"event": "replay_processing_incomplete"}))
-    score = support_score(physical, anxiety, energy, sleep)
+    fields = existing_log.get("fields") if isinstance(existing_log, dict) else None
+    fields = fields if isinstance(fields, dict) else {}
+    saved_journal = fields.get(F_LOG["journal"])
+    saved_journal = saved_journal if isinstance(saved_journal, str) else ""
+    saved_safety_signal, _ = check_safety(saved_journal)
+    saved_medical, _ = check_medical_emergency(saved_journal)
+    safety_triggered = safety_triggered or is_safety_triggering(saved_safety_signal)
+    medical_triggered = medical_triggered or saved_medical
+
+    saved_ratings = (
+        _saved_rating(fields.get(F_LOG["physical"])),
+        _saved_rating(fields.get(F_LOG["anxiety"])),
+        _saved_rating(fields.get(F_LOG["energy"])),
+        _saved_rating(fields.get(F_LOG["sleep"])),
+    )
+    ratings = saved_ratings if all(v is not None for v in saved_ratings) else (
+        physical, anxiety, energy, sleep)
+    score = support_score(*ratings)
     tier = score_tier(score)
     if safety_triggered:
         response_route = ROUTE_SAFETY
@@ -1017,7 +1119,8 @@ def _build_early_emergency_result(client_rec, physical, anxiety, energy, sleep,
                                   safety_triggered, medical_triggered,
                                   checkin_saved, failure_event, error_type,
                                   crisis_alert_created=False,
-                                  attempt_crisis_alert=False):
+                                  attempt_crisis_alert=False,
+                                  http_status=503):
     """Build deterministic emergency guidance when Airtable blocks the
     normal assessment flow. Gemini is deliberately not called here."""
     _log_persistence_failure(failure_event, error_type)
@@ -1045,7 +1148,7 @@ def _build_early_emergency_result(client_rec, physical, anxiety, energy, sleep,
         checkin_saved=checkin_saved,
         crisis_alert_created=crisis_alert_created,
         owner_notification_confirmed=False,
-        http_status=503,
+        http_status=http_status,
     )
 
 
@@ -1203,11 +1306,15 @@ def enroll_submit():
 # ---------------------------------------------------------------------------
 @app.get("/access")
 def access_redeem_page():
+    if _bearer_query_present():
+        return protect_redemption_response(make_response("", 400))
     return protect_redemption_response(make_response(render_template("redeem.html")))
 
 
 @app.post("/access")
 def access_redeem_submit():
+    if _bearer_query_present():
+        return protect_redemption_response(make_response("", 400))
     raw_token = request.form.get("token", "")
     if not valid_bearer_token(raw_token):
         return protect_redemption_response(make_response("", 400))
@@ -1247,12 +1354,6 @@ def checkin_submit():
     if not valid_csrf():
         return no_store(make_response(render_template("link_invalid.html"), 400))
 
-    if rate_limited("checkin", client_ip()):
-        return no_store(csrf_render(
-            "checkin.html", status=429, name="there",
-            submission_id=new_submission_id(),
-            error="Too many check-ins were submitted. Please wait a bit and try again."))
-
     raw_submission_id = request.form.get("submission_id", "")
     try:
         submission_id = validate_submission_id(raw_submission_id)
@@ -1278,6 +1379,29 @@ def checkin_submit():
             error=(
                 "Please enter a whole number from 1 to 10 for each rating, and a journal entry "
                 f"of no more than {MAX_JOURNAL_LENGTH} characters.")))
+
+    if rate_limited("checkin", client_ip()):
+        keyword_signal, _ = check_safety(journal)
+        keyword_medical, _ = check_medical_emergency(journal)
+        keyword_safety_triggered = is_safety_triggering(keyword_signal)
+        if keyword_safety_triggered or keyword_medical:
+            result = _build_early_emergency_result(
+                None, physical, anxiety, energy, sleep,
+                keyword_safety_triggered, keyword_medical,
+                checkin_saved=False,
+                failure_event="checkin_rate_limited",
+                error_type="RateLimited",
+                crisis_alert_created=False,
+                http_status=429,
+            )
+            http_status = result.pop("http_status", 429)
+            result.pop("later_processing_failed", None)
+            return no_store(make_response(
+                render_template("result.html", **result), http_status))
+        return no_store(csrf_render(
+            "checkin.html", status=429, name="there",
+            submission_id=new_submission_id(),
+            error="Too many check-ins were submitted. Please wait a bit and try again."))
 
     # Identity is deliberately resolved only after CSRF, replay-key, score,
     # and journal-length validation, so malformed or oversized submissions do
@@ -1376,11 +1500,15 @@ def recover_submit():
 
 @app.get("/recover-access")
 def recovery_redeem_page():
+    if _bearer_query_present():
+        return protect_redemption_response(make_response("", 400))
     return protect_redemption_response(make_response(render_template("redeem.html")))
 
 
 @app.post("/recover-access")
 def recovery_redeem_submit():
+    if _bearer_query_present():
+        return protect_redemption_response(make_response("", 400))
     raw_token = request.form.get("token", "")
     if not valid_bearer_token(raw_token):
         return protect_redemption_response(make_response("", 400))

@@ -84,17 +84,14 @@ def test_replay_is_scoped_to_authenticated_participant(
     assert result_b["summary"] == "private b summary"
 
     mock_gemini.set(sentiment="neutral", summary="participant a summary")
-    result_a = main.process_checkin(
-        participant_a, STEADY["physical"], STEADY["anxiety"], STEADY["energy"],
-        STEADY["sleep"], "Participant A journal", replay_id, "Flask Web")
+    with pytest.raises(main.ReplayLookupUnavailable):
+        main.process_checkin(
+            participant_a, STEADY["physical"], STEADY["anxiety"], STEADY["energy"],
+            STEADY["sleep"], "Participant A journal", replay_id, "Flask Web")
 
-    assert result_a["summary"] == "participant a summary"
-    assert "private b" not in result_a["summary"]
     logs = fake_airtable.find_all(main.T_LOGS)
-    assert len(logs) == 2
-    assert {tuple(r["fields"][main.F_LOG["client"]]) for r in logs} == {
-        (participant_a["id"],), (participant_b["id"],),
-    }
+    assert len(logs) == 1
+    assert logs[0]["fields"][main.F_LOG["client"]] == [participant_b["id"]]
 
 
 def test_replay_rejects_unexpected_client_link_after_scoped_lookup(
@@ -110,16 +107,40 @@ def test_replay_rejects_unexpected_client_link_after_scoped_lookup(
     monkeypatch.setattr(main, "find_log_by_submission_id", lambda *_: foreign_log)
     mock_gemini.set(summary="owned result")
 
-    result = main.process_checkin(
-        participant_a, STEADY["physical"], STEADY["anxiety"], STEADY["energy"],
-        STEADY["sleep"], "Owned journal", replay_id, "Flask Web")
+    with pytest.raises(main.ReplayLookupUnavailable):
+        main.process_checkin(
+            participant_a, STEADY["physical"], STEADY["anxiety"], STEADY["energy"],
+            STEADY["sleep"], "Owned journal", replay_id, "Flask Web")
 
-    assert result["summary"] == "owned result"
     owned_logs = [
         r for r in fake_airtable.find_all(main.T_LOGS)
         if participant_a["id"] in (r["fields"].get(main.F_LOG["client"]) or [])
     ]
-    assert len(owned_logs) == 1
+    assert len(owned_logs) == 0
+
+
+def test_malformed_replay_ownership_preserves_current_emergency_guidance(
+    fake_airtable, mock_gemini, make_client_record, monkeypatch,
+):
+    participant_a = make_client_record(email="a-emergency-link@example.com")
+    participant_b = make_client_record(email="b-emergency-link@example.com")
+    replay_id = submission_id_for("unexpected-emergency-client-link")
+    foreign_log = fake_airtable.create(main.T_LOGS, {
+        main.F_LOG["submission_id"]: replay_id,
+        main.F_LOG["client"]: [participant_b["id"]],
+    })
+    monkeypatch.setattr(main, "find_log_by_submission_id", lambda *_: foreign_log)
+    monkeypatch.setattr(
+        main, "at_create", lambda *a, **k: pytest.fail("Malformed replay wrote a record"))
+
+    result = main.process_checkin(
+        participant_a, 5, 5, 5, 5, "I want to die.", replay_id, "Flask Web")
+    assert result["response_route"] == ROUTE_SAFETY
+    assert result["checkin_saved"] is None
+    assert result["crisis_alert_created"] is None
+    assert result["http_status"] == 503
+    assert mock_gemini.call_count() == 0
+    assert len(fake_airtable.find_all(main.T_LOGS)) == 1
 
 
 def test_replay_rejects_assessment_linked_to_another_participant(
@@ -164,9 +185,9 @@ def test_airtable_string_literal_escapes_quotes_and_backslashes():
     assert main._airtable_string_literal("a'b\\c") == "a\\'b\\\\c"
 
 
-def test_production_replay_formula_is_client_scoped_and_escaped(monkeypatch):
+def test_production_replay_formula_uses_submission_id_only(monkeypatch):
     replay_id = submission_id_for("scoped-production-formula")
-    client_id = "rec'client\\value"
+    client_id = "rec00000000000001"
     captured = {}
 
     class Response:
@@ -175,8 +196,11 @@ def test_production_replay_formula_is_client_scoped_and_escaped(monkeypatch):
 
         def json(self):
             return {"records": [{
-                "id": "rec-log",
-                "fields": {main.F_LOG["client"]: [client_id]},
+                "id": "rec00000000000002",
+                "fields": {
+                    main.F_LOG["submission_id"]: replay_id,
+                    main.F_LOG["client"]: [client_id],
+                },
             }]}
 
     def fake_get(*args, **kwargs):
@@ -186,12 +210,134 @@ def test_production_replay_formula_is_client_scoped_and_escaped(monkeypatch):
     monkeypatch.setattr(main.requests, "get", fake_get)
     result = main.find_log_by_submission_id(replay_id, client_id)
 
-    assert result["id"] == "rec-log"
+    assert result["id"] == "rec00000000000002"
     formula = captured["filterByFormula"]
-    assert formula.startswith("AND(")
-    assert replay_id in formula
-    assert "rec\\'client\\\\value" in formula
-    assert "ARRAYJOIN({Client})" in formula
+    assert formula == f"{{Submission ID}}='{replay_id}'"
+    assert client_id not in formula
+    assert "ARRAYJOIN" not in formula
+    assert captured["maxRecords"] == main.MAX_REPLAY_CANDIDATES
+    assert captured["pageSize"] == main.MAX_REPLAY_CANDIDATES
+
+
+def test_replay_candidate_selection_handles_zero_owned_mixed_and_duplicate_states():
+    replay_id = submission_id_for("candidate-selection")
+    owner = "rec00000000000001"
+    foreign = "rec00000000000002"
+
+    def record(record_id, client_id):
+        return {"id": record_id, "fields": {
+            main.F_LOG["submission_id"]: replay_id,
+            main.F_LOG["client"]: [client_id],
+        }}
+
+    assert main._select_owned_log_candidate([], replay_id, owner) is None
+    owned = record("rec00000000000003", owner)
+    foreign_record = record("rec00000000000004", foreign)
+    assert main._select_owned_log_candidate(
+        [foreign_record, owned], replay_id, owner) is owned
+
+    with pytest.raises(main.ReplayLookupUnavailable):
+        main._select_owned_log_candidate([foreign_record], replay_id, owner)
+    with pytest.raises(main.ReplayLookupUnavailable):
+        main._select_owned_log_candidate(
+            [owned, record("rec00000000000005", owner)], replay_id, owner)
+    with pytest.raises(main.ReplayLookupUnavailable):
+        main._select_owned_log_candidate([{"unexpected": "shape"}], replay_id, owner)
+    with pytest.raises(main.ReplayLookupUnavailable):
+        main._select_owned_log_candidate([owned], replay_id, owner, truncated=True)
+
+
+@pytest.mark.parametrize("payload", [None, [], "records", {"records": None}, {"records": {}}])
+def test_production_replay_lookup_unexpected_response_shapes_fail_closed(
+    monkeypatch, payload,
+):
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return payload
+
+    monkeypatch.setattr(main.requests, "get", lambda *a, **k: Response())
+    with pytest.raises(main.ReplayLookupUnavailable):
+        main.find_log_by_submission_id(
+            submission_id_for("unexpected-production-shape"),
+            "rec00000000000001",
+        )
+
+
+@pytest.mark.parametrize(
+    "links,expected",
+    [
+        (None, False), ([], False), ({"x": "y"}, False), (7, False),
+        ([None], False), ([{"id": "rec00000000000001"}], False),
+        (["bad"], False),
+        (["rec00000000000001", "rec00000000000002"], False),
+        (["rec00000000000002", "rec00000000000003"], False),
+        (["rec00000000000002"], False),
+        (["rec00000000000001"], True),
+    ],
+)
+@pytest.mark.parametrize("field_id", [main.F_LOG["client"], main.F_ASSESS["client"]])
+def test_exact_one_client_link_required_for_replay_ownership(field_id, links, expected):
+    record = {"id": "rec00000000000009", "fields": {}}
+    if links is not None:
+        record["fields"][field_id] = links
+    assert main._record_links_to_client(
+        record, field_id, "rec00000000000001") is expected
+
+
+@pytest.mark.parametrize("field_id", [main.F_LOG["client"], main.F_ASSESS["client"]])
+def test_explicit_null_client_link_is_never_owned(field_id):
+    record = {
+        "id": "rec00000000000009",
+        "fields": {field_id: None},
+    }
+    assert not main._record_links_to_client(
+        record, field_id, "rec00000000000001")
+
+
+@pytest.mark.parametrize(
+    "assessment_links",
+    [
+        None, [], {}, 7, [None], ["bad"],
+        ["rec00000000000001", "rec00000000000002"],
+        ["rec00000000000002"],
+    ],
+)
+def test_malformed_assessment_ownership_exposes_no_saved_assessment_data(
+    fake_airtable, mock_gemini, make_client_record, assessment_links,
+):
+    client_rec = make_client_record()
+    replay_id = submission_id_for(f"malformed-assessment-{assessment_links}")
+    log_rec = fake_airtable.create(main.T_LOGS, {
+        main.F_LOG["submission_id"]: replay_id,
+        main.F_LOG["client"]: [client_rec["id"]],
+        main.F_LOG["journal"]: "An ordinary saved journal.",
+        main.F_LOG["physical"]: 5,
+        main.F_LOG["anxiety"]: 5,
+        main.F_LOG["energy"]: 5,
+        main.F_LOG["sleep"]: 5,
+    })
+    assessment_fields = {
+        main.F_ASSESS["daily_log"]: [log_rec["id"]],
+        main.F_ASSESS["reasoning"]: "private foreign summary",
+        main.F_ASSESS["trigger_reasons"]: '["private foreign reason"]',
+        main.F_ASSESS["response_route"]: main.ROUTE_LABELS[ROUTE_SAFETY],
+        main.F_ASSESS["owner_alert_status"]: "sent",
+    }
+    if assessment_links is not None:
+        assessment_fields[main.F_ASSESS["client"]] = assessment_links
+    fake_airtable.create(main.T_ASSESS, assessment_fields)
+
+    result = main.process_checkin(
+        client_rec, 5, 5, 5, 5, "An ordinary retry.", replay_id, "Flask Web")
+    assert result["processing_incomplete"] is True
+    assert result["response_route"] is None
+    assert result["summary"] == ""
+    assert result["crisis_alert_created"] is None
+    assert "private foreign" not in str(result)
+    assert mock_gemini.call_count() == 0
 
 
 def test_two_legitimate_same_day_checkins_are_independent(fake_airtable, mock_gemini, make_client_record):
@@ -475,7 +621,9 @@ def test_replay_log_lookup_failure_preserves_emergency_with_unknown_state(
     journal, expected_route, medical_triggered,
 ):
     sensitive_token = "test-sensitive-access-token"
+    sensitive_phone = "+15559876543"
     client_rec = make_client_record(**{
+        main.F_CLIENT["phone"]: sensitive_phone,
         main.F_CLIENT["access_token_hash"]: sensitive_token,
     })
     raw_exception = (
@@ -517,6 +665,7 @@ def test_replay_log_lookup_failure_preserves_emergency_with_unknown_state(
     assert "jane@example.com" not in log_output
     assert journal not in log_output
     assert sensitive_token not in log_output
+    assert sensitive_phone not in log_output
     assert client_rec["id"] not in log_output
     assert raw_exception not in log_output
 
@@ -534,7 +683,9 @@ def test_replay_assessment_lookup_failure_confirms_saved_but_not_alert_state(
     journal, expected_route, medical_triggered,
 ):
     sensitive_token = "test-sensitive-access-token"
+    sensitive_phone = "+15559876544"
     client_rec = make_client_record(**{
+        main.F_CLIENT["phone"]: sensitive_phone,
         main.F_CLIENT["access_token_hash"]: sensitive_token,
     })
     fake_airtable.create(main.T_LOGS, {
@@ -584,6 +735,7 @@ def test_replay_assessment_lookup_failure_confirms_saved_but_not_alert_state(
     assert "jane@example.com" not in log_output
     assert journal not in log_output
     assert sensitive_token not in log_output
+    assert sensitive_phone not in log_output
     assert client_rec["id"] not in log_output
     assert raw_exception not in log_output
 
@@ -768,6 +920,7 @@ def test_retry_after_assessment_failure_never_duplicates_emergency_side_effects(
     assert len(fake_airtable.find_all(main.T_CRISIS)) == 1
     assert len(fake_airtable.find_all(main.T_ASSESS)) == 0
     assert len(webhook_calls) == 1
+    assert mock_gemini.call_count() == 1
     crisis = fake_airtable.find_all(main.T_CRISIS)[0]
     assert main.F_CRISIS["assessment"] not in crisis["fields"]
 
@@ -796,6 +949,94 @@ def test_non_emergency_partial_replay_does_not_duplicate_daily_log(
     assert len(fake_airtable.find_all(main.T_LOGS)) == 1
     assert len(fake_airtable.find_all(main.T_CRISIS)) == 0
     assert len(fake_airtable.find_all(main.T_ASSESS)) == 0
+    assert mock_gemini.call_count() == 1
+
+
+@pytest.mark.parametrize(
+    "saved_journal,retry_journal,expected_route,expect_medical",
+    [
+        ("An ordinary steady day.", "An ordinary steady day.", None, False),
+        ("An ordinary steady day.", "I want to die.", ROUTE_SAFETY, False),
+        ("An ordinary steady day.", "I have chest pain right now.", ROUTE_MEDICAL_EMERGENCY, True),
+        ("I want to die.", "An ordinary steady day.", ROUTE_SAFETY, False),
+        ("I have chest pain right now.", "An ordinary steady day.", ROUTE_MEDICAL_EMERGENCY, True),
+        ("I want to die and I can't breathe.", "An ordinary steady day.", ROUTE_SAFETY, True),
+    ],
+)
+def test_partial_replay_unions_saved_and_retry_emergency_signals_without_side_effects(
+    fake_airtable, mock_gemini, make_client_record, monkeypatch,
+    saved_journal, retry_journal, expected_route, expect_medical,
+):
+    client_rec = make_client_record()
+    replay_id = submission_id_for(f"partial-union-{saved_journal}-{retry_journal}")
+    fake_airtable.create(main.T_LOGS, {
+        main.F_LOG["submission_id"]: replay_id,
+        main.F_LOG["client"]: [client_rec["id"]],
+        main.F_LOG["journal"]: saved_journal,
+        main.F_LOG["physical"]: 3,
+        main.F_LOG["anxiety"]: 3,
+        main.F_LOG["energy"]: 8,
+        main.F_LOG["sleep"]: 8,
+    })
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Partial replay attempted a write or external side effect")
+
+    monkeypatch.setattr(main, "at_create", forbidden)
+    monkeypatch.setattr(main, "at_update", forbidden)
+    monkeypatch.setattr(main.requests, "post", forbidden)
+    calls_before = mock_gemini.call_count()
+    result = main.process_checkin(
+        client_rec, 9, 9, 1, 1, retry_journal, replay_id, "Flask Web")
+
+    assert result["response_route"] == expected_route
+    assert result["medical_emergency_triggered"] is expect_medical
+    assert result["score"] == main.support_score(3, 3, 8, 8)
+    assert result["processing_incomplete"] is True
+    assert result["checkin_saved"] is True
+    assert result["crisis_alert_created"] is None
+    assert result["summary"] == ""
+    assert result["element"] is None
+    assert len(fake_airtable.find_all(main.T_LOGS)) == 1
+    assert len(fake_airtable.find_all(main.T_CRISIS)) == 0
+    assert len(fake_airtable.find_all(main.T_ASSESS)) == 0
+    assert mock_gemini.call_count() == calls_before
+
+
+@pytest.mark.parametrize(
+    "saved_fields,retry_journal,expected_route,expect_medical",
+    [
+        ({}, "An ordinary steady day.", None, False),
+        ({main.F_LOG["journal"]: ["not", "text"], main.F_LOG["physical"]: "bad"},
+         "I want to die.", ROUTE_SAFETY, False),
+        ({main.F_LOG["journal"]: "I can't breathe.", main.F_LOG["sleep"]: None},
+         "An ordinary steady day.", ROUTE_MEDICAL_EMERGENCY, True),
+    ],
+)
+def test_partial_replay_handles_missing_or_malformed_saved_fields_safely(
+    fake_airtable, mock_gemini, make_client_record, monkeypatch,
+    saved_fields, retry_journal, expected_route, expect_medical,
+):
+    client_rec = make_client_record()
+    replay_id = submission_id_for(f"partial-malformed-{retry_journal}-{saved_fields}")
+    fields = {
+        main.F_LOG["submission_id"]: replay_id,
+        main.F_LOG["client"]: [client_rec["id"]],
+        **saved_fields,
+    }
+    fake_airtable.create(main.T_LOGS, fields)
+    monkeypatch.setattr(
+        main, "at_create", lambda *a, **k: pytest.fail("Partial replay wrote a record"))
+    monkeypatch.setattr(
+        main, "at_update", lambda *a, **k: pytest.fail("Partial replay updated a record"))
+    result = main.process_checkin(
+        client_rec, 5, 5, 5, 5, retry_journal, replay_id, "Flask Web")
+    assert result["response_route"] == expected_route
+    assert result["medical_emergency_triggered"] is expect_medical
+    assert result["processing_incomplete"] is True
+    assert result["summary"] == ""
+    assert mock_gemini.call_count() == 0
+    assert len(fake_airtable.find_all(main.T_LOGS)) == 1
 
 
 def test_crisis_alert_link_failure_keeps_emergency_result(

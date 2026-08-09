@@ -2,7 +2,7 @@
 
 AI-native adaptive routing service for the **Calm by Design** nervous system regulation program (White Raven Holistic). Built for the Build with Gemini XPRIZE, May–Aug 2026.
 
-**What it does:** lets a participant enroll once, then check in daily (symptom ratings + journal) through a branded web page. A deterministic, non-clinical support score plus a Gemini structured classification (sentiment, distress/progress signals, safety signal) decide one of five response routes — Positive/Progress, Steady, Grounding Support, Heightened Support, or the Safety Route — and write the check-in and routing audit trail to Airtable when persistence is available. Direct self-harm or imminent-danger language (checked on every submission by both Gemini and a narrow deterministic keyword backstop) triggers an immediate on-screen 988/911 safety message and a best-effort Crisis Alert record, independent of the score. Record creation does not prove notification delivery or human review. The original GoHighLevel form + webhook path (`/assess`) continues to use the same underlying assessment logic.
+**What it does:** lets a participant enroll once, then check in daily (symptom ratings + journal) through a branded web page. A deterministic, non-clinical support score plus a Gemini structured classification (sentiment, distress/progress signals, safety signal) decide one of five response routes — Positive/Progress, Steady, Grounding Support, Heightened Support, or the Safety Route — and write the check-in and routing audit trail to Airtable when persistence is available. Direct self-harm or imminent-danger language is checked by a narrow deterministic backstop before external processing, and Gemini also classifies submissions on the normal dependency-available path. A triggering result shows immediate on-screen 988/911 guidance and makes a best-effort Crisis Alert record when persistence is available, independent of the score. Record creation does not prove notification delivery or human review. The original GoHighLevel form + webhook path (`/assess`) continues to use the same underlying assessment logic.
 
 ```
 Participant browser                              GoHighLevel (existing, unchanged)
@@ -87,7 +87,7 @@ python run_golden.py        # scenario eval against the live Gemini API
 ## Where the evidence lives (for the submission)
 
 - **AI executes key decisions:** AI Assessments + State Transitions tables (Airtable) + Cloud Run logs
-- **Telemetry:** Cloud Console → Cloud Run → cbd-assess → Logs (every assessment logs latency, tokens, tier, route, model — never journal text, email, phone, or tokens)
+- **Telemetry:** Cloud Console → Cloud Run → cbd-assess → Logs (completed ordinary Gemini assessment paths log latency, tokens, tier, route, and model; emergency short-circuits and incomplete persistence paths do not necessarily emit that telemetry, and logs must never contain journal text, email, phone, or tokens)
 - **Costs:** Cloud Console Billing + Airtable/GHL invoices → cost ledger
 
 ## Safety design

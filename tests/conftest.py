@@ -34,7 +34,7 @@ class FakeAirtable:
         self._counter = itertools.count(1)
 
     def create(self, table, fields):
-        rid = f"rec{next(self._counter):06d}"
+        rid = f"rec{next(self._counter):014d}"
         self.tables.setdefault(table, {})[rid] = dict(fields)
         return {"id": rid, "fields": dict(fields)}
 
@@ -99,12 +99,12 @@ def fake_airtable(monkeypatch):
     def find_log_by_submission_id(submission_id, client_record_id):
         if not submission_id:
             return None
-        return store.find(
+        records = store.find_all(
             main.T_LOGS,
-            lambda f: (
-                f.get(main.F_LOG["submission_id"]) == submission_id
-                and client_record_id in (f.get(main.F_LOG["client"]) or [])
-            ),
+            lambda f: f.get(main.F_LOG["submission_id"]) == submission_id,
+        )
+        return main._select_owned_log_candidate(
+            records, submission_id, client_record_id,
         )
 
     def find_assessment_by_log_id(log_record_id):
@@ -164,9 +164,10 @@ def mock_gemini(monkeypatch):
     """Patch main.run_assessment. Call mock_gemini.set(...) with a canned
     result dict, or mock_gemini.fail(exc) to simulate an outage/malformed
     response."""
-    state = {"result": make_gemini_result(), "exc": None}
+    state = {"result": make_gemini_result(), "exc": None, "calls": 0}
 
     def run_assessment(journal, scores, context):
+        state["calls"] += 1
         if state["exc"]:
             raise state["exc"]
         return state["result"], 120, 50, 30
@@ -187,7 +188,12 @@ def mock_gemini(monkeypatch):
 
     monkeypatch.setattr(main, "run_assessment", run_assessment)
 
-    return types.SimpleNamespace(set=set_result, set_raw=set_raw, fail=fail)
+    return types.SimpleNamespace(
+        set=set_result,
+        set_raw=set_raw,
+        fail=fail,
+        call_count=lambda: state["calls"],
+    )
 
 
 @pytest.fixture(autouse=True)

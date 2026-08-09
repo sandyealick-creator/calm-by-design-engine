@@ -2,7 +2,7 @@
 
 Everything not marked "done locally" below needs a live Cloud Run deployment (or `python main.py` locally against real Airtable/Gemini) with real `GEMINI_API_KEY` / `AIRTABLE_API_KEY` / `WEBHOOK_SECRET` / `SESSION_SECRET` set, and must be run against **test data only**. Before starting: enroll every test participant with **Test Record** checked on the Clients table, and use email addresses you control — never a real participant's contact info. **Never trigger the safety route or medical-emergency route against a real phone number or email you don't own.**
 
-The replay/token remediation was validated locally with 162 mocked tests passing and outbound sockets blocked. This confirms mocked logic only; live Airtable, GHL, Gemini, Cloud Run, browser, and delivery behavior still require the approvals and manual checks below.
+The replay/token and emergency-guidance remediation was validated locally with 230 mocked tests passing and outbound sockets blocked. This confirms mocked logic only; live Airtable, GHL, Gemini, Cloud Run, browser, and delivery behavior still require the approvals and manual checks below.
 
 ## Status legend
 
@@ -29,6 +29,7 @@ The replay/token remediation was validated locally with 162 mocked tests passing
 - [ ] 🔲 Needs GHL workflow + live Airtable. **Identity recovery, email delivery**: confirm the actual email arrives and the link logs you back in, in a real inbox.
 - [ ] 🔲 Needs manual browser/phone. **Lost link / new device recovery path**: repeat from a second device/browser to confirm cross-device recovery works end-to-end.
 - [ ] 🔲 Needs Cloud Run. Confirm request logs do not contain access or recovery bearer tokens during `/access#t=...` and `/recover-access#rt=...` redemption. Fragments should never reach the HTTP request line; do not enroll participants if deployed logging contradicts this expectation.
+- [ ] 🔲 Needs Cloud Run. Before enabling recovery delivery, confirm generated recovery links use the intended public HTTPS origin and are not influenced by an unexpected Host or proxy scheme. The application currently derives the origin from `request.url_root`.
 
 ## B–E. Daily check-in, scoring, routing
 
