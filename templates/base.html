@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Calm by Design{% endblock %}, White Raven Holistic</title>
+<style>
+  :root {
+    --navy: #1e2a35;
+    --amber: #c49a2a;
+    --slate: #3a4a54;
+    --white: #ffffff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--navy);
+    color: var(--white);
+    font-family: Georgia, 'Times New Roman', serif;
+    line-height: 1.5;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 24px 16px 60px;
+  }
+  .wordmark {
+    letter-spacing: 0.08em;
+    font-size: 0.9rem;
+    text-transform: uppercase;
+    color: var(--amber);
+    margin-bottom: 28px;
+    text-align: center;
+  }
+  .card {
+    background: var(--slate);
+    border-radius: 12px;
+    padding: 28px 24px;
+    max-width: 520px;
+    width: 100%;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+  }
+  h1 {
+    color: var(--white);
+    font-size: 1.5rem;
+    margin: 0 0 8px;
+  }
+  h2 {
+    color: var(--amber);
+    font-size: 1.1rem;
+    margin: 20px 0 8px;
+  }
+  p { margin: 0 0 14px; }
+  label {
+    display: block;
+    margin: 14px 0 6px;
+    font-size: 0.95rem;
+  }
+  input[type=text], input[type=email], input[type=tel], input[type=number], textarea {
+    width: 100%;
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: 1px solid rgba(255,255,255,0.25);
+    background: rgba(255,255,255,0.06);
+    color: var(--white);
+    font-family: inherit;
+    font-size: 1rem;
+  }
+  textarea { min-height: 110px; resize: vertical; }
+  .checkbox-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    margin: 14px 0;
+  }
+  .checkbox-row input { margin-top: 4px; }
+  .checkbox-row span { font-size: 0.9rem; }
+  button {
+    margin-top: 22px;
+    width: 100%;
+    padding: 13px;
+    border: none;
+    border-radius: 8px;
+    background: var(--amber);
+    color: var(--navy);
+    font-family: inherit;
+    font-weight: bold;
+    font-size: 1.05rem;
+    cursor: pointer;
+  }
+  button:hover { opacity: 0.92; }
+  a { color: var(--amber); }
+  .error {
+    background: rgba(196, 60, 60, 0.18);
+    border: 1px solid rgba(196, 60, 60, 0.5);
+    padding: 10px 14px;
+    border-radius: 8px;
+    margin-bottom: 14px;
+    font-size: 0.92rem;
+  }
+  .muted {
+    color: rgba(255,255,255,0.65);
+    font-size: 0.85rem;
+  }
+  .safety-box {
+    background: #4a1e1e;
+    border: 2px solid #d95f5f;
+    border-radius: 10px;
+    padding: 18px;
+    margin: 16px 0;
+  }
+  .safety-box h2 { color: #ffb3b3; margin-top: 0; }
+  .safety-box a.button-link {
+    display: block;
+    text-align: center;
+    background: #d95f5f;
+    color: var(--white);
+    padding: 12px;
+    border-radius: 8px;
+    text-decoration: none;
+    font-weight: bold;
+    margin-top: 10px;
+  }
+  .steps { padding-left: 20px; }
+  .steps li { margin-bottom: 8px; }
+  .link-box {
+    word-break: break-all;
+    background: rgba(0,0,0,0.25);
+    padding: 12px;
+    border-radius: 8px;
+    font-family: monospace;
+    font-size: 0.85rem;
+  }
+  @media (prefers-color-scheme: light) {
+    /* Brand is intentionally dark-first; keep it consistent in both modes. */
+  }
+</style>
+</head>
+<body>
+  <div class="wordmark">White Raven Holistic &middot; Calm by Design</div>
+  <div class="card">
+    {% block content %}{% endblock %}
+  </div>
+</body>
+</html>

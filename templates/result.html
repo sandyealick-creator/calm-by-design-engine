@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}Your check-in{% endblock %}
+{% block content %}
+
+{% if processing_incomplete and not response_route %}
+  <h1>Your check-in was saved.</h1>
+  <p>We could not finish processing it right now, so no response route or follow-up is confirmed. Please do not submit the same check-in again.</p>
+
+{% elif response_route == "MEDICAL_EMERGENCY_ROUTE" %}
+  <div class="safety-box">
+    <h2>This may be a medical emergency</h2>
+    <p>What you shared may describe a medical emergency. This app is not emergency care and is not monitored in real time.</p>
+    <p><strong>Please don't wait for a reply from us.</strong> If this feels urgent, call 911 or go to the nearest emergency room now.</p>
+    <a class="button-link" href="tel:911">Call 911</a>
+  </div>
+  {% if crisis_alert_created is sameas true %}
+  <p class="muted">We recorded an alert for White Raven Holistic to review, but this app cannot confirm that a notification was delivered or seen. Please do not wait for a response.</p>
+  {% elif crisis_alert_created is sameas false %}
+  <p class="muted">We could not record an alert for White Raven Holistic, and no notification is confirmed. Please do not wait for a response.</p>
+  {% else %}
+  <p class="muted">We could not confirm whether an alert was recorded. No notification, delivery, or review is confirmed. Please do not wait for a response.</p>
+  {% endif %}
+
+{% elif response_route == "SAFETY_ROUTE" %}
+  {% if medical_emergency_triggered %}
+  <div class="safety-box">
+    <h2>This may also be a medical emergency</h2>
+    <p>What you shared may also describe a medical emergency. If this feels urgent, call 911 or go to the nearest emergency room now.</p>
+    <a class="button-link" href="tel:911">Call 911</a>
+  </div>
+  {% endif %}
+  <div class="safety-box">
+    <h2>Your safety matters right now</h2>
+    <p>What you shared suggests you may be in danger. This app is not emergency care, and it is not monitored in real time. Messages here, including this one, or an alert to White Raven Holistic, may not be seen right away.</p>
+    <p><strong>Please don't wait for a reply from us.</strong> Reach out now:</p>
+    <a class="button-link" href="tel:988">Call 988</a>
+    <a class="button-link" href="sms:988">Text 988</a>
+    <p style="margin-top:12px;">If you are in immediate danger, cannot stay safe, or an attempt is already in progress, call <strong>911</strong> or go to the nearest emergency room now.</p>
+  </div>
+  {% if crisis_alert_created is sameas true %}
+  <p class="muted">We recorded an alert for White Raven Holistic to review, but this app cannot confirm that a notification was delivered or seen. Please do not wait for a response.</p>
+  {% elif crisis_alert_created is sameas false %}
+  <p class="muted">We could not record an alert for White Raven Holistic, and no notification is confirmed. Please do not wait for a response.</p>
+  {% else %}
+  <p class="muted">We could not confirm whether an alert was recorded. No notification, delivery, or review is confirmed. Please do not wait for a response.</p>
+  {% endif %}
+
+  {% if element %}
+  <h2>If it helps while you reach out</h2>
+  <p class="muted">This is an extra option, not a substitute for the resources above.</p>
+  <p><strong>{{ element_name }}, {{ element.title }}</strong> ({{ element.duration }})</p>
+  <p>{{ element.intro }}</p>
+  <ol class="steps">
+    {% for step in element.steps %}<li>{{ step }}</li>{% endfor %}
+  </ol>
+  {% endif %}
+
+{% elif response_route == "HEIGHTENED_SUPPORT" %}
+  <h1>Thank you for sharing that.</h1>
+  <p>It sounds like today has been genuinely hard. Here's a short practice that may help right now.</p>
+  {% if element %}
+  <h2>{{ element_name }}, {{ element.title }}</h2>
+  <p class="muted">{{ element.trait }} &middot; {{ element.duration }}</p>
+  <p>{{ element.intro }}</p>
+  <ol class="steps">
+    {% for step in element.steps %}<li>{{ step }}</li>{% endfor %}
+  </ol>
+  <p>{{ element.close }}</p>
+  {% endif %}
+  <p><strong>Consider reaching out</strong> to someone you trust, or a professional support person, today. This app is a helpful check-in, but it isn't monitored continuously and isn't a substitute for that kind of support.</p>
+
+{% elif response_route == "GROUNDING_SUPPORT" %}
+  <h1>Let's take a moment together.</h1>
+  {% if element %}
+  <h2>{{ element_name }}, {{ element.title }}</h2>
+  <p class="muted">{{ element.trait }} &middot; {{ element.duration }}</p>
+  <p>{{ element.intro }}</p>
+  <ol class="steps">
+    {% for step in element.steps %}<li>{{ step }}</li>{% endfor %}
+  </ol>
+  <p>{{ element.close }}</p>
+  {% endif %}
+
+{% elif response_route == "POSITIVE_PROGRESS" %}
+  <h1>That's real progress.</h1>
+  <p>Thank you for noticing it and writing it down. Keep going at your own pace, no need to do anything else right now.</p>
+
+{% else %}
+  <h1>Got it, thanks for checking in.</h1>
+  <p>Nothing more needed from you today. Keep noticing how things feel, that's the practice.</p>
+{% endif %}
+
+{% if checkin_saved is sameas true %}
+<p class="muted" style="margin-top:24px;">Your check-in was saved.{% if processing_incomplete %} We could not finish processing it, and no notification, delivery, review, or response is confirmed.{% elif fallback_mode %} The AI reader was unavailable, so deterministic fallback routing was used.{% endif %}</p>
+{% elif checkin_saved is sameas false %}
+<p class="muted" style="margin-top:24px;">We could not save this check-in. The emergency resources above are still available. Please do not wait for a response from us.</p>
+{% else %}
+<p class="muted" style="margin-top:24px;">We could not confirm whether this check-in was saved. The emergency resources above are still available. Please do not wait for a response from us.</p>
+{% endif %}
+{% if response_route != "MEDICAL_EMERGENCY_ROUTE" %}
+<p class="muted" style="font-size:0.75rem;">{{ safety_footer }}</p>
+{% endif %}
+{% endblock %}

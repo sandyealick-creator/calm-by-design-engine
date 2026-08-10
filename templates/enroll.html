@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Join Calm by Design{% endblock %}
+{% block content %}
+<h1>Welcome home.</h1>
+<p>Set up your Calm by Design check-in access. This is a one-time step, after this, your daily check-ins take under a minute.</p>
+
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+<form method="post" action="/enroll">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+  <label for="first_name">First name</label>
+  <input type="text" id="first_name" name="first_name" required>
+
+  <label for="last_name">Last name</label>
+  <input type="text" id="last_name" name="last_name" required>
+
+  <label for="email">Email</label>
+  <input type="email" id="email" name="email" required>
+
+  <label for="phone">Phone</label>
+  <input type="tel" id="phone" name="phone" required>
+
+  <div class="checkbox-row">
+    <input type="checkbox" id="sms_consent" name="sms_consent">
+    <span><label for="sms_consent" style="display:inline;margin:0;">I agree to receive non-marketing text messages related to my check-ins (for example, a grounding practice or a safety follow-up). This is optional, you can still take part without it.</label></span>
+  </div>
+
+  <div class="checkbox-row">
+    <input type="checkbox" id="marketing_consent" name="marketing_consent">
+    <span><label for="marketing_consent" style="display:inline;margin:0;">I'd also like to receive occasional Calm by Design news and updates (optional, separate from the above).</label></span>
+  </div>
+
+  <button type="submit">Continue</button>
+</form>
+
+<p class="muted" style="margin-top:18px;">Already enrolled? <a href="/recover">Find your check-in link</a>.</p>
+{% endblock %}

@@ -1,0 +1,73 @@
+# Calm by Design — Manual Test Checklist
+
+Everything not marked "done locally" below needs a live Cloud Run deployment (or `python main.py` locally against real Airtable/Gemini) with real `GEMINI_API_KEY` / `AIRTABLE_API_KEY` / `WEBHOOK_SECRET` / `SESSION_SECRET` set, and must be run against **test data only**. Before starting: enroll every test participant with **Test Record** checked on the Clients table, and use email addresses you control — never a real participant's contact info. **Never trigger the safety route or medical-emergency route against a real phone number or email you don't own.**
+
+The replay/token and emergency-guidance remediation was validated locally with 265 mocked tests passing and outbound sockets blocked. This confirms mocked logic only; live Airtable, GHL, Gemini, Cloud Run, browser, and delivery behavior still require the approvals and manual checks below.
+
+## Status legend
+
+- ✅ **Done locally** — verified this session via `pytest` (Airtable/Gemini mocked) and/or `run_golden.py` (real Gemini, no Airtable writes). Logic-level verification only.
+- 🔲 **Needs live Airtable** — requires running the app (locally or on Cloud Run) against your real CBD Core base, which writes real records. Not done this session per your instruction not to make additional live Airtable changes without approval — even locally, since `main.py` always talks to the live base (there's no sandbox-base toggle).
+- 🔲 **Needs Cloud Run** — requires the deployed public URL specifically (e.g. testing from an external phone, or anything GHL needs to call back to).
+- 🔲 **Needs GHL workflow** — requires the new "Send Check-in Link" workflow (see below) to exist before it can be tested.
+- 🔲 **Needs manual browser/phone** — requires a human clicking through, not automatable.
+
+## Before you start
+
+- [ ] 🔲 Needs live Airtable/Cloud Run. `SESSION_SECRET` and `WEBHOOK_SECRET` are set to long random strings, distinct from each other, not committed anywhere.
+- [ ] 🔲 Needs Cloud Run. Confirm the deployed Python runtime version is supported by every dependency declared in `requirements.txt`, then run the mocked suite and `pip check` in that same runtime before live verification.
+- [ ] 🔲 Needs GHL workflow (not yet created). Create the new GHL workflow **"Send Check-in Link"**: Trigger = Airtable "New Record Created" on the `Recovery Requests` table, filtered to records where `Recovery Link` is not empty → Find Contact by email → Send Email containing the `Recovery Link` field value directly. That field holds the full, single-use, 30-minute fragment link (`/recover-access#rt=...`); the browser removes the fragment before same-origin POST redemption, and the Airtable field is cleared once used.
+- [ ] 🔲 Needs live Airtable/Cloud Run. The existing "Daily Check-In - Assessment" GHL workflow still targets `/assess`, which continues to call the shared `process_checkin()` core. Verify the real payload stays within the journal limit and either omits `submission_id` or supplies a canonical UUIDv4; malformed IDs now fail closed.
+- [ ] 🔲 Needs live Airtable/Cloud Run. The existing "Crisis Alert Notification" and "Safety Buffer Routing" GHL workflows are still active and untouched.
+
+## A. Enrollment and identity
+
+- [x] ✅ Done locally. **New enrollment** creates one Clients row, does not require SMS/marketing consent to complete (`test_new_enrollment_creates_client_and_uses_clean_cookie_redirect`, `test_enrollment_without_sms_consent_still_succeeds`).
+- [x] ✅ Done locally. **Consent handling**: SMS and marketing consent save independently, no cross-contamination (`test_enrollment_without_sms_consent_still_succeeds` plus the schema keeps the two fields separate).
+- [x] ✅ Done locally. **Existing email protection**: a clean browser cannot overwrite the participant profile or consent fields, rotate the durable access token, or receive an authenticated cookie; the submission uses the generic recovery process instead (`test_existing_email_enrollment_uses_generic_recovery_without_authenticating`, `test_existing_email_enrollment_cannot_overwrite_profile_or_consents`).
+- [x] ✅ Done locally. **Returning participant**: session cookie skips name/email/phone/consent fields on `/checkin` (`test_returning_participant_checkin_prefilled`).
+- [x] ✅ Done locally. **Identity recovery, logic**: generic message regardless of match, real link only created for a matched email, single-use enforcement, full round trip (`test_recover_generic_message_regardless_of_match`, `test_recover_creates_token_only_for_matched_email`, `test_recover_confirm_full_round_trip`).
+- [ ] 🔲 Needs GHL workflow + live Airtable. **Identity recovery, email delivery**: confirm the actual email arrives and the link logs you back in, in a real inbox.
+- [ ] 🔲 Needs manual browser/phone. **Lost link / new device recovery path**: repeat from a second device/browser to confirm cross-device recovery works end-to-end.
+- [ ] 🔲 Needs Cloud Run. Confirm request logs do not contain access or recovery bearer tokens during `/access#t=...` and `/recover-access#rt=...` redemption. Fragments should never reach the HTTP request line; do not enroll participants if deployed logging contradicts this expectation.
+- [ ] 🔲 Needs Cloud Run. Before enabling recovery delivery, confirm generated recovery links use the intended public HTTPS origin and are not influenced by an unexpected Host or proxy scheme. The application currently derives the origin from `request.url_root`.
+
+## B–E. Daily check-in, scoring, routing
+
+- [x] ✅ Done locally. **Score boundaries** 11/12, 15/16, 23/24 (`test_score_boundary_11_vs_12_routes_differently` plus `test_routing_config.py`'s full boundary suite).
+- [x] ✅ Done locally. **Positive journal entry** → Positive/Progress, no grounding practice pushed (`test_positive_progress_advances_curriculum`).
+- [x] ✅ Done locally. **Neutral entry** → Steady.
+- [x] ✅ Done locally. **Distressed entry below 16** escalates to Grounding Support (`test_distress_at_lower_score_escalates_to_grounding`).
+- [x] ✅ Done locally. **High score, no self-harm language** → Heightened Support, not Safety Route (`test_high_score_alone_is_not_safety_route`).
+- [x] ✅ Done locally. **All five elements** selectable and recorded, anti-repeat logic works (`test_all_five_elements_selectable`, `test_anti_repeat_avoids_last_used_element`).
+- [x] ✅ Done locally. **Duplicate submission** (double-click/retry) creates exactly one record (`test_idempotent_replay_same_submission_id_no_duplicate`).
+- [x] ✅ Done locally. **Two legitimate same-day check-ins** save independently and can land in different tiers (`test_two_legitimate_same_day_checkins_are_independent`).
+- [ ] 🔲 Needs live Airtable. Confirm the on-screen result **and** the real Airtable `AI Assessments` row match (field-ID correctness against the actual base, not the test fake).
+- [ ] 🔲 Needs manual browser/phone. **Mobile layout**: run enrollment and check-in on an actual phone/emulator. No horizontal scrolling, inputs usable, 988/911/911-medical links tappable.
+- [ ] 🔲 Needs Cloud Run. Confirm `request.remote_addr` provides a useful participant/GHL boundary behind Cloud Run before relying on submission rate limits. Do not enable trust of `X-Forwarded-For` without an explicitly verified proxy-hop configuration.
+
+## Safety and medical-emergency language (use only against your own test contact info)
+
+- [x] ✅ Done locally, keyword backstop level. Historical/negated self-harm language does not trigger (`test_historical_past_tense_with_negation_does_not_trigger`, `test_negation_does_not_trigger`).
+- [x] ✅ Done locally. Ambiguous self-harm language → `ambiguous`, not the Safety Route by itself (`test_ambiguous_hopelessness`, `test_ambiguous_self_harm_language_does_not_trigger_either_override`).
+- [x] ✅ Done locally. Direct current self-harm language → Safety Route, Crisis Alert created, 988/911 shown (`test_direct_self_harm_language_still_routes_to_safety`, `test_gemini_safety_signal_triggers_safety_route`, `test_keyword_rule_triggers_safety_route_even_when_gemini_says_none`).
+- [x] ✅ Done locally. Imminent-danger language → Safety Route, `imminent_danger` (`test_imminent_self_harm_danger_still_routes_to_safety`).
+- [x] ✅ Done locally. High score alone never triggers the Safety Route (`test_high_score_alone_is_not_safety_route`).
+- [x] ✅ Done locally, keyword backstop level. **Ordinary physical discomfort** does not trigger the medical-emergency override (`test_ordinary_physical_discomfort_does_not_trigger_medical_emergency`, `test_ordinary_physical_discomfort_is_not_medical_emergency`).
+- [x] ✅ Done locally. **Clear medical-emergency language** (chest pain, can't breathe) → Medical Emergency Route: 911 guidance shown, no 988, no grounding practice as the response (`test_chest_pain_triggers_medical_emergency`, `test_clear_medical_emergency_language_routes_to_medical_emergency`, `test_medical_emergency_result_page_shows_911_not_988`).
+- [x] ✅ Done locally. **Historical/third-person medical language** does not trigger (`test_historical_medical_language_does_not_trigger`, `test_third_person_medical_language_does_not_trigger`).
+- [x] ✅ Done locally. **Simultaneous medical-emergency + self-harm language** → Safety Route wins for routing/curriculum, but the result page shows both the 911 medical block and the 988 safety block (`test_simultaneous_medical_emergency_and_self_harm`, `test_simultaneous_medical_and_safety_result_page_shows_both`).
+- [x] ✅ Done locally. Medical-emergency and self-harm signals are independent in both directions, neither implies the other (`test_medical_and_self_harm_language_are_independent`, `test_self_harm_alone_does_not_trigger_medical_emergency`, `test_medical_emergency_alone_does_not_trigger_self_harm_signal`).
+- [x] ✅ Done locally against the real Gemini API (`run_golden.py`, 19/20 passed — see final report for the one disagreement, which does not affect real routing).
+- [ ] 🔲 Needs live Airtable. Confirm the real Crisis Alerts row's `Alert ID` and `Reasoning` correctly show the `SELF_HARM` / `MEDICAL_EMERGENCY` / `SELF_HARM_AND_MEDICAL_EMERGENCY` category prefix (logic verified locally; real-base field write not yet verified).
+
+## Failure modes
+
+- [x] ✅ Done locally. **Malformed Gemini response** → deterministic fallback, `Fallback Mode` set, participant still gets a result (`test_malformed_gemini_response_triggers_fallback`).
+- [x] ✅ Done locally. **Gemini unavailable** → same fallback behavior; keyword safety backstop still catches direct self-harm language without Gemini (`test_gemini_unavailable_falls_back_and_keyword_rule_still_catches_safety`, `test_gemini_unavailable_still_routes_by_score`).
+- [x] ✅ Done locally. **Airtable unavailable** → participant sees the generic error page, no stack trace or raw error text (`test_airtable_unavailable_shows_generic_error`).
+- [x] ✅ Done locally, by design. **GoHighLevel unavailable** → the optional `GHL_ROUTING_WEBHOOK`/`GHL_CRISIS_WEBHOOK` calls are guarded by `if hook:`, so an unset/unreachable webhook cannot block a check-in from saving (unit-tested indirectly; no live GHL call is made in the test suite at all).
+
+## After this checklist passes
+
+Only then should the new Flask enrollment/check-in flow be treated as the primary demo path; keep the existing GHL form available as a fallback until it does.
