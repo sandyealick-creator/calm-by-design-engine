@@ -177,9 +177,10 @@ verification remain deployment blockers until those gates are approved.
 
 ## 4. Build from an isolated commit-derived context
 
-This repository has no tracked submodules, `.gitmodules`, or archive-altering
-`.gitattributes` at this checkpoint. If any appears in the approved commit,
-this phase stops rather than producing an incomplete archive.
+This repository has no tracked submodules, symlinks, `.gitmodules`, or
+archive-altering `.gitattributes` at this checkpoint. The validator below reads
+the exact approved Git tree with NUL-delimited output and stops if any of those
+unsupported inputs, any unsupported object mode, or any unsafe path appears.
 
 After separate build authorization, start this phase in a fresh shell and copy
 only approved release-record identifiers. It creates a new temporary directory,
@@ -209,6 +210,7 @@ tree, and submits the isolated context instead of the live worktree.
   TRAFFIC_PREFLIGHT_STATE='REPLACE_WITH_APPROVED_PREFLIGHT_STATE'
   PREVIOUS_REVISION='REPLACE_WITH_RECORDED_PREVIOUS_REVISION'
   PREVIOUS_IMAGE_DIGEST='REPLACE_WITH_RECORDED_PREVIOUS_IMAGE_DIGEST'
+  PYTHON_BIN='python3.12'
   CANDIDATE_IMAGE_DIGEST=''
 
   for name in PROJECT_ID REGION AR_REPOSITORY IMAGE_NAME SOURCE_SHA SOURCE_TREE \
@@ -235,16 +237,7 @@ tree, and submits the isolated context instead of the live worktree.
     fail 'tree lookup'
   fi
   [[ "$CURRENT_TREE" == "$SOURCE_TREE" ]] || fail 'recorded tree mismatch'
-
-  if [[ -e .gitmodules ]]; then fail 'submodules require a different build method'; fi
-  if [[ -e .gitattributes ]]; then
-    fail 'archive attributes require separate review'
-  fi
-  if ! SUBMODULE_PATHS="$(git ls-tree -r "$SOURCE_SHA" \
-    | awk '$1 == "160000" {print $4}')"; then
-    fail 'submodule inspection'
-  fi
-  [[ -z "$SUBMODULE_PATHS" ]] || fail 'tracked submodule found'
+  command -v "$PYTHON_BIN" >/dev/null 2>&1 || fail 'python3.12 is unavailable'
 
   TMP_BASE="${TMPDIR:-/tmp}"
   [[ "$TMP_BASE" == /* && "$TMP_BASE" != / && -d "$TMP_BASE" && -w "$TMP_BASE" ]] \
@@ -262,8 +255,6 @@ tree, and submits the isolated context instead of the live worktree.
 
   ARCHIVE_PATH="${BUILD_ROOT}/source.tar"
   BUILD_CONTEXT="${BUILD_ROOT}/context"
-  TRACKED_LIST="${BUILD_ROOT}/tracked-files.txt"
-  ARCHIVED_LIST="${BUILD_ROOT}/archived-files.txt"
   mkdir -- "$BUILD_CONTEXT" || fail 'context directory creation'
 
   git archive --format=tar --output="$ARCHIVE_PATH" "$SOURCE_SHA" \
@@ -273,12 +264,172 @@ tree, and submits the isolated context instead of the live worktree.
   fi
   [[ "$ARCHIVED_COMMIT" == "$SOURCE_SHA" ]] || fail 'archive commit mismatch'
 
-  git ls-tree -r --name-only "$SOURCE_SHA" | LC_ALL=C sort > "$TRACKED_LIST" \
-    || fail 'tracked file manifest'
-  tar -tf "$ARCHIVE_PATH" | sed '/\/$/d' | LC_ALL=C sort > "$ARCHIVED_LIST" \
-    || fail 'archive file manifest'
-  cmp -s "$TRACKED_LIST" "$ARCHIVED_LIST" || fail 'archive differs from tracked tree'
-  tar -xf "$ARCHIVE_PATH" -C "$BUILD_CONTEXT" || fail 'archive extraction'
+  if ! "$PYTHON_BIN" - "$SOURCE_SHA" "$ARCHIVE_PATH" "$BUILD_CONTEXT" <<'PY'
+import os
+import re
+import subprocess
+import sys
+import tarfile
+from pathlib import Path, PurePosixPath
+
+
+def stop(message: str) -> None:
+    raise SystemExit(f"tree/archive validation failed: {message}")
+
+
+source_sha, archive_name, context_name = sys.argv[1:]
+if not re.fullmatch(r"[0-9a-f]{40}", source_sha):
+    stop("source SHA")
+
+context = Path(context_name)
+if not context.is_absolute() or not context.is_dir() or any(context.iterdir()):
+    stop("context must be a new empty absolute directory")
+
+try:
+    result = subprocess.run(
+        ["git", "ls-tree", "-rz", source_sha],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+except subprocess.CalledProcessError:
+    stop("exact-tree query")
+
+records = result.stdout.split(b"\0")
+if not records or records[-1] != b"":
+    stop("tree output is not NUL terminated")
+records.pop()
+if not records:
+    stop("approved tree is empty")
+
+tracked: dict[str, tuple[str, str]] = {}
+tracked_bytes: set[bytes] = set()
+for record in records:
+    try:
+        header, raw_path = record.split(b"\t", 1)
+        mode_raw, type_raw, oid_raw = header.split(b" ", 2)
+    except ValueError:
+        stop("malformed tree record")
+    if not raw_path or raw_path in tracked_bytes:
+        stop("empty or duplicate tree path")
+    tracked_bytes.add(raw_path)
+    try:
+        mode = mode_raw.decode("ascii")
+        object_type = type_raw.decode("ascii")
+        oid = oid_raw.decode("ascii")
+        path = raw_path.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        stop("unsupported tree encoding")
+    if object_type != "blob" or mode not in {"100644", "100755"}:
+        stop("unsupported object type or mode")
+    if not re.fullmatch(r"[0-9a-f]{40}", oid):
+        stop("malformed blob identity")
+    if "\n" in path or "\r" in path or any(ord(char) < 32 or ord(char) == 127 for char in path):
+        stop("unsupported control character in tree path")
+    if path.startswith("/") or path.endswith("/") or "//" in path:
+        stop("absolute or malformed tree path")
+    parts = path.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        stop("tree traversal component")
+    if PurePosixPath(path).as_posix() != path:
+        stop("tree path normalization changed")
+    if parts[-1] in {".gitmodules", ".gitattributes"}:
+        stop("unsupported Git metadata input")
+    tracked[path] = (mode, oid)
+
+required = {"Dockerfile", "requirements.txt"}
+if not required.issubset(tracked):
+    stop("required build input is absent from approved tree")
+
+expected_directories: set[str] = set()
+for path in tracked:
+    parts = path.split("/")
+    for index in range(1, len(parts)):
+        expected_directories.add("/".join(parts[:index]))
+
+archive_files: dict[str, tarfile.TarInfo] = {}
+archive_directories: set[str] = set()
+seen_members: set[str] = set()
+try:
+    archive = tarfile.open(archive_name, mode="r:")
+except (OSError, tarfile.TarError):
+    stop("archive open")
+
+with archive:
+    for member in archive.getmembers():
+        raw_name = member.name
+        name = raw_name[:-1] if member.isdir() and raw_name.endswith("/") else raw_name
+        if not name or name in seen_members:
+            stop("empty or duplicate archive member")
+        seen_members.add(name)
+        if "\n" in name or "\r" in name or any(ord(char) < 32 or ord(char) == 127 for char in name):
+            stop("unsupported control character in archive path")
+        if name.startswith("/") or name.endswith("/") or "//" in name:
+            stop("absolute or malformed archive path")
+        parts = name.split("/")
+        if any(part in {"", ".", ".."} for part in parts):
+            stop("archive traversal component")
+        if PurePosixPath(name).as_posix() != name:
+            stop("archive path normalization changed")
+        if member.isdir():
+            if name not in expected_directories:
+                stop("unexpected archive directory")
+            archive_directories.add(name)
+        elif member.isfile():
+            if name not in tracked:
+                stop("unexpected archive file")
+            archive_files[name] = member
+        else:
+            stop("symlink, hard link, device, FIFO, or unsupported archive member")
+
+    if set(archive_files) != set(tracked):
+        stop("archive file manifest differs from approved tree")
+    if archive_directories != expected_directories:
+        stop("archive directory manifest differs from approved tree")
+
+    for path, (mode, oid) in tracked.items():
+        member = archive_files[path]
+        expected_executable = mode == "100755"
+        archive_executable = bool(member.mode & 0o111)
+        if archive_executable != expected_executable or member.mode & 0o7000:
+            stop("archive executable mode differs from approved tree")
+        extracted = archive.extractfile(member)
+        if extracted is None:
+            stop("archive file cannot be read")
+        archive_content = extracted.read()
+        try:
+            blob = subprocess.run(
+                ["git", "cat-file", "blob", oid],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            ).stdout
+        except subprocess.CalledProcessError:
+            stop("approved blob lookup")
+        if archive_content != blob:
+            stop("archive content differs from approved blob")
+
+    for directory in sorted(expected_directories, key=lambda value: (value.count("/"), value)):
+        (context / directory).mkdir(exist_ok=False)
+    for path, (mode, _oid) in tracked.items():
+        destination = context.joinpath(*path.split("/"))
+        member = archive_files[path]
+        source = archive.extractfile(member)
+        if source is None:
+            stop("validated archive file cannot be reopened")
+        with destination.open("xb") as output:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+        os.chmod(destination, 0o755 if mode == "100755" else 0o644)
+
+print(f"validated_tree_files={len(tracked)}")
+PY
+  then
+    fail 'exact-tree, archive, or extraction validation'
+  fi
 
   [[ -f "${BUILD_CONTEXT}/Dockerfile" ]] || fail 'Dockerfile missing from context'
   [[ -f "${BUILD_CONTEXT}/requirements.txt" ]] \
@@ -342,9 +493,26 @@ characters. Authorized tooling must confirm these constraints before execution.
 After that review, record
 `REVISION_NAMING_GATE=APPROVED_CLOUD_RUN_NAMING_CONSTRAINTS`.
 
-The collision query returns names only. It must succeed, must include the known
-`PREVIOUS_REVISION` as a coherence check, and must not include the proposed full
-candidate name. Failure, empty output, or ambiguity stops deployment.
+Repository-local evidence does not establish a trustworthy gcloud service-scoped
+filter, output schema, or zero-result representation for revision collision
+checking. Do not guess one. Before this phase, a separately authorized tooling
+verification must establish and record an exact field-filtered query that is
+bound to project, region, service, and the full candidate revision. It must
+distinguish command failure from a successful zero-match result and reject
+partial, malformed, duplicate, unrelated, or ambiguous records. A regional list
+or the presence of the previous revision is not evidence of candidate absence.
+
+Only a successful, reviewed, service-bound zero-match result may set all of:
+
+- `COLLISION_SCHEMA_GATE=APPROVED_SERVICE_BOUND_ZERO_MATCH_SCHEMA`
+- `COLLISION_CHECK_PROJECT`, `COLLISION_CHECK_REGION`, and
+  `COLLISION_CHECK_SERVICE` to the exact queried scope;
+- `COLLISION_CHECK_CANDIDATE_REVISION` to the exact full queried name; and
+- `COLLISION_EXACT_MATCH_COUNT=0`.
+
+Until that controlled verification exists, candidate deployment remains
+blocked. The deployment block below revalidates the complete recorded binding;
+it contains no fallback collision query whose failure could resemble absence.
 
 ```bash
 (
@@ -369,11 +537,19 @@ candidate name. Failure, empty output, or ambiguity stops deployment.
   SECRET_REFERENCE_GATE='REPLACE_WITH_APPROVED_SECRET_REFERENCE_GATE'
   RUNTIME_CONFIGURATION_GATE='REPLACE_WITH_APPROVED_RUNTIME_CONFIG_GATE'
   REVISION_NAMING_GATE='REPLACE_WITH_APPROVED_NAMING_CONSTRAINT_GATE'
+  COLLISION_SCHEMA_GATE='REPLACE_WITH_APPROVED_COLLISION_SCHEMA_GATE'
+  COLLISION_CHECK_PROJECT='REPLACE_WITH_EXACT_COLLISION_QUERY_PROJECT'
+  COLLISION_CHECK_REGION='REPLACE_WITH_EXACT_COLLISION_QUERY_REGION'
+  COLLISION_CHECK_SERVICE='REPLACE_WITH_EXACT_COLLISION_QUERY_SERVICE'
+  COLLISION_CHECK_CANDIDATE_REVISION='REPLACE_WITH_EXACT_COLLISION_QUERY_CANDIDATE'
+  COLLISION_EXACT_MATCH_COUNT='REPLACE_WITH_VALIDATED_EXACT_MATCH_COUNT'
 
   for name in PROJECT_ID REGION SERVICE AR_REPOSITORY IMAGE_NAME SOURCE_SHA \
     CANDIDATE_REVISION CANDIDATE_IMAGE_DIGEST PREVIOUS_REVISION \
     PREVIOUS_IMAGE_DIGEST TRAFFIC_PREFLIGHT_STATE SECRET_REFERENCE_GATE \
-    RUNTIME_CONFIGURATION_GATE REVISION_NAMING_GATE; do
+    RUNTIME_CONFIGURATION_GATE REVISION_NAMING_GATE COLLISION_SCHEMA_GATE \
+    COLLISION_CHECK_PROJECT COLLISION_CHECK_REGION COLLISION_CHECK_SERVICE \
+    COLLISION_CHECK_CANDIDATE_REVISION COLLISION_EXACT_MATCH_COUNT; do
     require_value "$name"
   done
   [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail 'SOURCE_SHA format'
@@ -389,6 +565,18 @@ candidate name. Failure, empty output, or ambiguity stops deployment.
     || fail 'runtime-configuration gate'
   [[ "$REVISION_NAMING_GATE" == APPROVED_CLOUD_RUN_NAMING_CONSTRAINTS ]] \
     || fail 'authorized revision-naming verification gate'
+  [[ "$COLLISION_SCHEMA_GATE" == APPROVED_SERVICE_BOUND_ZERO_MATCH_SCHEMA ]] \
+    || fail 'collision-query schema and zero-result gate'
+  [[ "$COLLISION_CHECK_PROJECT" == "$PROJECT_ID" ]] \
+    || fail 'collision project binding'
+  [[ "$COLLISION_CHECK_REGION" == "$REGION" ]] \
+    || fail 'collision region binding'
+  [[ "$COLLISION_CHECK_SERVICE" == "$SERVICE" ]] \
+    || fail 'collision service binding'
+  [[ "$COLLISION_CHECK_CANDIDATE_REVISION" == "$CANDIDATE_REVISION" ]] \
+    || fail 'collision candidate binding'
+  [[ "$COLLISION_EXACT_MATCH_COUNT" == 0 ]] \
+    || fail 'candidate collision was not disproved exactly'
 
   [[ "$SERVICE" =~ ^[a-z]([a-z0-9-]*[a-z0-9])?$ ]] || fail 'SERVICE format'
   [[ "$CANDIDATE_REVISION" =~ ^[a-z]([a-z0-9-]*[a-z0-9])?$ ]] \
@@ -404,20 +592,6 @@ candidate name. Failure, empty output, or ambiguity stops deployment.
     || fail 'revision suffix boundary'
   [[ "${SERVICE}-${CANDIDATE_REVISION_SUFFIX}" == "$CANDIDATE_REVISION" ]] \
     || fail 'derived revision mismatch'
-
-  EXISTING_REVISIONS=''
-  if ! EXISTING_REVISIONS="$(gcloud run revisions list \
-    --project="$PROJECT_ID" \
-    --region="$REGION" \
-    --format='value(metadata.name)')"; then
-    fail 'revision collision query'
-  fi
-  [[ -n "$EXISTING_REVISIONS" ]] || fail 'collision query returned no evidence'
-  grep -Fxq "$PREVIOUS_REVISION" <<< "$EXISTING_REVISIONS" \
-    || fail 'known previous revision missing from collision output'
-  if grep -Fxq "$CANDIDATE_REVISION" <<< "$EXISTING_REVISIONS"; then
-    fail 'candidate revision already exists'
-  fi
 
   IMAGE_URI="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPOSITORY}/${IMAGE_NAME}"
   CANDIDATE_IMAGE_REF="${IMAGE_URI}@${CANDIDATE_IMAGE_DIGEST}"
@@ -526,9 +700,20 @@ After separately reviewing successful evidence, the release record may contain:
 ## 8. Move traffic gradually with a fresh authorization each time
 
 Run this self-contained phase once per separately authorized percentage change.
-Copy all gates from the reviewed release record. A later increase requires a
-new authorization and a new fresh phase after the approved observation criteria
-and duration have passed.
+Copy all bindings from the reviewed release record. Before every movement, an
+authorized tooling check must have confirmed the exact filtered JSON field
+schema used below and recorded
+`TRAFFIC_QUERY_SCHEMA_GATE=APPROVED_FILTERED_TRAFFIC_AND_REVISION_JSON_SCHEMA`.
+That gate establishes output structure only; this phase still performs fresh
+queries and validates the actual revision identities, immutable digests, Ready
+conditions, complete current allocation, and exact authorized from-map.
+
+Each authorization records both canonical maps in candidate-then-previous order,
+for example `candidate=0,previous=100` followed by `candidate=10,previous=90`,
+using the full revision names rather than those illustrative words. It also
+records the exact two revision names and digests. A later increase requires a
+new authorization, a new fresh phase, and the prior target as its newly verified
+from-map. A historical zero-traffic gate is not valid after traffic has moved.
 
 ```bash
 (
@@ -538,70 +723,290 @@ and duration have passed.
     local name="$1" value="${!1-}"
     [[ -n "$value" && "$value" != REPLACE_* ]] || fail "$name is unresolved"
   }
+  require_component() {
+    local name="$1" value="${!1-}"
+    require_value "$name"
+    [[ "$value" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || fail "$name format"
+  }
+  validate_state() {
+    local expected_candidate_percent="$1" expected_previous_percent="$2"
+    "$PYTHON_BIN" - \
+      "$CANDIDATE_REVISION" "$CANDIDATE_IMAGE_DIGEST" \
+      "$PREVIOUS_REVISION" "$PREVIOUS_IMAGE_DIGEST" \
+      "$expected_candidate_percent" "$expected_previous_percent" \
+      "$CANDIDATE_STATUS" "$PREVIOUS_STATUS" "$TRAFFIC_STATUS" <<'PY'
+import json
+import re
+import sys
+
+
+def stop(message: str) -> None:
+    raise SystemExit(f"traffic-state validation failed: {message}")
+
+
+(
+    candidate_revision,
+    candidate_digest,
+    previous_revision,
+    previous_digest,
+    candidate_percent_raw,
+    previous_percent_raw,
+    candidate_raw,
+    previous_raw,
+    traffic_raw,
+) = sys.argv[1:]
+
+
+def document(raw: str, label: str) -> dict:
+    if not raw.strip():
+        stop(f"{label} output is empty")
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        stop(f"{label} output is malformed")
+    if not isinstance(value, dict):
+        stop(f"{label} output is ambiguous")
+    return value
+
+
+def normalized_digest(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        stop(f"{label} digest is empty or malformed")
+    digest = value.rsplit("@", 1)[-1]
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        stop(f"{label} digest is not immutable")
+    return digest
+
+
+def validate_revision(raw: str, expected_name: str, expected_digest: str, label: str) -> None:
+    value = document(raw, label)
+    metadata = value.get("metadata")
+    status = value.get("status")
+    if not isinstance(metadata, dict) or metadata.get("name") != expected_name:
+        stop(f"{label} revision identity mismatch")
+    if not isinstance(status, dict):
+        stop(f"{label} status is absent")
+    if normalized_digest(status.get("imageDigest"), label) != expected_digest:
+        stop(f"{label} digest mismatch")
+    conditions = status.get("conditions")
+    if not isinstance(conditions, list):
+        stop(f"{label} conditions are absent or malformed")
+    if any(
+        not isinstance(item, dict)
+        or not isinstance(item.get("type"), str)
+        or not isinstance(item.get("status"), str)
+        for item in conditions
+    ):
+        stop(f"{label} condition record is malformed")
+    ready = [item for item in conditions if isinstance(item, dict) and item.get("type") == "Ready"]
+    if len(ready) != 1 or ready[0].get("status") != "True":
+        stop(f"{label} does not have exactly one Ready=True condition")
+
+
+validate_revision(candidate_raw, candidate_revision, candidate_digest, "candidate")
+validate_revision(previous_raw, previous_revision, previous_digest, "previous")
+
+try:
+    expected_candidate = int(candidate_percent_raw)
+    expected_previous = int(previous_percent_raw)
+except ValueError:
+    stop("authorized percentages are malformed")
+
+traffic_document = document(traffic_raw, "traffic")
+status = traffic_document.get("status")
+traffic = status.get("traffic") if isinstance(status, dict) else None
+if not isinstance(traffic, list) or not traffic:
+    stop("complete traffic allocation is absent or malformed")
+
+allowed_names = {candidate_revision, previous_revision}
+allocation: dict[str, int] = {}
+allowed_fields = {"revisionName", "percent", "tag", "latestRevision", "url"}
+for target in traffic:
+    if not isinstance(target, dict) or not set(target).issubset(allowed_fields):
+        stop("traffic target is malformed or has an unverified field")
+    name = target.get("revisionName")
+    percent = target.get("percent")
+    if not isinstance(name, str) or name not in allowed_names:
+        stop("unexpected, missing, or third revision in traffic")
+    if name in allocation:
+        stop("duplicate traffic revision")
+    if isinstance(percent, bool) or not isinstance(percent, int) or not 0 <= percent <= 100:
+        stop("traffic percentage is malformed")
+    tag = target.get("tag")
+    if tag is not None and tag != "":
+        stop("tagged traffic is not permitted")
+    latest = target.get("latestRevision")
+    if latest is not None and latest is not False:
+        stop("latestRevision allocation is ambiguous")
+    allocation[name] = percent
+
+actual_candidate = allocation.get(candidate_revision, 0)
+actual_previous = allocation.get(previous_revision, 0)
+if actual_candidate + actual_previous != 100:
+    stop("traffic allocation does not total 100")
+if actual_candidate != expected_candidate or actual_previous != expected_previous:
+    stop("actual allocation differs from authorized map")
+
+print(
+    f"validated_allocation={candidate_revision}={actual_candidate},"
+    f"{previous_revision}={actual_previous}"
+)
+PY
+  }
 
   PROJECT_ID='REPLACE_WITH_PROJECT_ID'
   REGION='REPLACE_WITH_REGION'
   SERVICE='REPLACE_WITH_SERVICE'
+  PYTHON_BIN='python3.12'
   CANDIDATE_REVISION='REPLACE_WITH_RECORDED_CANDIDATE_REVISION'
   CANDIDATE_IMAGE_DIGEST='REPLACE_WITH_RECORDED_CANDIDATE_IMAGE_DIGEST'
   PREVIOUS_REVISION='REPLACE_WITH_RECORDED_PREVIOUS_REVISION'
   PREVIOUS_IMAGE_DIGEST='REPLACE_WITH_RECORDED_PREVIOUS_IMAGE_DIGEST'
   TRAFFIC_PREFLIGHT_STATE='REPLACE_WITH_APPROVED_PREFLIGHT_STATE'
-  CANDIDATE_READY_GATE='REPLACE_WITH_APPROVED_READY_GATE'
-  ZERO_TRAFFIC_GATE='REPLACE_WITH_APPROVED_ZERO_TRAFFIC_GATE'
+  TRAFFIC_QUERY_SCHEMA_GATE='REPLACE_WITH_APPROVED_FILTERED_JSON_SCHEMA_GATE'
   SMOKE_TEST_GATE='REPLACE_WITH_APPROVED_SMOKE_GATE'
   INTEGRATION_TEST_GATE='REPLACE_WITH_APPROVED_INTEGRATION_GATE'
-  TRAFFIC_AUTHORIZATION='REPLACE_WITH_AUTHORIZATION_FOR_THIS_EXACT_CHANGE'
-  APPROVED_PERCENT='REPLACE_WITH_APPROVED_CANDIDATE_PERCENT'
-  REMAINDER_PERCENT='REPLACE_WITH_PREVIOUS_REVISION_PERCENT'
+  TRAFFIC_AUTHORIZATION='REPLACE_WITH_BOUND_AUTHORIZATION_FOR_THIS_EXACT_CHANGE'
+  AUTHORIZED_PROJECT_ID='REPLACE_WITH_AUTHORIZED_PROJECT_ID'
+  AUTHORIZED_REGION='REPLACE_WITH_AUTHORIZED_REGION'
+  AUTHORIZED_SERVICE='REPLACE_WITH_AUTHORIZED_SERVICE'
+  AUTHORIZED_CANDIDATE_REVISION='REPLACE_WITH_AUTHORIZED_CANDIDATE_REVISION'
+  AUTHORIZED_CANDIDATE_DIGEST='REPLACE_WITH_AUTHORIZED_CANDIDATE_DIGEST'
+  AUTHORIZED_PREVIOUS_REVISION='REPLACE_WITH_AUTHORIZED_PREVIOUS_REVISION'
+  AUTHORIZED_PREVIOUS_DIGEST='REPLACE_WITH_AUTHORIZED_PREVIOUS_DIGEST'
+  CURRENT_CANDIDATE_PERCENT='REPLACE_WITH_AUTHORIZED_CURRENT_CANDIDATE_PERCENT'
+  CURRENT_PREVIOUS_PERCENT='REPLACE_WITH_AUTHORIZED_CURRENT_PREVIOUS_PERCENT'
+  TARGET_CANDIDATE_PERCENT='REPLACE_WITH_AUTHORIZED_TARGET_CANDIDATE_PERCENT'
+  TARGET_PREVIOUS_PERCENT='REPLACE_WITH_AUTHORIZED_TARGET_PREVIOUS_PERCENT'
+  AUTHORIZED_CURRENT_ALLOCATION='REPLACE_WITH_EXACT_CANONICAL_FROM_MAP'
+  AUTHORIZED_TARGET_ALLOCATION='REPLACE_WITH_EXACT_CANONICAL_TARGET_MAP'
 
   for name in PROJECT_ID REGION SERVICE CANDIDATE_REVISION \
     CANDIDATE_IMAGE_DIGEST PREVIOUS_REVISION PREVIOUS_IMAGE_DIGEST \
-    TRAFFIC_PREFLIGHT_STATE CANDIDATE_READY_GATE ZERO_TRAFFIC_GATE \
-    SMOKE_TEST_GATE INTEGRATION_TEST_GATE TRAFFIC_AUTHORIZATION \
-    APPROVED_PERCENT REMAINDER_PERCENT; do
+    TRAFFIC_PREFLIGHT_STATE TRAFFIC_QUERY_SCHEMA_GATE SMOKE_TEST_GATE \
+    INTEGRATION_TEST_GATE TRAFFIC_AUTHORIZATION AUTHORIZED_PROJECT_ID \
+    AUTHORIZED_REGION AUTHORIZED_SERVICE AUTHORIZED_CANDIDATE_REVISION \
+    AUTHORIZED_CANDIDATE_DIGEST AUTHORIZED_PREVIOUS_REVISION \
+    AUTHORIZED_PREVIOUS_DIGEST CURRENT_CANDIDATE_PERCENT \
+    CURRENT_PREVIOUS_PERCENT TARGET_CANDIDATE_PERCENT TARGET_PREVIOUS_PERCENT \
+    AUTHORIZED_CURRENT_ALLOCATION AUTHORIZED_TARGET_ALLOCATION; do
     require_value "$name"
   done
+  for name in PROJECT_ID REGION; do require_component "$name"; done
+  command -v "$PYTHON_BIN" >/dev/null 2>&1 || fail 'python3.12 is unavailable'
+  [[ "$SERVICE" =~ ^[a-z]([a-z0-9-]*[a-z0-9])?$ ]] || fail 'SERVICE format'
+  [[ "$CANDIDATE_REVISION" =~ ^[a-z]([a-z0-9-]*[a-z0-9])?$ ]] \
+    || fail 'candidate revision format'
+  [[ "$PREVIOUS_REVISION" =~ ^[a-z]([a-z0-9-]*[a-z0-9])?$ ]] \
+    || fail 'previous revision format'
+  [[ "$CANDIDATE_REVISION" == "${SERVICE}-"* ]] || fail 'candidate service prefix'
+  [[ "$PREVIOUS_REVISION" == "${SERVICE}-"* ]] || fail 'previous service prefix'
+  [[ "$CANDIDATE_REVISION" != "$PREVIOUS_REVISION" ]] || fail 'revisions are identical'
+  (( ${#CANDIDATE_REVISION} <= 63 && ${#PREVIOUS_REVISION} <= 63 )) \
+    || fail 'revision length'
   [[ "$CANDIDATE_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
     || fail 'candidate digest format'
   [[ "$PREVIOUS_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
     || fail 'previous digest format'
   [[ "$TRAFFIC_PREFLIGHT_STATE" == ONE_REVISION_AT_100_NO_TAGS ]] \
     || fail 'standard traffic precondition'
-  [[ "$CANDIDATE_READY_GATE" == READY_TRUE_EXACT_REVISION_AND_DIGEST ]] \
-    || fail 'Ready=True gate'
-  [[ "$ZERO_TRAFFIC_GATE" == CANDIDATE_ZERO_PREVIOUS_100_NO_TAGS ]] \
-    || fail 'zero-traffic gate'
+  [[ "$TRAFFIC_QUERY_SCHEMA_GATE" == APPROVED_FILTERED_TRAFFIC_AND_REVISION_JSON_SCHEMA ]] \
+    || fail 'filtered traffic and revision schema gate'
   [[ "$SMOKE_TEST_GATE" == APPROVED_TEST_ONLY_SMOKE_EVIDENCE ]] \
     || fail 'smoke-test gate'
   [[ "$INTEGRATION_TEST_GATE" == APPROVED_TEST_ONLY_INTEGRATION_EVIDENCE ]] \
     || fail 'integration-test gate'
-  [[ "$TRAFFIC_AUTHORIZATION" == APPROVED_FOR_THIS_EXACT_PERCENTAGE ]] \
-    || fail 'traffic authorization'
-  [[ "$APPROVED_PERCENT" =~ ^([1-9]|[1-9][0-9])$ ]] \
-    || fail 'candidate percentage format'
-  [[ "$REMAINDER_PERCENT" =~ ^([1-9]|[1-9][0-9])$ ]] \
-    || fail 'previous percentage format'
-  (( APPROVED_PERCENT < 100 )) || fail 'candidate percentage range'
-  (( APPROVED_PERCENT + REMAINDER_PERCENT == 100 )) \
-    || fail 'traffic percentages do not total 100'
+  [[ "$TRAFFIC_AUTHORIZATION" == APPROVED_EXACT_SCOPE_REVISIONS_DIGESTS_FROM_MAP_AND_TARGET_MAP ]] \
+    || fail 'bound traffic authorization'
+  [[ "$AUTHORIZED_PROJECT_ID" == "$PROJECT_ID" ]] \
+    || fail 'authorized project binding'
+  [[ "$AUTHORIZED_REGION" == "$REGION" ]] \
+    || fail 'authorized region binding'
+  [[ "$AUTHORIZED_SERVICE" == "$SERVICE" ]] \
+    || fail 'authorized service binding'
+  [[ "$AUTHORIZED_CANDIDATE_REVISION" == "$CANDIDATE_REVISION" ]] \
+    || fail 'authorized candidate revision binding'
+  [[ "$AUTHORIZED_CANDIDATE_DIGEST" == "$CANDIDATE_IMAGE_DIGEST" ]] \
+    || fail 'authorized candidate digest binding'
+  [[ "$AUTHORIZED_PREVIOUS_REVISION" == "$PREVIOUS_REVISION" ]] \
+    || fail 'authorized previous revision binding'
+  [[ "$AUTHORIZED_PREVIOUS_DIGEST" == "$PREVIOUS_IMAGE_DIGEST" ]] \
+    || fail 'authorized previous digest binding'
+  [[ "$CURRENT_CANDIDATE_PERCENT" =~ ^(0|[1-9]|[1-9][0-9])$ ]] \
+    || fail 'current candidate percentage format'
+  [[ "$CURRENT_PREVIOUS_PERCENT" =~ ^([1-9]|[1-9][0-9]|100)$ ]] \
+    || fail 'current previous percentage format'
+  [[ "$TARGET_CANDIDATE_PERCENT" =~ ^([1-9]|[1-9][0-9])$ ]] \
+    || fail 'target candidate percentage format'
+  [[ "$TARGET_PREVIOUS_PERCENT" =~ ^([1-9]|[1-9][0-9])$ ]] \
+    || fail 'target previous percentage format'
+  (( CURRENT_CANDIDATE_PERCENT + CURRENT_PREVIOUS_PERCENT == 100 )) \
+    || fail 'current percentages do not total 100'
+  (( TARGET_CANDIDATE_PERCENT + TARGET_PREVIOUS_PERCENT == 100 )) \
+    || fail 'target percentages do not total 100'
+  (( TARGET_CANDIDATE_PERCENT > CURRENT_CANDIDATE_PERCENT )) \
+    || fail 'target is not a gradual candidate increase'
+  EXPECTED_CURRENT_ALLOCATION="${CANDIDATE_REVISION}=${CURRENT_CANDIDATE_PERCENT},${PREVIOUS_REVISION}=${CURRENT_PREVIOUS_PERCENT}"
+  EXPECTED_TARGET_ALLOCATION="${CANDIDATE_REVISION}=${TARGET_CANDIDATE_PERCENT},${PREVIOUS_REVISION}=${TARGET_PREVIOUS_PERCENT}"
+  [[ "$AUTHORIZED_CURRENT_ALLOCATION" == "$EXPECTED_CURRENT_ALLOCATION" ]] \
+    || fail 'authorized current allocation binding'
+  [[ "$AUTHORIZED_TARGET_ALLOCATION" == "$EXPECTED_TARGET_ALLOCATION" ]] \
+    || fail 'authorized target allocation binding'
+
+  CANDIDATE_STATUS=''
+  if ! CANDIDATE_STATUS="$(gcloud run revisions describe "$CANDIDATE_REVISION" \
+    --project="$PROJECT_ID" \
+    --region="$REGION" \
+    --format='json(metadata.name,status.conditions,status.imageDigest)')"; then
+    fail 'fresh filtered candidate query'
+  fi
+  [[ -n "$CANDIDATE_STATUS" ]] || fail 'candidate query returned empty output'
+  PREVIOUS_STATUS=''
+  if ! PREVIOUS_STATUS="$(gcloud run revisions describe "$PREVIOUS_REVISION" \
+    --project="$PROJECT_ID" \
+    --region="$REGION" \
+    --format='json(metadata.name,status.conditions,status.imageDigest)')"; then
+    fail 'fresh filtered previous-revision query'
+  fi
+  [[ -n "$PREVIOUS_STATUS" ]] || fail 'previous query returned empty output'
+  TRAFFIC_STATUS=''
+  if ! TRAFFIC_STATUS="$(gcloud run services describe "$SERVICE" \
+    --project="$PROJECT_ID" \
+    --region="$REGION" \
+    --format='json(status.traffic)')"; then
+    fail 'fresh filtered current-traffic query'
+  fi
+  [[ -n "$TRAFFIC_STATUS" ]] || fail 'current traffic query returned empty output'
+  if ! validate_state "$CURRENT_CANDIDATE_PERCENT" "$CURRENT_PREVIOUS_PERCENT"; then
+    fail 'current revision or traffic state differs from authorization'
+  fi
 
   if ! gcloud run services update-traffic "$SERVICE" \
     --project="$PROJECT_ID" \
     --region="$REGION" \
-    --to-revisions="${CANDIDATE_REVISION}=${APPROVED_PERCENT},${PREVIOUS_REVISION}=${REMAINDER_PERCENT}"; then
+    --to-revisions="$AUTHORIZED_TARGET_ALLOCATION"; then
     fail 'authorized traffic update'
   fi
-  gcloud run services describe "$SERVICE" \
+  TRAFFIC_STATUS=''
+  if ! TRAFFIC_STATUS="$(gcloud run services describe "$SERVICE" \
     --project="$PROJECT_ID" \
     --region="$REGION" \
-    --format='yaml(status.latestReadyRevisionName,status.traffic)' \
-    || fail 'post-movement traffic query'
+    --format='json(status.traffic)')"; then
+    fail 'filtered post-movement traffic query'
+  fi
+  [[ -n "$TRAFFIC_STATUS" ]] || fail 'post-movement traffic output is empty'
+  if ! validate_state "$TARGET_CANDIDATE_PERCENT" "$TARGET_PREVIOUS_PERCENT"; then
+    fail 'post-movement allocation differs from authorized target'
+  fi
 )
 ```
 
-Stop after each movement for the approved observation period. Do not move 100%
-through this gradual block; final cutover requires its own reviewed procedure.
+Stop after each movement for the approved observation period. Preserve filtered
+evidence without secret or participant content. A post-movement mismatch or a
+failed observation stops all further increases and requires the separately
+authorized rollback procedure; do not automatically issue another traffic
+command. Do not move 100% through this gradual block; final cutover requires its
+own reviewed procedure.
 
 ## 9. Roll back to the verified pre-release state
 
