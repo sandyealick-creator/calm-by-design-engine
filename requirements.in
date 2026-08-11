@@ -1,0 +1,6 @@
+# Direct production dependencies. requirements.txt is the generated,
+# hash-locked transitive set used by the container build.
+flask==3.1.3
+google-genai==2.17.0
+gunicorn==26.0.0
+requests==2.34.2

@@ -76,11 +76,18 @@ variables before participant enrollment.
 ## Test
 
 ```
-pip install -r requirements.txt
-pytest                      # unit/endpoint tests, Airtable and Gemini mocked
+python3.12 -m venv .venv
+.venv/bin/python -m pip install --require-hashes -r requirements-dev.txt
+.venv/bin/python scripts/run_mocked_tests.py -p no:cacheprovider tests
 export GEMINI_API_KEY=your_key
 python run_golden.py        # scenario eval against the live Gemini API
 ```
+
+The mocked-suite runner installs its socket guard before importing pytest,
+overrides integration settings with test-only placeholders, fails on any
+non-loopback connection attempt, and reports the attempted-connection count.
+`requirements.txt` is the production-only hash lock; `requirements-dev.txt`
+adds the separately resolved test dependencies.
 
 `golden_set.json` contains test journals covering every response route, score boundary values, positive/neutral/distressed entries, and negated/historical/third-person/direct/imminent safety language. Results are evidence for judges. See `MANUAL_TEST_CHECKLIST.md` for the manual pass covering mobile layout and real GHL/Airtable round-trips against test records.
 

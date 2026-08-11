@@ -1,0 +1,3 @@
+# Test dependencies are resolved separately from the production image.
+-r requirements.in
+pytest==9.1.1

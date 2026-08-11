@@ -126,15 +126,18 @@ Fields added this build cycle (all additive, created via the Airtable MCP with e
 | `templates/*.html` | Participant-facing pages: enroll, checkin, recover, result (all five routes + medical emergency + combined case), link_invalid, error, base layout. |
 | `golden_set.json` / `run_golden.py` | Scenario-based eval harness against the real Gemini API (no Airtable writes). |
 | `tests/` | pytest suite, Airtable and Gemini mocked (`tests/conftest.py`'s `FakeAirtable` and `mock_gemini` fixtures). |
+| `scripts/run_mocked_tests.py` | Installs an early outbound-socket guard, sanitizes integration settings, runs the complete mocked suite, and reports attempted connections. |
+| `requirements.txt` / `requirements-dev.txt` | Hash-locked Python 3.12 production and test dependency sets generated from the exact direct inputs in the matching `.in` files. |
+| `DEPLOYMENT_RUNBOOK.md` | Unrehearsed future procedure for source/image provenance, zero-traffic release verification, controlled traffic movement, and rollback. |
 | `MANUAL_TEST_CHECKLIST.md` | What still needs live Airtable/Cloud Run/GHL/a human, and what's already been verified locally. |
 | `env.yaml` | Local real credentials, gitignored, never committed. |
 
 ## 13. Local installation and setup
 
 ```
-python3 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install --require-hashes -r requirements-dev.txt
 cp .env.example .env   # fill in real values; never commit .env
 ```
 
@@ -149,10 +152,13 @@ Serves on `http://0.0.0.0:8080` by default. **Note:** there is no sandbox/test A
 ## 15. Running pytest
 
 ```
-pip install -r requirements.txt   # includes pytest
-pytest
+python -m pip install --require-hashes -r requirements-dev.txt
+python scripts/run_mocked_tests.py -p no:cacheprovider tests
 ```
-No real credentials needed - `tests/conftest.py` sets dummy env vars and mocks all Airtable/Gemini calls.
+No real credentials are used. The runner overwrites integration settings with
+test-only placeholders before importing the application, blocks non-loopback
+Python sockets for collection and execution, preserves the existing
+Airtable/Gemini mocks, and fails if its attempted-connection count is nonzero.
 
 ## 16. Running the Gemini golden set
 
