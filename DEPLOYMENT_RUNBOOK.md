@@ -58,104 +58,37 @@ Stop if the phase exits nonzero.
 The standard rollout is valid only when exactly one named revision receives
 100% of traffic and no tag or other allocation changes that distribution.
 
-### 2.1 Capture the complete filtered traffic status
-
-This separately authorized read-only phase requests service status only. It
-does not request the service specification or environment configuration.
-
-```bash
-(
-  set -euo pipefail
-  fail() { printf 'traffic inspection failed: %s\n' "$1" >&2; exit 1; }
-  require_value() {
-    local name="$1" value="${!1-}"
-    [[ -n "$value" && "$value" != REPLACE_* ]] || fail "$name is unresolved"
-  }
-
-  PROJECT_ID='REPLACE_WITH_PROJECT_ID'
-  REGION='REPLACE_WITH_REGION'
-  SERVICE='REPLACE_WITH_SERVICE'
-  require_value PROJECT_ID
-  require_value REGION
-  require_value SERVICE
-
-  gcloud run services describe "$SERVICE" \
-    --project="$PROJECT_ID" \
-    --region="$REGION" \
-    --format='yaml(status.latestReadyRevisionName,status.traffic)' \
-    || fail 'filtered service query'
-)
-```
-
-Record the complete returned traffic status. The operator must confirm all of
-the following before setting the release-record gate:
-
-- exactly one traffic entry names a revision;
-- that revision receives exactly 100%;
-- no tagged allocation is present;
-- no tag, latest-revision allocation, or omitted value makes the map ambiguous.
-
-If the map is empty, incomplete, tagged, ambiguous, or split across revisions,
-set no gate and stop the standard procedure before building. Split traffic
-requires a separately reviewed rollout and rollback plan that records and
-restores the complete original allocation.
-
-Only a verified one-revision, 100%, untagged state may be recorded as:
-
-`TRAFFIC_PREFLIGHT_STATE=ONE_REVISION_AT_100_NO_TAGS`
-
-### 2.2 Record that exact revision and immutable image digest
-
-In a fresh read-only phase, copy the exact revision and approved gate from the
-release record. A stale or unresolved value must not be reused.
+Repository-local evidence does not establish the exact gcloud field schema,
+filtered JSON structure, omission behavior, or representation needed to prove
+that state safely. This checkpoint therefore has no executable initial-traffic
+query. The block below is an intentional unconditional stop, not an invitation
+to enter an approval literal or copy traffic values manually.
 
 ```bash
 (
   set -euo pipefail
-  fail() { printf 'rollback-target capture failed: %s\n' "$1" >&2; exit 1; }
-  require_value() {
-    local name="$1" value="${!1-}"
-    [[ -n "$value" && "$value" != REPLACE_* ]] || fail "$name is unresolved"
-  }
-
-  PROJECT_ID='REPLACE_WITH_PROJECT_ID'
-  REGION='REPLACE_WITH_REGION'
-  SERVICE='REPLACE_WITH_SERVICE'
-  TRAFFIC_PREFLIGHT_STATE='REPLACE_WITH_APPROVED_PREFLIGHT_STATE'
-  PREVIOUS_REVISION='REPLACE_WITH_THE_EXACT_100_PERCENT_REVISION'
-  PREVIOUS_IMAGE_DIGEST=''
-
-  for name in PROJECT_ID REGION SERVICE TRAFFIC_PREFLIGHT_STATE PREVIOUS_REVISION; do
-    require_value "$name"
-  done
-  [[ "$TRAFFIC_PREFLIGHT_STATE" == ONE_REVISION_AT_100_NO_TAGS ]] \
-    || fail 'standard rollout traffic precondition was not proved'
-  [[ "$PREVIOUS_REVISION" =~ ^[a-z]([a-z0-9-]*[a-z0-9])?$ ]] \
-    || fail 'PREVIOUS_REVISION format'
-  (( ${#PREVIOUS_REVISION} <= 63 )) || fail 'PREVIOUS_REVISION length'
-
-  PREVIOUS_IMAGE_ID=''
-  if ! PREVIOUS_IMAGE_ID="$(gcloud run revisions describe "$PREVIOUS_REVISION" \
-    --project="$PROJECT_ID" \
-    --region="$REGION" \
-    --format='value(status.imageDigest)')"; then
-    fail 'previous revision digest query'
-  fi
-  [[ -n "$PREVIOUS_IMAGE_ID" ]] || fail 'previous image identity is empty'
-  case "$PREVIOUS_IMAGE_ID" in
-    sha256:*) PREVIOUS_IMAGE_DIGEST="$PREVIOUS_IMAGE_ID" ;;
-    *@sha256:*) PREVIOUS_IMAGE_DIGEST="${PREVIOUS_IMAGE_ID##*@}" ;;
-    *) fail 'previous image identity is not immutable' ;;
-  esac
-  [[ "$PREVIOUS_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
-    || fail 'PREVIOUS_IMAGE_DIGEST format'
-
-  printf 'traffic_preflight=%s\nprevious_revision=%s\nprevious_image_digest=%s\n' \
-    "$TRAFFIC_PREFLIGHT_STATE" "$PREVIOUS_REVISION" "$PREVIOUS_IMAGE_DIGEST"
+  fail() { printf 'initial traffic validation blocked: %s\n' "$1" >&2; exit 1; }
+  fail 'verified gcloud traffic schema and machine-parser wiring are unavailable; a reviewed repository correction is required before build or deployment'
 )
 ```
 
-Record the exact output. The standard procedure must stop if this phase fails.
+An authorized tooling review must precede a future repository correction. That
+review must establish a project-, region-, and service-bound query returning
+only the complete traffic allocation in strict JSON. The future parser must
+reject empty, null, scalar, truncated, malformed, duplicate, or unexpected
+structures and fields. It must require exactly one target with one explicit
+`revisionName`, integer `percent` equal to 100, no tag, and no
+`latestRevision` assignment. It must derive `PREVIOUS_REVISION` from that parsed
+target, query that exact revision through a separately verified filtered schema,
+and require one unambiguous immutable `sha256` image digest. The release record
+must bind the exact project, region, service, canonical original allocation,
+derived revision, and digest before any later activity.
+
+No `TRAFFIC_PREFLIGHT_STATE`, manually copied revision, approval string, or
+other operator-entered value can enable the present procedure. A split, tagged,
+latest-revision, incomplete, ambiguous, or non-100% original allocation requires
+a separately reviewed preservation-and-restoration plan rather than the standard
+procedure.
 
 ## 3. Secret-reference and runtime-configuration gate
 
@@ -238,6 +171,8 @@ tree, and submits the isolated context instead of the live worktree.
   fi
   [[ "$CURRENT_TREE" == "$SOURCE_TREE" ]] || fail 'recorded tree mismatch'
   command -v "$PYTHON_BIN" >/dev/null 2>&1 || fail 'python3.12 is unavailable'
+
+  fail 'BLOCKED: machine-validated initial traffic evidence is unavailable; a reviewed repository correction is required before build'
 
   TMP_BASE="${TMPDIR:-/tmp}"
   [[ "$TMP_BASE" == /* && "$TMP_BASE" != / && -d "$TMP_BASE" && -w "$TMP_BASE" ]] \
@@ -502,17 +437,19 @@ distinguish command failure from a successful zero-match result and reject
 partial, malformed, duplicate, unrelated, or ambiguous records. A regional list
 or the presence of the previous revision is not evidence of candidate absence.
 
-Only a successful, reviewed, service-bound zero-match result may set all of:
+Only a successful, machine-parsed, service-bound zero-match result may
+eventually permit deployment. The verified procedure must distinguish command
+failure, one exact match, and successful validated zero matches, and must reject
+multiple, duplicate, malformed, unrelated, partial, ambiguous, or unexpected
+records. Its evidence must bind the exact project, region, service, and full
+`CANDIDATE_REVISION`.
 
-- `COLLISION_SCHEMA_GATE=APPROVED_SERVICE_BOUND_ZERO_MATCH_SCHEMA`
-- `COLLISION_CHECK_PROJECT`, `COLLISION_CHECK_REGION`, and
-  `COLLISION_CHECK_SERVICE` to the exact queried scope;
-- `COLLISION_CHECK_CANDIDATE_REVISION` to the exact full queried name; and
-- `COLLISION_EXACT_MATCH_COUNT=0`.
-
-Until that controlled verification exists, candidate deployment remains
-blocked. The deployment block below revalidates the complete recorded binding;
-it contains no fallback collision query whose failure could resemble absence.
+That tooling verification has not occurred. The deployment block therefore
+terminates unconditionally immediately before construction of the image URI and
+the `gcloud run deploy` command. Approval strings, copied scope values, manually
+asserted counts, prose confirmation, or replacement placeholders cannot bypass
+the stop. Enabling collision clearance requires a separately reviewed repository
+correction; operators must not invent replacement values in this runbook.
 
 ```bash
 (
@@ -537,19 +474,11 @@ it contains no fallback collision query whose failure could resemble absence.
   SECRET_REFERENCE_GATE='REPLACE_WITH_APPROVED_SECRET_REFERENCE_GATE'
   RUNTIME_CONFIGURATION_GATE='REPLACE_WITH_APPROVED_RUNTIME_CONFIG_GATE'
   REVISION_NAMING_GATE='REPLACE_WITH_APPROVED_NAMING_CONSTRAINT_GATE'
-  COLLISION_SCHEMA_GATE='REPLACE_WITH_APPROVED_COLLISION_SCHEMA_GATE'
-  COLLISION_CHECK_PROJECT='REPLACE_WITH_EXACT_COLLISION_QUERY_PROJECT'
-  COLLISION_CHECK_REGION='REPLACE_WITH_EXACT_COLLISION_QUERY_REGION'
-  COLLISION_CHECK_SERVICE='REPLACE_WITH_EXACT_COLLISION_QUERY_SERVICE'
-  COLLISION_CHECK_CANDIDATE_REVISION='REPLACE_WITH_EXACT_COLLISION_QUERY_CANDIDATE'
-  COLLISION_EXACT_MATCH_COUNT='REPLACE_WITH_VALIDATED_EXACT_MATCH_COUNT'
 
   for name in PROJECT_ID REGION SERVICE AR_REPOSITORY IMAGE_NAME SOURCE_SHA \
     CANDIDATE_REVISION CANDIDATE_IMAGE_DIGEST PREVIOUS_REVISION \
     PREVIOUS_IMAGE_DIGEST TRAFFIC_PREFLIGHT_STATE SECRET_REFERENCE_GATE \
-    RUNTIME_CONFIGURATION_GATE REVISION_NAMING_GATE COLLISION_SCHEMA_GATE \
-    COLLISION_CHECK_PROJECT COLLISION_CHECK_REGION COLLISION_CHECK_SERVICE \
-    COLLISION_CHECK_CANDIDATE_REVISION COLLISION_EXACT_MATCH_COUNT; do
+    RUNTIME_CONFIGURATION_GATE REVISION_NAMING_GATE; do
     require_value "$name"
   done
   [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail 'SOURCE_SHA format'
@@ -565,18 +494,6 @@ it contains no fallback collision query whose failure could resemble absence.
     || fail 'runtime-configuration gate'
   [[ "$REVISION_NAMING_GATE" == APPROVED_CLOUD_RUN_NAMING_CONSTRAINTS ]] \
     || fail 'authorized revision-naming verification gate'
-  [[ "$COLLISION_SCHEMA_GATE" == APPROVED_SERVICE_BOUND_ZERO_MATCH_SCHEMA ]] \
-    || fail 'collision-query schema and zero-result gate'
-  [[ "$COLLISION_CHECK_PROJECT" == "$PROJECT_ID" ]] \
-    || fail 'collision project binding'
-  [[ "$COLLISION_CHECK_REGION" == "$REGION" ]] \
-    || fail 'collision region binding'
-  [[ "$COLLISION_CHECK_SERVICE" == "$SERVICE" ]] \
-    || fail 'collision service binding'
-  [[ "$COLLISION_CHECK_CANDIDATE_REVISION" == "$CANDIDATE_REVISION" ]] \
-    || fail 'collision candidate binding'
-  [[ "$COLLISION_EXACT_MATCH_COUNT" == 0 ]] \
-    || fail 'candidate collision was not disproved exactly'
 
   [[ "$SERVICE" =~ ^[a-z]([a-z0-9-]*[a-z0-9])?$ ]] || fail 'SERVICE format'
   [[ "$CANDIDATE_REVISION" =~ ^[a-z]([a-z0-9-]*[a-z0-9])?$ ]] \
@@ -592,6 +509,8 @@ it contains no fallback collision query whose failure could resemble absence.
     || fail 'revision suffix boundary'
   [[ "${SERVICE}-${CANDIDATE_REVISION_SUFFIX}" == "$CANDIDATE_REVISION" ]] \
     || fail 'derived revision mismatch'
+
+  fail 'BLOCKED: verified service-scoped collision query, parser, and zero-result semantics are unavailable; a reviewed repository correction is required before deployment'
 
   IMAGE_URI="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPOSITORY}/${IMAGE_NAME}"
   CANDIDATE_IMAGE_REF="${IMAGE_URI}@${CANDIDATE_IMAGE_DIGEST}"
@@ -953,6 +872,8 @@ PY
   [[ "$AUTHORIZED_TARGET_ALLOCATION" == "$EXPECTED_TARGET_ALLOCATION" ]] \
     || fail 'authorized target allocation binding'
 
+  fail 'BLOCKED: machine-validated initial traffic evidence is unavailable; a reviewed repository correction is required before traffic movement'
+
   CANDIDATE_STATUS=''
   if ! CANDIDATE_STATUS="$(gcloud run revisions describe "$CANDIDATE_REVISION" \
     --project="$PROJECT_ID" \
@@ -1015,71 +936,53 @@ state was one named revision at 100% with no tags. It restores that exact state,
 not an arbitrarily selected older revision. A preexisting split requires its
 separate approved full-map rollback plan instead.
 
+Repository-local evidence does not establish the exact gcloud schemas needed to
+query and prove rollback state safely. The present rollback procedure therefore
+terminates unconditionally and contains no traffic-changing command. Approval
+literals, copied revision names, manually described allocations, or sample
+values cannot enable rollback. A separately reviewed repository correction is
+required after authorized tooling verification.
+
+That future correction must use minimum-field, project-, region-, and
+service-bound JSON queries. Before any traffic command, its parser must:
+
+- verify that the recorded original allocation is exactly the one explicit
+  `PREVIOUS_REVISION` at integer 100%, with no tag or `latestRevision`;
+- query that exact revision, require its immutable digest to equal
+  `PREVIOUS_IMAGE_DIGEST`, and require exactly one condition whose `type` is
+  `Ready` and whose `status` is exactly `True`;
+- reject absent, False, Unknown, duplicate, malformed, partial, or mismatched
+  readiness evidence;
+- parse the complete current allocation, rejecting empty, null, scalar,
+  truncated, malformed, duplicate, incomplete, tagged, latest-revision, third-
+  revision, unexpected-field, non-integer, out-of-range, or non-100% states;
+- canonicalize the complete observed current map and require rollback
+  authorization to bind the exact project, region, service, release-record
+  identity, previous revision and digest, observed map, and exact original target
+  map; and
+- permit `--to-revisions="${PREVIOUS_REVISION}=100"` only for that validated
+  standard original allocation. Any other original allocation requires its own
+  separately reviewed full-map restoration plan.
+
+After the one separately authorized rollback command, the future parser must
+query the complete allocation again and require exact equality with the recorded
+original map. Command failure, observation failure, malformed output, drift, or
+final mismatch is rollback failure and must not trigger another traffic command.
+Evidence must contain only non-secret release identifiers and must not contain
+participant data.
+
 ```bash
 (
   set -euo pipefail
   fail() { printf 'rollback failed: %s\n' "$1" >&2; exit 1; }
-  require_value() {
-    local name="$1" value="${!1-}"
-    [[ -n "$value" && "$value" != REPLACE_* ]] || fail "$name is unresolved"
-  }
-
-  PROJECT_ID='REPLACE_WITH_PROJECT_ID'
-  REGION='REPLACE_WITH_REGION'
-  SERVICE='REPLACE_WITH_SERVICE'
-  PREVIOUS_REVISION='REPLACE_WITH_RECORDED_PREVIOUS_REVISION'
-  PREVIOUS_IMAGE_DIGEST='REPLACE_WITH_RECORDED_PREVIOUS_IMAGE_DIGEST'
-  TRAFFIC_PREFLIGHT_STATE='REPLACE_WITH_APPROVED_PREFLIGHT_STATE'
-  ROLLBACK_AUTHORIZATION='REPLACE_WITH_APPROVED_ROLLBACK_AUTHORIZATION'
-
-  for name in PROJECT_ID REGION SERVICE PREVIOUS_REVISION PREVIOUS_IMAGE_DIGEST \
-    TRAFFIC_PREFLIGHT_STATE ROLLBACK_AUTHORIZATION; do
-    require_value "$name"
-  done
-  [[ "$TRAFFIC_PREFLIGHT_STATE" == ONE_REVISION_AT_100_NO_TAGS ]] \
-    || fail 'standard rollback precondition'
-  [[ "$PREVIOUS_REVISION" =~ ^[a-z]([a-z0-9-]*[a-z0-9])?$ ]] \
-    || fail 'PREVIOUS_REVISION format'
-  [[ "$PREVIOUS_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
-    || fail 'recorded previous digest format'
-  [[ "$ROLLBACK_AUTHORIZATION" == APPROVED_EXACT_PREVIOUS_REVISION_100 ]] \
-    || fail 'rollback authorization'
-
-  CURRENT_PREVIOUS_IMAGE_ID=''
-  if ! CURRENT_PREVIOUS_IMAGE_ID="$(gcloud run revisions describe \
-    "$PREVIOUS_REVISION" \
-    --project="$PROJECT_ID" \
-    --region="$REGION" \
-    --format='value(status.imageDigest)')"; then
-    fail 'rollback-target digest query'
-  fi
-  [[ -n "$CURRENT_PREVIOUS_IMAGE_ID" ]] || fail 'rollback-target digest is empty'
-  case "$CURRENT_PREVIOUS_IMAGE_ID" in
-    sha256:*) CURRENT_PREVIOUS_DIGEST="$CURRENT_PREVIOUS_IMAGE_ID" ;;
-    *@sha256:*) CURRENT_PREVIOUS_DIGEST="${CURRENT_PREVIOUS_IMAGE_ID##*@}" ;;
-    *) fail 'rollback-target image is not immutable' ;;
-  esac
-  [[ "$CURRENT_PREVIOUS_DIGEST" == "$PREVIOUS_IMAGE_DIGEST" ]] \
-    || fail 'rollback-target digest changed'
-
-  if ! gcloud run services update-traffic "$SERVICE" \
-    --project="$PROJECT_ID" \
-    --region="$REGION" \
-    --to-revisions="${PREVIOUS_REVISION}=100"; then
-    fail 'rollback traffic update'
-  fi
-  gcloud run services describe "$SERVICE" \
-    --project="$PROJECT_ID" \
-    --region="$REGION" \
-    --format='yaml(status.latestReadyRevisionName,status.traffic)' \
-    || fail 'post-rollback traffic query'
+  fail 'BLOCKED: verified rollback schemas and complete pre/post-state parser wiring are unavailable; a reviewed repository correction is required before rollback'
 )
 ```
 
-Verify the returned map is exactly the recorded pre-release state. Record the
-reason, time, operator, impact, and follow-up decision. Preserve the candidate
-revision and image for investigation unless a separate retention or security
-authorization requires otherwise.
+After a future successful rollback, record the verified original map, observed
+pre-rollback map, final map, reason, time, operator, impact, and follow-up
+decision. Preserve the candidate revision and image for investigation unless a
+separate retention or security authorization requires otherwise.
 
 ## 10. Remaining gates
 
