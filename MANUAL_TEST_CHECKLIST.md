@@ -2,7 +2,7 @@
 
 Everything not marked "done locally" below needs a live Cloud Run deployment (or `python main.py` locally against real Airtable/Gemini) with real `GEMINI_API_KEY` / `AIRTABLE_API_KEY` / `WEBHOOK_SECRET` / `SESSION_SECRET` set, and must be run against **test data only**. Before starting: enroll every test participant with **Test Record** checked on the Clients table, and use email addresses you control — never a real participant's contact info. **Never trigger the safety route or medical-emergency route against a real phone number or email you don't own.**
 
-The replay/token and emergency-guidance remediation was validated locally with 265 mocked tests passing and outbound sockets blocked. This confirms mocked logic only; live Airtable, GHL, Gemini, Cloud Run, browser, and delivery behavior still require the approvals and manual checks below.
+The historical baseline before Phase 2A added its dependency-compatibility test was 265 mocked tests. The recorded current Phase 2A result is 266 collected and 266 passed, with zero skipped or missing tests and zero guarded outbound attempts. Exactly one dependency-compatibility test explains the increase from 265 to 266. The guard covers only the patched Python APIs documented in README and HANDOFF; it is not a universal network guarantee or operating-system sandbox. This is mocked local evidence only and claims no live Gemini, Airtable, GHL, delivery, browser, container, Cloud Run, or deployment validation.
 
 ## Status legend
 

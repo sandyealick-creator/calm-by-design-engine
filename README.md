@@ -48,7 +48,10 @@ GHL's Crisis Alert Notification and Safety Buffer Routing workflows continue to 
 
 ## Local setup (for reference — do not commit real credentials)
 
-Credentials are supplied to Cloud Run via `--set-env-vars` / `--update-env-vars` at deploy time, or via a local `env.yaml` that is excluded from version control (see `.gitignore`). Required variables:
+Required runtime variable names are listed below. Deployment configuration must
+use approved Secret Manager references by name or resource reference only. Do
+not put plaintext credential values in commands, documentation, terminal output,
+or release records.
 
 - `GEMINI_API_KEY` — from [aistudio.google.com](https://aistudio.google.com)
 - `AIRTABLE_API_KEY` — Airtable personal access token, scoped to the CBD Core base only (`data.records:read`, `data.records:write`)
@@ -58,13 +61,15 @@ Credentials are supplied to Cloud Run via `--set-env-vars` / `--update-env-vars`
 
 ## Deploy
 
-```
-gcloud run deploy cbd-assess \
-  --source . \
-  --region us-east1 \
-  --allow-unauthenticated \
-  --set-env-vars "GEMINI_API_KEY=...,AIRTABLE_API_KEY=...,WEBHOOK_SECRET=...,SESSION_SECRET=..."
-```
+Do not deploy directly from source or a mutable image. Follow
+[`DEPLOYMENT_RUNBOOK.md`](DEPLOYMENT_RUNBOOK.md) only after separate explicit
+authorization. It requires an exact clean Git commit, an authorized build, an
+immutable resulting image digest, explicit project/region/service/repository/
+image identity, and a candidate revision created with zero traffic. Live
+verification and traffic movement require separate authorizations. Secret
+Manager references may be recorded by name or resource reference only, never as
+plaintext credential values in commands, documentation, terminal output, or the
+release record. The procedure has not been executed or rehearsed.
 
 The participant enrollment, recovery, token-redemption, and check-in routes are
 intentionally public at the Cloud Run layer and enforce their own cookie, CSRF,
@@ -76,11 +81,28 @@ variables before participant enrollment.
 ## Test
 
 ```
-pip install -r requirements.txt
-pytest                      # unit/endpoint tests, Airtable and Gemini mocked
-export GEMINI_API_KEY=your_key
-python run_golden.py        # scenario eval against the live Gemini API
+python3.12 -m venv .venv
+.venv/bin/python -m pip install --require-hashes -r requirements-dev.txt
+.venv/bin/python scripts/run_mocked_tests.py -p no:cacheprovider tests
 ```
+
+Do not run the golden set without separate authorization to use the API budget.
+Provide `GEMINI_API_KEY` through an approved secure local mechanism that does
+not place its value in documentation, commands, or shell history, then run
+`python run_golden.py`.
+
+The mocked-suite runner installs its guard before importing pytest, overrides
+integration settings with test-only placeholders, and guards the Python test
+process at non-loopback `getaddrinfo`, `socket.create_connection`,
+`socket.socket.connect`, and `socket.socket.connect_ex`. This covers external
+numeric IPv4 and IPv6 connections through those paths. It is not an operating-
+system network sandbox and does not comprehensively prevent unconnected UDP,
+native-extension, child-process, or every alternative networking path. The
+Phase 2A run recorded zero guarded outbound attempts across 266 tests, with no
+active bypass observed in the repository suite. Linux/container and stronger
+OS-level isolation remain controlled verification or future-hardening items.
+`requirements.txt` is the production-only hash lock; `requirements-dev.txt`
+adds the separately resolved test dependencies.
 
 `golden_set.json` contains test journals covering every response route, score boundary values, positive/neutral/distressed entries, and negated/historical/third-person/direct/imminent safety language. Results are evidence for judges. See `MANUAL_TEST_CHECKLIST.md` for the manual pass covering mobile layout and real GHL/Airtable round-trips against test records.
 
