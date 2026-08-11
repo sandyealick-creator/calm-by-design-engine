@@ -86,6 +86,84 @@ def session_reference(secret="session-secret", version="7"):
     }
 
 
+def saved_secret_reference_result(
+    *, secret="session-secret", version="7", result_scope=None
+):
+    return {
+        "classification": "VALID_SECRET_MANAGER_REFERENCE",
+        "name": "SESSION_SECRET",
+        "scope": scope() if result_scope is None else result_scope,
+        "secret": secret,
+        "version": version,
+    }
+
+
+def minimal_runtime_service():
+    return {
+        "name": f"projects/{PROJECT}/locations/{REGION}/services/{SERVICE}",
+        "template": {"containers": [{"name": "app"}]},
+    }
+
+
+def populated_runtime_service():
+    document = minimal_runtime_service()
+    document.update(
+        {
+            "ingress": "INGRESS_TRAFFIC_ALL",
+            "invokerIamDisabled": True,
+            "iapEnabled": False,
+        }
+    )
+    document["template"] = {
+        "serviceAccount": "runtime@example.invalid",
+        "maxInstanceRequestConcurrency": 80,
+        "timeout": "300s",
+        "executionEnvironment": "EXECUTION_ENVIRONMENT_GEN2",
+        "scaling": {"minInstanceCount": 0, "maxInstanceCount": 10},
+        "vpcAccess": {
+            "egress": "PRIVATE_RANGES_ONLY",
+            "networkInterfaces": [
+                {"network": "projects/example/global/networks/default", "tags": ["app"]}
+            ],
+        },
+        "containers": [
+            {
+                "name": "app",
+                "env": [
+                    {"name": "PLAIN_NAME_ONLY"},
+                    {
+                        "name": "SESSION_SECRET",
+                        "valueSource": {
+                            "secretKeyRef": {"secret": "session-secret", "version": "7"}
+                        },
+                    },
+                ],
+                "resources": {
+                    "limits": {"cpu": "1", "memory": "512Mi"},
+                    "cpuIdle": True,
+                    "startupCpuBoost": False,
+                },
+                "ports": [{"name": "http1", "containerPort": 8080}],
+                "startupProbe": {
+                    "httpGet": {
+                        "path": "/health",
+                        "port": 8080,
+                        "httpHeaders": [{"name": "X-Probe"}],
+                    },
+                    "initialDelaySeconds": 0,
+                    "timeoutSeconds": 1,
+                    "periodSeconds": 10,
+                    "failureThreshold": 3,
+                },
+                "livenessProbe": {"tcpSocket": {"port": 8080}},
+                "volumeMounts": [{"name": "cache", "mountPath": "/cache"}],
+            }
+        ],
+        "volumes": [{"name": "cache", "emptyDir": {"medium": "MEMORY"}}],
+    }
+    return document
+
+
 def secret_metadata(*, secret_result="FOUND", version_result="FOUND", state="ENABLED"):
     secret = {"result": secret_result}
     version = {"result": version_result}
@@ -882,19 +960,9 @@ class Phase2FGateTests(ValidatorTestCase):
 
     def test_runtime_configuration_equality_and_drift(self):
         authorized_scope = validator.require_scope(PROJECT, REGION, SERVICE)
-        runtime = {
-            "name": authorized_scope.service_resource,
-            "runtime": {
-                "serviceAccount": "runtime@example.invalid",
-                "containerConcurrency": 80,
-                "timeout": "300s",
-                "environment": [
-                    {"name": "SESSION_SECRET", "secret": "session-secret", "version": "7"}
-                ],
-            },
-        }
-        first = validator.validate_runtime_document(runtime, authorized_scope)
-        second = validator.validate_runtime_document(runtime, authorized_scope)
+        runtime = populated_runtime_service()
+        first = validator.validate_runtime_service_document(runtime, authorized_scope)
+        second = validator.validate_runtime_service_document(runtime, authorized_scope)
         self.assertEqual(first, second)
         self.assertEqual(
             validator.validate_runtime_comparison(
@@ -903,8 +971,10 @@ class Phase2FGateTests(ValidatorTestCase):
             "RUNTIME_UNCHANGED",
         )
         changed = json.loads(json.dumps(runtime))
-        changed["runtime"]["containerConcurrency"] = 81
-        changed_hash = validator.validate_runtime_document(changed, authorized_scope)["sha256"]
+        changed["template"]["maxInstanceRequestConcurrency"] = 81
+        changed_hash = validator.validate_runtime_service_document(
+            changed, authorized_scope
+        )["sha256"]
         self.assert_validation_code(
             "RUNTIME_DRIFT",
             validator.validate_runtime_comparison,
@@ -912,12 +982,12 @@ class Phase2FGateTests(ValidatorTestCase):
         )
         for unsafe in (
             {**runtime, "name": "projects/wrong12/locations/us-east1/services/other"},
-            {**runtime, "runtime": {"value": "ADVERSARIAL_SECRET"}},
-            {**runtime, "runtime": {"unknown": "ADVERSARIAL_SECRET"}},
+            {**runtime, "template": {"containers": [{"name": "app", "value": "ADVERSARIAL_SECRET"}]}},
+            {**runtime, "template": {"containers": [{"name": "app", "unknown": "ADVERSARIAL_SECRET"}]}},
         ):
             with self.subTest(unsafe=unsafe):
                 with self.assertRaises(validator.ValidationError):
-                    validator.validate_runtime_document(unsafe, authorized_scope)
+                    validator.validate_runtime_service_document(unsafe, authorized_scope)
 
     def test_exact_expected_traffic_and_rollback_maps(self):
         observed = traffic_document(fixed(BASELINE, 100))
@@ -1287,7 +1357,7 @@ class Phase2HRegressionTests(ValidatorTestCase):
         self.assertIn('curl_config="$(emit_bearer_config)" || return 1', runbook)
         self.assertIn("curl --config <(printf '%s\\n' \"$curl_config\") \"$@\"", runbook)
         self.assertNotIn("emit_bearer_config | curl", runbook)
-        self.assertEqual(runbook.count("authorized_curl --"), 6)
+        self.assertEqual(runbook.count("authorized_curl --"), 7)
 
 
 class Phase2JRegressionTests(ValidatorTestCase):
@@ -1522,6 +1592,377 @@ class Phase2JRegressionTests(ValidatorTestCase):
             self.assertNotIn("MISSING_SECRET", stderr.getvalue())
 
 
+class Phase2QRegressionTests(ValidatorTestCase):
+    def setUp(self):
+        self.authorized_scope = validator.require_scope(PROJECT, REGION, SERVICE)
+        self.build = Phase2FGateTests().build_document()
+
+    def validate_build(self, document):
+        return validator.validate_build_document(
+            document,
+            expected_build_id=BUILD_ID,
+            expected_source_sha=SOURCE_SHA,
+            expected_source_tree=SOURCE_TREE,
+            expected_image_tag=IMAGE_TAG,
+            scope=self.authorized_scope,
+        )
+
+    def test_saved_secret_reference_result_is_scope_bound_and_canonical(self):
+        valid = validator.validate_secret_reference_result(
+            saved_secret_reference_result(), self.authorized_scope
+        )
+        self.assertEqual(
+            valid["secretResource"], f"projects/{PROJECT}/secrets/session-secret"
+        )
+        self.assertEqual(valid["version"], "7")
+        full = validator.validate_secret_reference_result(
+            saved_secret_reference_result(
+                secret=f"projects/{PROJECT}/secrets/session-secret"
+            ),
+            self.authorized_scope,
+        )
+        self.assertEqual(full["secretResource"], valid["secretResource"])
+
+    def test_saved_secret_reference_result_rejects_stale_or_cross_scope(self):
+        stale_scopes = (
+            scope(project="other-project"),
+            scope(region="us-west1"),
+            scope(service="other-service"),
+        )
+        for stale_scope in stale_scopes:
+            with self.subTest(stale_scope=stale_scope):
+                self.assert_validation_code(
+                    "SECRET_REFERENCE_SCOPE_MISMATCH",
+                    validator.validate_secret_reference_result,
+                    saved_secret_reference_result(result_scope=stale_scope),
+                    self.authorized_scope,
+                )
+        self.assert_validation_code(
+            "SECRET_SCOPE_MISMATCH",
+            validator.validate_secret_reference_result,
+            saved_secret_reference_result(
+                secret="projects/other-project/secrets/session-secret"
+            ),
+            self.authorized_scope,
+        )
+
+    def test_saved_secret_reference_result_rejects_versions_and_bad_envelopes(self):
+        for version in ("latest", "0", "-1", "+1", "01", "1.0", 7, None, []):
+            with self.subTest(version=version):
+                self.assert_validation_code(
+                    "SECRET_REFERENCE_VERSION",
+                    validator.validate_secret_reference_result,
+                    saved_secret_reference_result(version=version),
+                    self.authorized_scope,
+                )
+        for secret in ("bad/secret", " secret", "secret\nname", None, [], {}):
+            with self.subTest(secret=secret):
+                with self.assertRaises(validator.ValidationError):
+                    validator.validate_secret_reference_result(
+                        saved_secret_reference_result(secret=secret),
+                        self.authorized_scope,
+                    )
+        valid = saved_secret_reference_result()
+        malformed = [
+            None,
+            [],
+            "text",
+            {key: value for key, value in valid.items() if key != "version"},
+            {**valid, "unexpected": True},
+            {**valid, "classification": "TAMPERED"},
+            {**valid, "name": "OTHER_SECRET"},
+            {**valid, "scope": []},
+            {**valid, "scope": {**scope(), "unexpected": True}},
+        ]
+        for document in malformed:
+            with self.subTest(document=document):
+                with self.assertRaises(validator.ValidationError):
+                    validator.validate_secret_reference_result(
+                        document, self.authorized_scope
+                    )
+
+    def test_saved_secret_reference_cli_revalidates_before_output(self):
+        with tempfile.TemporaryDirectory(prefix="phase2q-secret-result.") as created_root:
+            root = __import__("os").path.realpath(created_root)
+            result_file = Path(root) / "reference.json"
+            result_file.write_text(
+                json.dumps(saved_secret_reference_result()), encoding="utf-8"
+            )
+            args = [
+                "secret-reference-result",
+                "--project", PROJECT,
+                "--region", REGION,
+                "--service", SERVICE,
+                "--evidence-root", root,
+                "--input-file", str(result_file),
+                "--output", "resource-version",
+            ]
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                status = validator.main(args)
+            self.assertEqual(status, 0)
+            self.assertEqual(
+                stdout.getvalue(), f"projects/{PROJECT}/secrets/session-secret 7\n"
+            )
+            self.assertEqual(stderr.getvalue(), "")
+            result_file.write_text(
+                json.dumps(saved_secret_reference_result(result_scope=scope(service="stale"))),
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                status = validator.main(args)
+            self.assertEqual(status, 2)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertNotIn("session-secret", stderr.getvalue())
+
+    def test_runtime_minimal_populated_equality_and_difference(self):
+        minimal = validator.validate_runtime_service_document(
+            minimal_runtime_service(), self.authorized_scope
+        )
+        populated = validator.validate_runtime_service_document(
+            populated_runtime_service(), self.authorized_scope
+        )
+        self.assertEqual(minimal["classification"], "RUNTIME_CANONICAL")
+        self.assertEqual(populated["classification"], "RUNTIME_CANONICAL")
+        self.assertEqual(
+            validator.validate_runtime_comparison(
+                {"preSha256": populated["sha256"], "postSha256": populated["sha256"]}
+            )["classification"],
+            "RUNTIME_UNCHANGED",
+        )
+        self.assert_validation_code(
+            "RUNTIME_DRIFT",
+            validator.validate_runtime_comparison,
+            {"preSha256": minimal["sha256"], "postSha256": populated["sha256"]},
+        )
+
+    def test_runtime_rejects_empty_missing_and_type_confused_containers(self):
+        service_name = self.authorized_scope.service_resource
+        invalid = (
+            {"name": service_name, "template": {}},
+            {"name": service_name, "template": {"containers": []}},
+            {"name": service_name, "template": {"containers": "not-a-list"}},
+            {"name": service_name, "template": {"containers": {}}},
+            {"name": service_name, "template": {"containers": None}},
+            {"name": service_name, "template": {"containers": 1}},
+            {"name": service_name, "template": {"containers": [{}]}},
+            {"name": service_name, "template": {"containers": [{"name": None}]}},
+        )
+        for document in invalid:
+            with self.subTest(document=document):
+                with self.assertRaises(validator.ValidationError):
+                    validator.validate_runtime_service_document(
+                        document, self.authorized_scope
+                    )
+
+    def test_runtime_rejects_malformed_nested_projected_fields(self):
+        cases = []
+        for mutator in (
+            lambda d: d["template"]["containers"][0].update({"env": "bad"}),
+            lambda d: d["template"]["containers"][0].update(
+                {"env": [{"name": "SESSION_SECRET", "valueSource": {"secretKeyRef": {"secret": "bad/path", "version": "7"}}}]}
+            ),
+            lambda d: d["template"]["containers"][0].update({"resources": {"limits": []}}),
+            lambda d: d["template"]["containers"][0].update({"resources": {"cpuIdle": "true"}}),
+            lambda d: d["template"]["containers"][0].update({"startupProbe": {"httpGet": {}, "tcpSocket": {}}}),
+            lambda d: d["template"]["containers"][0].update({"livenessProbe": {"tcpSocket": {"port": 0}}}),
+            lambda d: d["template"]["containers"][0].update({"volumeMounts": [{"name": "cache"}]}),
+            lambda d: d["template"].update({"volumes": [{"name": "cache"}]}),
+            lambda d: d["template"].update({"volumes": [{"name": "cache", "emptyDir": {}, "gcs": {"bucket": "b"}}]}),
+            lambda d: d["template"].update({"scaling": {"minInstanceCount": 2, "maxInstanceCount": 1}}),
+            lambda d: d["template"].update({"vpcAccess": {"networkInterfaces": [{}]}}),
+            lambda d: d["template"].update({"timeout": "five minutes"}),
+            lambda d: d.update({"invokerIamDisabled": 1}),
+        ):
+            document = minimal_runtime_service()
+            mutator(document)
+            cases.append(document)
+        for document in cases:
+            with self.subTest(document=document):
+                with self.assertRaises(validator.ValidationError):
+                    validator.validate_runtime_service_document(
+                        document, self.authorized_scope
+                    )
+
+    def test_identical_malformed_runtime_files_cannot_compare_unchanged(self):
+        with tempfile.TemporaryDirectory(prefix="phase2q-runtime.") as created_root:
+            root = __import__("os").path.realpath(created_root)
+            malformed = {"name": self.authorized_scope.service_resource, "template": {}}
+            pre = Path(root) / "pre.json"
+            post = Path(root) / "post.json"
+            pre.write_text(json.dumps(malformed), encoding="utf-8")
+            post.write_text(json.dumps(malformed), encoding="utf-8")
+            args = [
+                "runtime-equal", "--project", PROJECT, "--region", REGION,
+                "--service", SERVICE, "--evidence-root", root,
+                "--pre-evidence-file", str(pre), "--post-evidence-file", str(post),
+            ]
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                status = validator.main(args)
+            self.assertEqual(status, 2)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("RUNTIME_TEMPLATE", stderr.getvalue())
+
+    def test_exact_artifact_registry_get_contract(self):
+        request = validator.validate_artifact_image_request(
+            expected_image_tag=IMAGE_TAG,
+            expected_digest=DIGEST,
+            scope=self.authorized_scope,
+        )
+        self.assertEqual(request["resource"], DOCKER_IMAGE_RESOURCE)
+        self.assertEqual(
+            request["url"],
+            f"https://artifactregistry.googleapis.com/v1/{DOCKER_IMAGE_RESOURCE}"
+            "?fields=name%2Curi%2Ctags",
+        )
+        self.assertNotIn("page", request["url"].lower())
+        response = {
+            "name": DOCKER_IMAGE_RESOURCE,
+            "uri": IMAGE_TAG.rsplit(":", 1)[0] + "@" + DIGEST,
+            "tags": [IMAGE_TAG],
+        }
+        self.assertEqual(
+            validator.validate_tag_resolution_document(
+                response,
+                expected_image_tag=IMAGE_TAG,
+                scope=self.authorized_scope,
+            )["digest"],
+            DIGEST,
+        )
+        for invalid in (
+            [],
+            [response],
+            {"dockerImages": [response]},
+            {**response, "nextPageToken": "token"},
+            {**response, "name": DOCKER_IMAGE_RESOURCE.replace(PROJECT, "other-project")},
+            {**response, "name": DOCKER_IMAGE_RESOURCE.replace(REGION, "us-west1")},
+            {**response, "name": DOCKER_IMAGE_RESOURCE.replace("/repositories/cbd/", "/repositories/other/")},
+            {**response, "name": DOCKER_IMAGE_RESOURCE.replace("/dockerImages/", "/packages/")},
+            {**response, "uri": response["uri"].replace(f"{REGION}-", "us-west1-")},
+            {**response, "tags": [IMAGE_TAG.replace("/cbd/", "/other/")]},
+            {**response, "tags": []},
+            {**response, "tags": [IMAGE_TAG, IMAGE_TAG]},
+            {**response, "uri": IMAGE_TAG.rsplit(":", 1)[0] + "@@" + DIGEST},
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(validator.ValidationError):
+                    validator.validate_tag_resolution_document(
+                        invalid,
+                        expected_image_tag=IMAGE_TAG,
+                        scope=self.authorized_scope,
+                    )
+
+    def test_artifact_request_cli_rejects_noncanonical_scope_and_digest(self):
+        args = [
+            "artifact-image-request", "--project", PROJECT, "--region", REGION,
+            "--service", SERVICE, "--expected-image-tag", IMAGE_TAG,
+            "--expected-digest", DIGEST, "--output", "resource",
+        ]
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            status = validator.main(args)
+        self.assertEqual(status, 0)
+        self.assertEqual(stdout.getvalue(), DOCKER_IMAGE_RESOURCE + "\n")
+        for index, value in ((args.index(DIGEST), "prefix@" + DIGEST),):
+            changed = list(args)
+            changed[index] = value
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                status = validator.main(changed)
+            self.assertEqual(status, 2)
+            self.assertEqual(stdout.getvalue(), "")
+
+    def test_push_timing_is_bounded_by_build_interval_at_nanoseconds(self):
+        def with_timing(start, end):
+            document = json.loads(json.dumps(self.build))
+            document["results"]["images"][0]["pushTiming"] = {
+                "startTime": start,
+                "endTime": end,
+            }
+            return document
+
+        allowed = (
+            ("2026-08-11T12:00:01Z", "2026-08-11T12:01:00Z"),
+            ("2026-08-11T07:00:01-05:00", "2026-08-11T07:01:00-05:00"),
+            ("2026-08-11T12:00:01.000000001Z", "2026-08-11T12:00:59.999999999Z"),
+        )
+        for start, end in allowed:
+            with self.subTest(start=start, end=end):
+                self.assertEqual(
+                    self.validate_build(with_timing(start, end))["classification"],
+                    "BUILD_SUCCESS",
+                )
+        rejected = (
+            ("2026-08-11T12:00:00.999999999Z", "2026-08-11T12:00:02Z"),
+            ("2026-08-11T12:00:02Z", "2026-08-11T12:01:00.000000001Z"),
+            ("2026-08-11T12:00:02.000000001Z", "2026-08-11T12:00:02Z"),
+        )
+        for start, end in rejected:
+            with self.subTest(start=start, end=end):
+                self.assert_validation_code(
+                    "BUILT_IMAGE_PUSH_TIMING_ORDER",
+                    self.validate_build,
+                    with_timing(start, end),
+                )
+
+    def test_revision_digest_requires_exact_bare_canonical_form(self):
+        self.assertEqual(
+            validator.validate_revision_document(
+                revision_document(), BASELINE, DIGEST
+            )["digest"],
+            DIGEST,
+        )
+        invalid = (
+            "malformed-prefix@" + DIGEST,
+            "one@two@" + DIGEST,
+            IMAGE_TAG,
+            " " + DIGEST,
+            DIGEST + "\n",
+            DIGEST.upper(),
+            "sha256:" + "a" * 63,
+            "sha256:" + "a" * 65,
+        )
+        for value in invalid:
+            with self.subTest(value=repr(value)):
+                self.assert_validation_code(
+                    "REVISION_DIGEST",
+                    validator.validate_revision_document,
+                    revision_document(digest=value),
+                    BASELINE,
+                    DIGEST,
+                )
+                self.assert_validation_code(
+                    "EXPECTED_DIGEST",
+                    validator.validate_revision_document,
+                    revision_document(),
+                    BASELINE,
+                    value,
+                )
+
+    def test_documentation_matches_corrected_contracts(self):
+        runbook = Path("DEPLOYMENT_RUNBOOK.md").read_text(encoding="utf-8")
+        readme = Path("README.md").read_text(encoding="utf-8")
+        handoff = Path("HANDOFF.md").read_text(encoding="utf-8")
+        checklist = Path("MANUAL_TEST_CHECKLIST.md").read_text(encoding="utf-8")
+        self.assertNotIn("gcloud artifacts docker images describe", runbook)
+        self.assertIn("artifact-image-request", runbook)
+        self.assertIn("DockerImages.Get", runbook)
+        self.assertIn("secret-reference-result", runbook)
+        self.assertIn("pushStart <= pushEnd <= finishTime", runbook)
+        self.assertIn("nonempty named container", runbook)
+        self.assertIn("non-paginated", readme)
+        self.assertIn("historical Phase 2B observation", handoff)
+        self.assertNotIn("current verified service state", handoff)
+        self.assertIn("schema-validated safe runtime projection", checklist)
+
+
 class Phase2FCliTests(unittest.TestCase):
     common = ["--project", PROJECT, "--region", REGION, "--service", SERVICE]
 
@@ -1586,7 +2027,7 @@ class Phase2FCliTests(unittest.TestCase):
             ),
             (
                 ["runtime-snapshot", *self.common],
-                scoped("serviceConfig", {"name": f"projects/{PROJECT}/locations/{REGION}/services/{SERVICE}", "template": {"timeout": "300s"}}),
+                scoped("serviceConfig", minimal_runtime_service()),
             ),
             (
                 ["runtime-equal", *self.common],

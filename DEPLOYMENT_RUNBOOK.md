@@ -248,8 +248,10 @@ gcloud run revisions describe "$BASELINE_REVISION" \
       --expected-digest="$BASELINE_DIGEST"
 ```
 
-Exactly one `Ready=True` condition, the exact name, and the exact immutable
-digest are required. Preserve the validator's command-output and resolved-effective map
+Exactly one `Ready=True` condition, the exact name, and a canonical bare
+lowercase `sha256:` digest are required. Arbitrary prefixes, tags, multiple
+`@` characters, whitespace, uppercase, and malformed digest lengths stop.
+Preserve the validator's command-output and resolved-effective map
 representations in the release record.
 
 ## 4. Safe `SESSION_SECRET` and runtime-configuration gate
@@ -303,7 +305,10 @@ and an exact positive numeric version. It rejects `latest`, aliases, whitespace,
 control characters, URLs, assignments, and value-like strings. Save its
 allowlisted result only in a preapproved metadata evidence directory. Then a
 separately authorized phase may run this exact metadata-only construction. It
-does not list secrets or versions and never accesses a payload:
+does not list secrets or versions and never accesses a payload. The saved
+result is re-parsed with duplicate-key rejection, exact envelope and scope
+matching, current-project secret-resource validation, and canonical positive
+numeric version validation before either request URL is constructed:
 
 ```bash
 (
@@ -312,32 +317,13 @@ does not list secrets or versions and never accesses a payload:
   fail() { printf 'secret metadata gate failed: %s\n' "$1" >&2; exit 1; }
   : "${EVIDENCE_ROOT:?preapproved evidence directory is required}"
   : "${SESSION_REFERENCE_RESULT_FILE:?validated reference result is required}"
-  python3.12 scripts/validate_deployment_state.py evidence-path \
-    --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
-    --evidence-root="$EVIDENCE_ROOT" \
-    --input-file="$SESSION_REFERENCE_RESULT_FILE" >/dev/null \
-    || fail 'unsafe evidence directory or reference file'
-
-  read -r SECRET_REFERENCE SECRET_VERSION < <(python3.12 -c '
-import json, sys
-def pairs(items):
-    result = {}
-    for key, value in items:
-        if key in result:
-            raise ValueError
-        result[key] = value
-    return result
-data = json.load(open(sys.argv[1], encoding="utf-8"), object_pairs_hook=pairs)
-if set(data) != {"classification", "name", "scope", "secret", "version"} \
-        or data.get("classification") != "VALID_SECRET_MANAGER_REFERENCE":
-    raise SystemExit(2)
-print(data["secret"], data["version"])
-' "$SESSION_REFERENCE_RESULT_FILE") || fail 'strict reference result parsing'
-
-  case "$SECRET_REFERENCE" in
-    projects/*) SECRET_RESOURCE="$SECRET_REFERENCE" ;;
-    *) SECRET_RESOURCE="projects/${PROJECT_ID}/secrets/${SECRET_REFERENCE}" ;;
-  esac
+  read -r SECRET_RESOURCE SECRET_VERSION < <(
+    python3.12 scripts/validate_deployment_state.py secret-reference-result \
+      --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+      --evidence-root="$EVIDENCE_ROOT" \
+      --input-file="$SESSION_REFERENCE_RESULT_FILE" \
+      --output=resource-version
+  ) || fail 'scope-bound reference result validation'
   SECRET_URL="https://secretmanager.googleapis.com/v1/${SECRET_RESOURCE}?fields=name"
   VERSION_RESOURCE="${SECRET_RESOURCE}/versions/${SECRET_VERSION}"
   VERSION_URL="https://secretmanager.googleapis.com/v1/${VERSION_RESOURCE}?fields=name%2Cstate"
@@ -365,7 +351,7 @@ print(data["secret"], data["version"])
 
   SECRET_ARGS=(
     secret-version --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE"
-    --expected-secret="$SECRET_REFERENCE" --expected-version="$SECRET_VERSION"
+    --expected-secret="$SECRET_RESOURCE" --expected-version="$SECRET_VERSION"
     --evidence-root="$EVIDENCE_ROOT" --secret-status="$SECRET_STATUS"
     --version-status="$VERSION_STATUS" --secret-evidence-file="$SECRET_BODY"
   )
@@ -401,12 +387,14 @@ service URLs, and payloads while retaining the approved runtime controls:
 ```bash
 capture_runtime_snapshot() {
   local destination="$1"
+  local runtime_fields
   local runtime_url
   python3.12 scripts/validate_deployment_state.py evidence-path \
     --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
     --evidence-root="$EVIDENCE_ROOT" --output-file="$destination" >/dev/null \
     || return 1
-  runtime_url="https://run.googleapis.com/v2/projects/${PROJECT_ID}/locations/${REGION}/services/${SERVICE}?fields=name%2Cingress%2CinvokerIamDisabled%2CiapEnabled%2Ctemplate%2FserviceAccount%2Ctemplate%2FmaxInstanceRequestConcurrency%2Ctemplate%2Ftimeout%2Ctemplate%2FexecutionEnvironment%2Ctemplate%2Fscaling%2Ctemplate%2FvpcAccess%2Ctemplate%2Fcontainers%2Fname%2Ctemplate%2Fcontainers%2Fenv%2Fname%2Ctemplate%2Fcontainers%2Fenv%2FvalueSource%2FsecretKeyRef%2Fsecret%2Ctemplate%2Fcontainers%2Fenv%2FvalueSource%2FsecretKeyRef%2Fversion%2Ctemplate%2Fcontainers%2Fresources%2Ctemplate%2Fcontainers%2Fports%2Ctemplate%2Fcontainers%2FstartupProbe%2Ctemplate%2Fcontainers%2FlivenessProbe%2Ctemplate%2Fcontainers%2FvolumeMounts%2Ctemplate%2Fvolumes"
+  runtime_fields='name,ingress,invokerIamDisabled,iapEnabled,template/serviceAccount,template/maxInstanceRequestConcurrency,template/timeout,template/executionEnvironment,template/scaling/minInstanceCount,template/scaling/maxInstanceCount,template/scaling/cpuUtilization,template/scaling/concurrencyUtilization,template/vpcAccess/connector,template/vpcAccess/egress,template/vpcAccess/networkInterfaces/network,template/vpcAccess/networkInterfaces/subnetwork,template/vpcAccess/networkInterfaces/tags,template/containers/name,template/containers/env/name,template/containers/env/valueSource/secretKeyRef/secret,template/containers/env/valueSource/secretKeyRef/version,template/containers/resources/limits,template/containers/resources/cpuIdle,template/containers/resources/startupCpuBoost,template/containers/ports/name,template/containers/ports/containerPort,template/containers/startupProbe/initialDelaySeconds,template/containers/startupProbe/timeoutSeconds,template/containers/startupProbe/periodSeconds,template/containers/startupProbe/failureThreshold,template/containers/startupProbe/httpGet/path,template/containers/startupProbe/httpGet/port,template/containers/startupProbe/httpGet/httpHeaders/name,template/containers/startupProbe/tcpSocket/port,template/containers/startupProbe/grpc/port,template/containers/startupProbe/grpc/service,template/containers/livenessProbe/initialDelaySeconds,template/containers/livenessProbe/timeoutSeconds,template/containers/livenessProbe/periodSeconds,template/containers/livenessProbe/failureThreshold,template/containers/livenessProbe/httpGet/path,template/containers/livenessProbe/httpGet/port,template/containers/livenessProbe/httpGet/httpHeaders/name,template/containers/livenessProbe/tcpSocket/port,template/containers/livenessProbe/grpc/port,template/containers/livenessProbe/grpc/service,template/containers/volumeMounts/name,template/containers/volumeMounts/mountPath,template/containers/volumeMounts/subPath,template/volumes/name,template/volumes/cloudSqlInstance/instances,template/volumes/emptyDir/medium,template/volumes/emptyDir/sizeLimit,template/volumes/gcs/bucket,template/volumes/gcs/mountOptions,template/volumes/gcs/readOnly,template/volumes/nfs/server,template/volumes/nfs/path,template/volumes/nfs/readOnly,template/volumes/secret/secret,template/volumes/secret/defaultMode,template/volumes/secret/items/path,template/volumes/secret/items/version,template/volumes/secret/items/mode'
+  runtime_url="https://run.googleapis.com/v2/projects/${PROJECT_ID}/locations/${REGION}/services/${SERVICE}?fields=${runtime_fields}"
   authorized_curl --fail --url "$runtime_url" \
     > "$destination" || return 1
   bind_scope serviceConfig < "$destination" \
@@ -419,10 +407,17 @@ capture_runtime_snapshot() {
 
 Section 7 invokes this function once immediately before and once immediately
 after deployment, then passes both strictly parsed HTTP response bodies to `runtime-equal`.
-Require `RUNTIME_UNCHANGED`. Any missing field, plaintext `value`, unknown key,
-wrong service identity, malformed projection, or hash difference stops. The
-comparator revalidates both complete raw files; their retention or deletion
-follows the separately approved evidence policy.
+Require `RUNTIME_UNCHANGED`. The validator requires a nonempty named container
+list and validates every selected service, template, container, environment,
+secret-reference, resource, port, probe, volume, scaling, and networking field
+against its Cloud Run v2 shape. Optional selected fields may be absent, but a
+present field with the wrong type or structure stops. Plaintext environment
+values and probe-header values are deliberately not requested; only probe-header
+names are compared. The result proves equality of this exact safe projection,
+not of unselected values. Wrong service identity, malformed or truncated
+projection, unknown key, or hash difference stops. Both raw files are
+revalidated; their retention or deletion follows the separately approved
+evidence policy.
 
 ## 5. Separately authorized immutable candidate build
 
@@ -629,6 +624,15 @@ PY
   done
   [[ "$BUILD_COMPLETE" == true ]] || fail 'build did not complete within 900 seconds'
 
+  BUILD_IMAGE_DIGEST="$(
+    python3.12 scripts/validate_deployment_state.py build --raw \
+      --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+      --expected-build-id="$BUILD_ID" --expected-source-sha="$SOURCE_SHA" \
+      --expected-source-tree="$SOURCE_TREE" \
+      --expected-image-tag="$CANDIDATE_IMAGE_TAG" --output=digest \
+      < "$BUILD_SUCCESS_RAW_FILE"
+  )" || fail 'canonical build digest extraction'
+
   TAG_RESULT_BODY="$EVIDENCE_ROOT/${BUILD_ID}-docker-image.raw.json"
   IMAGE_AUTHORIZATION_FILE="$EVIDENCE_ROOT/${BUILD_ID}-image-authorization.json"
   python3.12 scripts/validate_deployment_state.py evidence-path \
@@ -637,10 +641,14 @@ PY
     --output-file="$IMAGE_AUTHORIZATION_FILE" \
     --expected-image-tag="$CANDIDATE_IMAGE_TAG" >/dev/null \
     || fail 'unsafe or preexisting image evidence path'
-  gcloud artifacts docker images describe "$CANDIDATE_IMAGE_TAG" \
-    --account="$ACCOUNT" --project="$PROJECT_ID" \
-    --format='json(name,uri,tags)' > "$TAG_RESULT_BODY" \
-    || fail 'exact candidate DockerImage resolution'
+  DOCKER_IMAGE_URL="$(
+    python3.12 scripts/validate_deployment_state.py artifact-image-request \
+      --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+      --expected-image-tag="$CANDIDATE_IMAGE_TAG" \
+      --expected-digest="$BUILD_IMAGE_DIGEST" --output=url
+  )" || fail 'exact candidate DockerImage request construction'
+  authorized_curl --fail --url "$DOCKER_IMAGE_URL" \
+    > "$TAG_RESULT_BODY" || fail 'exact candidate DockerImage GET'
   python3.12 scripts/validate_deployment_state.py tag-resolution --raw \
     --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
     --expected-image-tag="$CANDIDATE_IMAGE_TAG" < "$TAG_RESULT_BODY" >/dev/null \
@@ -663,12 +671,18 @@ one valid build ID, `SUCCESS` within the bounded polling window, exact Build
 resource name/project/SHA/tree/image substitutions, exactly one declared
 `images[]` tag, and exactly one matching `results.images[]` BuiltImage with its
 canonical digest, exact Artifact Registry Package resource, valid optional OCI
-media type, and—when present—an exact nanosecond-aware chronological `pushTiming`
-TimeSpan. The Build create/start/finish chronology is likewise compared without
-microsecond or floating-point precision loss. The independently queried
-DockerImage must identify that same project, location, repository, image, tag,
-and digest. `authorize-image` requires equality of the Build-result digest, the
-DockerImage URI digest, and the final digest-qualified image reference. This is
+media type, and—when present—a `pushTiming` TimeSpan fully bounded by the Build
+execution interval at nanosecond precision:
+`createTime <= startTime <= pushStart <= pushEnd <= finishTime`. The exact
+Artifact Registry v1 DockerImage resource name is constructed only from the
+validated candidate tag and Build digest and retrieved with one `DockerImages.Get`.
+The local gcloud 578.0.0 generated client defines that request as `GET
+v1/{+name}` with no query or pagination parameters and a single `DockerImage`
+response; the generated message defines the requested `name`, `uri`, and `tags`
+fields. The independently queried DockerImage must identify that same project,
+location, repository, image, tag, and digest. `authorize-image` requires equality
+of the Build-result digest, DockerImage URI digest, and final digest-qualified
+image reference. This is
 Build artifact-output binding, not a SLSA attestation. Every queued or working
 state is retry-only; cancelled, expired, timed out, failed, unknown, empty, or
 contradictory evidence stops.

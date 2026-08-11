@@ -81,12 +81,20 @@ complete authorized traffic or rollback maps. A completed Build must declare the
 exact candidate tag in `images[]` and report exactly one matching
 `results.images[]` BuiltImage with a canonical digest, exact Artifact Registry
 Package resource, and a structurally valid optional `pushTiming`/OCI media type.
-Build and push chronologies are compared at full nanosecond precision with
-timezone-offset normalization. Its digest must equal the independently resolved
-DockerImage URI digest before the validator derives a deployable immutable
-reference. This is Cloud Build artifact-output binding, not a SLSA attestation.
-Secret references require an exact numeric version;
-aliases and plaintext-like selectors fail before every HTTP classification. A floating `LATEST` allocation is a
+When present, `pushTiming` must be fully contained within the Build execution
+interval at nanosecond precision with timezone-offset normalization. The exact,
+non-paginated Artifact Registry `DockerImages.Get` resource is constructed from
+the validated candidate tag and Build digest; its DockerImage URI digest and tag
+must agree before the validator derives a deployable immutable reference. This is
+Cloud Build artifact-output binding, not a SLSA attestation. Saved
+`SESSION_SECRET` results are strictly rebound to the current project, region,
+and service before metadata URLs are constructed, and the secret must resolve
+within the current project with an exact positive numeric version. Aliases and
+plaintext-like selectors fail before every HTTP classification. Runtime
+preservation compares a schema-validated safe Cloud Run v2 projection with a
+nonempty named-container structure; it deliberately excludes plaintext
+environment and probe-header values and does not claim equality of unselected
+fields. A floating `LATEST` allocation is a
 deployment and rollback hazard, not a standalone source-validation or image-build
 blocker. The governed procedure records both the gcloud-emitted map and a resolved effective
 serving map: an authorized digest-based `--no-traffic` deployment may convert

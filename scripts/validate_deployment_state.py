@@ -45,6 +45,8 @@ RFC3339_TIMESTAMP_RE = re.compile(
     r"(?:\.(?P<fraction>[0-9]{1,9}))?"
     r"(?P<zone>Z|[+-][0-9]{2}:[0-9]{2})"
 )
+DURATION_RE = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]{1,9})?s")
+ARTIFACT_REGISTRY_API_ORIGIN = "https://artifactregistry.googleapis.com/v1"
 
 
 class ValidationError(ValueError):
@@ -204,15 +206,6 @@ def _require_revision_name(value: Any, code: str) -> str:
     return value
 
 
-def _normalize_digest(value: Any, code: str) -> str:
-    if not isinstance(value, str) or not value:
-        fail(code, "Image digest is missing or malformed")
-    digest = value.rsplit("@", 1)[-1]
-    if not DIGEST_RE.fullmatch(digest):
-        fail(code, "Image digest is not immutable")
-    return digest
-
-
 def _canonical_digest(value: Any, code: str) -> str:
     if not isinstance(value, str) or not DIGEST_RE.fullmatch(value):
         fail(code, "Image digest is not one canonical immutable digest")
@@ -330,7 +323,7 @@ def validate_revision_document(
     """Validate exact revision identity, digest, and one Ready=True condition."""
 
     expected_revision = _require_revision_name(expected_revision, "EXPECTED_REVISION")
-    expected_digest = _normalize_digest(expected_digest, "EXPECTED_DIGEST")
+    expected_digest = _canonical_digest(expected_digest, "EXPECTED_DIGEST")
     root = _require_object(
         document, "REVISION_DOCUMENT", "Revision evidence must be a JSON object"
     )
@@ -347,7 +340,7 @@ def validate_revision_document(
         root["status"], "REVISION_STATUS", "Revision status is missing or null"
     )
     _require_exact_keys(status, required={"conditions", "imageDigest"})
-    actual_digest = _normalize_digest(status["imageDigest"], "REVISION_DIGEST")
+    actual_digest = _canonical_digest(status["imageDigest"], "REVISION_DIGEST")
     if actual_digest != expected_digest:
         fail("REVISION_DIGEST_MISMATCH", "Revision digest differs from expectation")
 
@@ -780,6 +773,58 @@ def _secret_resource(reference: str, project: str) -> str:
     return f"projects/{project}/secrets/{reference}"
 
 
+def validate_secret_reference_result(document: Any, scope: Scope) -> dict[str, Any]:
+    """Revalidate one saved SESSION_SECRET handoff before any metadata request."""
+
+    root = _require_object(
+        document,
+        "SECRET_REFERENCE_RESULT",
+        "Saved secret-reference result is malformed",
+    )
+    _require_exact_keys(
+        root,
+        required={"classification", "name", "scope", "secret", "version"},
+        code="SECRET_REFERENCE_RESULT",
+    )
+    if (
+        root["classification"] != "VALID_SECRET_MANAGER_REFERENCE"
+        or root["name"] != "SESSION_SECRET"
+    ):
+        fail(
+            "SECRET_REFERENCE_RESULT",
+            "Saved secret-reference result has an invalid classification",
+        )
+    raw_scope = _require_object(
+        root["scope"],
+        "SECRET_REFERENCE_SCOPE",
+        "Saved secret-reference scope is malformed",
+    )
+    _require_exact_keys(
+        raw_scope,
+        required={"project", "region", "service"},
+        code="SECRET_REFERENCE_SCOPE",
+    )
+    observed_scope = require_scope(
+        raw_scope["project"], raw_scope["region"], raw_scope["service"]
+    )
+    if observed_scope != scope:
+        fail(
+            "SECRET_REFERENCE_SCOPE_MISMATCH",
+            "Saved secret-reference scope differs from the authorized scope",
+        )
+    secret_resource = _secret_resource(root["secret"], scope.project)
+    version = _validate_numeric_version(
+        root["version"], code="SECRET_REFERENCE_VERSION"
+    )
+    return {
+        "classification": "VALID_SCOPE_BOUND_SECRET_REFERENCE",
+        "name": "SESSION_SECRET",
+        "scope": scope.output(),
+        "secretResource": secret_resource,
+        "version": version,
+    }
+
+
 def validate_secret_version_document(
     document: Any,
     *,
@@ -1100,10 +1145,13 @@ def validate_build_document(
         )
         push_start = _parse_build_timestamp(push_timing["startTime"], "push startTime")
         push_end = _parse_build_timestamp(push_timing["endTime"], "push endTime")
-        if push_start > push_end:
+        if not (
+            timestamps["startTime"] <= push_start
+            <= push_end <= timestamps["finishTime"]
+        ):
             fail(
                 "BUILT_IMAGE_PUSH_TIMING_ORDER",
-                "BuiltImage pushTiming is nonchronological",
+                "BuiltImage pushTiming is outside the build execution interval",
             )
     if "ociMediaType" in built_image:
         oci_media_type = built_image["ociMediaType"]
@@ -1143,9 +1191,14 @@ def validate_tag_resolution_document(
     root = _require_object(document, "TAG_EVIDENCE", "Tag evidence is malformed")
     _require_exact_keys(root, required={"name", "uri", "tags"})
     uri = root["uri"]
-    if not isinstance(uri, str) or not uri.startswith(identity.image_uri + "@"):
+    prefix = identity.image_uri + "@"
+    if (
+        not isinstance(uri, str)
+        or uri.count("@") != 1
+        or not uri.startswith(prefix)
+    ):
         fail("TAG_URI", "DockerImage URI differs from the authorized image")
-    digest = _normalize_digest(uri, "TAG_DIGEST")
+    digest = _canonical_digest(uri[len(prefix):], "TAG_DIGEST")
     if uri != identity.digest_uri(digest):
         fail("TAG_URI", "DockerImage URI is not canonical")
     if root["name"] != identity.docker_image_resource(digest):
@@ -1171,6 +1224,25 @@ def validate_tag_resolution_document(
         "imageDigestRef": identity.digest_uri(digest),
         "imageTag": expected_image_tag,
         "packageResource": identity.package_resource,
+    }
+
+
+def validate_artifact_image_request(
+    *, expected_image_tag: str, expected_digest: str, scope: Scope
+) -> dict[str, str]:
+    """Construct one exact, non-paginated Artifact Registry DockerImage GET."""
+
+    identity = _image_identity(expected_image_tag, scope)
+    digest = _canonical_digest(expected_digest, "EXPECTED_DIGEST")
+    resource = identity.docker_image_resource(digest)
+    return {
+        "classification": "ARTIFACT_IMAGE_REQUEST_VALID",
+        "digest": digest,
+        "resource": resource,
+        "url": (
+            f"{ARTIFACT_REGISTRY_API_ORIGIN}/{resource}"
+            "?fields=name%2Curi%2Ctags"
+        ),
     }
 
 
@@ -1213,119 +1285,435 @@ def validate_deployment_image_authorization(
     }
 
 
-SAFE_RUNTIME_KEYS = {
-    "authentication",
-    "cloudSqlInstance",
-    "connector",
-    "containerConcurrency",
-    "containerPort",
-    "containers",
-    "cpu",
-    "cpuIdle",
-    "emptyDir",
-    "egress",
-    "env",
-    "environment",
-    "executionEnvironment",
-    "failureThreshold",
-    "gcs",
-    "grpc",
-    "header",
-    "httpGet",
-    "httpHeaders",
-    "ingress",
-    "initialDelaySeconds",
-    "instance",
-    "instances",
-    "invokerIamDisabled",
-    "iapEnabled",
-    "items",
-    "key",
-    "limits",
-    "livenessProbe",
-    "maxInstanceRequestConcurrency",
-    "maxInstanceCount",
-    "memory",
-    "medium",
-    "minInstanceCount",
-    "mode",
-    "mountPath",
-    "mountOptions",
-    "name",
-    "network",
-    "networkInterfaces",
-    "nfs",
-    "path",
-    "periodSeconds",
-    "port",
-    "ports",
-    "probes",
-    "resources",
-    "readOnly",
-    "scaling",
-    "secret",
-    "secretKeyRef",
-    "serviceAccount",
-    "server",
-    "share",
-    "sizeLimit",
-    "startupProbe",
-    "startupCpuBoost",
-    "tcpSocket",
-    "tags",
-    "template",
-    "timeout",
-    "timeoutSeconds",
-    "subnetwork",
-    "uri",
-    "valueSource",
-    "version",
-    "volumeMounts",
-    "volumes",
-    "vpcAccess",
-}
+def _runtime_string(value: Any, code: str, *, maximum: int = 1024) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > maximum
+        or value != value.strip()
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        fail(code, "Runtime metadata contains a malformed string")
+    return value
 
 
-def _safe_runtime_value(value: Any) -> Any:
-    if value is None or isinstance(value, (bool, int)):
-        return value
-    if isinstance(value, str):
-        if len(value) > 512 or value != value.strip() or any(
-            ord(character) < 32 or ord(character) == 127 for character in value
-        ):
-            fail("RUNTIME_VALUE", "Runtime metadata contains a malformed value")
-        return value
-    if isinstance(value, list):
-        return [_safe_runtime_value(item) for item in value]
-    if isinstance(value, dict):
-        if not value:
-            return {}
-        if not set(value).issubset(SAFE_RUNTIME_KEYS):
-            fail("RUNTIME_FIELD", "Runtime metadata contains an unapproved field")
-        if "value" in value or "secretValue" in value:
-            fail("RUNTIME_SECRET_VALUE", "Runtime metadata contains a plaintext value field")
-        return {key: _safe_runtime_value(value[key]) for key in sorted(value)}
-    fail("RUNTIME_VALUE", "Runtime metadata contains an unsupported value")
+def _runtime_int(value: Any, code: str, *, minimum: int, maximum: int) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not minimum <= value <= maximum
+    ):
+        fail(code, "Runtime metadata contains a malformed integer")
+    return value
 
 
-def validate_runtime_document(document: Any, scope: Scope) -> dict[str, Any]:
-    root = _require_object(document, "RUNTIME_EVIDENCE", "Runtime evidence is malformed")
-    _require_exact_keys(root, required={"name", "runtime"})
-    if root["name"] != scope.service_resource:
-        fail("SERVICE_IDENTITY_MISMATCH", "Runtime evidence identifies another service")
-    runtime = _require_object(
-        root["runtime"], "RUNTIME_EVIDENCE", "Runtime metadata is malformed"
+def _runtime_bool(value: Any, code: str) -> bool:
+    if not isinstance(value, bool):
+        fail(code, "Runtime metadata contains a malformed boolean")
+    return value
+
+
+def _runtime_string_list(value: Any, code: str, *, allow_empty: bool = True) -> None:
+    if not isinstance(value, list) or (not allow_empty and not value):
+        fail(code, "Runtime metadata contains a malformed list")
+    rendered: list[str] = []
+    for item in value:
+        rendered.append(_runtime_string(item, code))
+    if len(rendered) != len(set(rendered)):
+        fail(code, "Runtime metadata contains a duplicate list item")
+
+
+def _validate_runtime_secret_selector(value: Any) -> None:
+    selector = _require_object(
+        value, "RUNTIME_SECRET_REFERENCE", "Runtime secret reference is malformed"
     )
-    if not runtime:
-        fail("RUNTIME_EMPTY", "Runtime metadata is empty")
-    canonical = json.dumps(
-        _safe_runtime_value(runtime), sort_keys=True, separators=(",", ":")
+    _require_exact_keys(
+        selector,
+        required={"secret", "version"},
+        code="RUNTIME_SECRET_REFERENCE",
     )
-    return {
-        "classification": "RUNTIME_CANONICAL",
-        "scope": scope.output(),
-        "sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    _validate_secret_reference(selector["secret"])
+    version = _runtime_string(selector["version"], "RUNTIME_SECRET_REFERENCE")
+    if not SECRET_ID_RE.fullmatch(version):
+        fail("RUNTIME_SECRET_REFERENCE", "Runtime secret version is malformed")
+
+
+def _validate_runtime_environment(value: Any) -> None:
+    if not isinstance(value, list):
+        fail("RUNTIME_ENV", "Runtime environment metadata is malformed")
+    seen: set[str] = set()
+    for raw_entry in value:
+        entry = _require_object(
+            raw_entry, "RUNTIME_ENV", "Runtime environment entry is malformed"
+        )
+        _require_exact_keys(
+            entry,
+            required={"name"},
+            optional={"valueSource"},
+            code="RUNTIME_ENV",
+        )
+        name = _runtime_string(entry["name"], "RUNTIME_ENV", maximum=32768)
+        if "=" in name or name in seen:
+            fail("RUNTIME_ENV", "Runtime environment name is malformed or duplicated")
+        seen.add(name)
+        if "valueSource" in entry:
+            source = _require_object(
+                entry["valueSource"],
+                "RUNTIME_SECRET_REFERENCE",
+                "Runtime environment source is malformed",
+            )
+            _require_exact_keys(
+                source,
+                required={"secretKeyRef"},
+                code="RUNTIME_SECRET_REFERENCE",
+            )
+            _validate_runtime_secret_selector(source["secretKeyRef"])
+
+
+def _validate_runtime_resources(value: Any) -> None:
+    resources = _require_object(
+        value, "RUNTIME_RESOURCES", "Runtime resources are malformed"
+    )
+    _require_exact_keys(
+        resources,
+        required=set(),
+        optional={"limits", "cpuIdle", "startupCpuBoost"},
+        code="RUNTIME_RESOURCES",
+    )
+    if not resources:
+        fail("RUNTIME_RESOURCES", "Runtime resources are empty")
+    if "limits" in resources:
+        limits = _require_object(
+            resources["limits"], "RUNTIME_LIMITS", "Runtime limits are malformed"
+        )
+        if not limits or not set(limits).issubset({"cpu", "memory", "nvidia.com/gpu"}):
+            fail("RUNTIME_LIMITS", "Runtime limits are missing or unexpected")
+        for limit in limits.values():
+            _runtime_string(limit, "RUNTIME_LIMITS")
+    for key in ("cpuIdle", "startupCpuBoost"):
+        if key in resources:
+            _runtime_bool(resources[key], "RUNTIME_RESOURCES")
+
+
+def _validate_runtime_probe(value: Any) -> None:
+    probe = _require_object(value, "RUNTIME_PROBE", "Runtime probe is malformed")
+    actions = {"httpGet", "tcpSocket", "grpc"}
+    timers = {
+        "initialDelaySeconds",
+        "timeoutSeconds",
+        "periodSeconds",
+        "failureThreshold",
     }
+    _require_exact_keys(
+        probe, required=set(), optional=actions | timers, code="RUNTIME_PROBE"
+    )
+    if len(actions & set(probe)) != 1:
+        fail("RUNTIME_PROBE", "Runtime probe must contain exactly one action")
+    for key in timers:
+        if key in probe:
+            minimum = 0 if key == "initialDelaySeconds" else 1
+            _runtime_int(probe[key], "RUNTIME_PROBE", minimum=minimum, maximum=3600)
+    if (
+        "timeoutSeconds" in probe
+        and "periodSeconds" in probe
+        and probe["timeoutSeconds"] > probe["periodSeconds"]
+    ):
+        fail("RUNTIME_PROBE", "Runtime probe timeout exceeds its period")
+    if "httpGet" in probe:
+        action = _require_object(
+            probe["httpGet"], "RUNTIME_PROBE", "Runtime HTTP probe is malformed"
+        )
+        _require_exact_keys(
+            action,
+            required=set(),
+            optional={"path", "port", "httpHeaders"},
+            code="RUNTIME_PROBE",
+        )
+        if "path" in action:
+            _runtime_string(action["path"], "RUNTIME_PROBE")
+        if "port" in action:
+            _runtime_int(action["port"], "RUNTIME_PROBE", minimum=1, maximum=65535)
+        if "httpHeaders" in action:
+            headers = action["httpHeaders"]
+            if not isinstance(headers, list):
+                fail("RUNTIME_PROBE", "Runtime probe headers are malformed")
+            for raw_header in headers:
+                header = _require_object(
+                    raw_header, "RUNTIME_PROBE", "Runtime probe header is malformed"
+                )
+                _require_exact_keys(
+                    header, required={"name"}, code="RUNTIME_PROBE"
+                )
+                _runtime_string(header["name"], "RUNTIME_PROBE")
+    if "tcpSocket" in probe:
+        action = _require_object(
+            probe["tcpSocket"], "RUNTIME_PROBE", "Runtime TCP probe is malformed"
+        )
+        _require_exact_keys(
+            action, required=set(), optional={"port"}, code="RUNTIME_PROBE"
+        )
+        if "port" in action:
+            _runtime_int(action["port"], "RUNTIME_PROBE", minimum=1, maximum=65535)
+    if "grpc" in probe:
+        action = _require_object(
+            probe["grpc"], "RUNTIME_PROBE", "Runtime gRPC probe is malformed"
+        )
+        _require_exact_keys(
+            action,
+            required=set(),
+            optional={"port", "service"},
+            code="RUNTIME_PROBE",
+        )
+        if "port" in action:
+            _runtime_int(action["port"], "RUNTIME_PROBE", minimum=1, maximum=65535)
+        if "service" in action:
+            _runtime_string(action["service"], "RUNTIME_PROBE")
+
+
+def _validate_runtime_volume_mounts(value: Any) -> None:
+    if not isinstance(value, list):
+        fail("RUNTIME_VOLUME_MOUNT", "Runtime volume mounts are malformed")
+    for raw_mount in value:
+        mount = _require_object(
+            raw_mount, "RUNTIME_VOLUME_MOUNT", "Runtime volume mount is malformed"
+        )
+        _require_exact_keys(
+            mount,
+            required={"name", "mountPath"},
+            optional={"subPath"},
+            code="RUNTIME_VOLUME_MOUNT",
+        )
+        _runtime_string(mount["name"], "RUNTIME_VOLUME_MOUNT")
+        _runtime_string(mount["mountPath"], "RUNTIME_VOLUME_MOUNT")
+        if "subPath" in mount:
+            _runtime_string(mount["subPath"], "RUNTIME_VOLUME_MOUNT")
+
+
+def _validate_runtime_container(value: Any) -> None:
+    container = _require_object(
+        value, "RUNTIME_CONTAINER", "Runtime container is malformed"
+    )
+    optional = {
+        "env",
+        "resources",
+        "ports",
+        "startupProbe",
+        "livenessProbe",
+        "volumeMounts",
+    }
+    _require_exact_keys(
+        container, required={"name"}, optional=optional, code="RUNTIME_CONTAINER"
+    )
+    _require_revision_name(container["name"], "RUNTIME_CONTAINER")
+    if "env" in container:
+        _validate_runtime_environment(container["env"])
+    if "resources" in container:
+        _validate_runtime_resources(container["resources"])
+    if "ports" in container:
+        ports = container["ports"]
+        if not isinstance(ports, list) or not ports:
+            fail("RUNTIME_PORT", "Runtime ports are malformed")
+        for raw_port in ports:
+            port = _require_object(
+                raw_port, "RUNTIME_PORT", "Runtime port is malformed"
+            )
+            _require_exact_keys(
+                port,
+                required={"containerPort"},
+                optional={"name"},
+                code="RUNTIME_PORT",
+            )
+            _runtime_int(
+                port["containerPort"], "RUNTIME_PORT", minimum=1, maximum=65535
+            )
+            if "name" in port and port["name"] not in {"http1", "h2c"}:
+                fail("RUNTIME_PORT", "Runtime port protocol is malformed")
+    for key in ("startupProbe", "livenessProbe"):
+        if key in container:
+            _validate_runtime_probe(container[key])
+    if "volumeMounts" in container:
+        _validate_runtime_volume_mounts(container["volumeMounts"])
+
+
+def _validate_runtime_scaling(value: Any) -> None:
+    scaling = _require_object(
+        value, "RUNTIME_SCALING", "Runtime scaling is malformed"
+    )
+    allowed = {
+        "minInstanceCount",
+        "maxInstanceCount",
+        "cpuUtilization",
+        "concurrencyUtilization",
+    }
+    _require_exact_keys(
+        scaling, required=set(), optional=allowed, code="RUNTIME_SCALING"
+    )
+    if not scaling:
+        fail("RUNTIME_SCALING", "Runtime scaling is empty")
+    for key in ("minInstanceCount", "maxInstanceCount"):
+        if key in scaling:
+            _runtime_int(
+                scaling[key], "RUNTIME_SCALING", minimum=0, maximum=1_000_000
+            )
+    if (
+        "minInstanceCount" in scaling
+        and "maxInstanceCount" in scaling
+        and scaling["minInstanceCount"] > scaling["maxInstanceCount"]
+    ):
+        fail("RUNTIME_SCALING", "Runtime scaling bounds are contradictory")
+    for key in ("cpuUtilization", "concurrencyUtilization"):
+        if key in scaling:
+            item = scaling[key]
+            if (
+                isinstance(item, bool)
+                or not isinstance(item, (int, float))
+                or not 0 <= item <= 1
+            ):
+                fail("RUNTIME_SCALING", "Runtime utilization is malformed")
+
+
+def _validate_runtime_vpc(value: Any) -> None:
+    vpc = _require_object(value, "RUNTIME_VPC", "Runtime VPC access is malformed")
+    _require_exact_keys(
+        vpc,
+        required=set(),
+        optional={"connector", "egress", "networkInterfaces"},
+        code="RUNTIME_VPC",
+    )
+    if not vpc:
+        fail("RUNTIME_VPC", "Runtime VPC access is empty")
+    if len({"connector", "networkInterfaces"} & set(vpc)) != 1:
+        fail("RUNTIME_VPC", "Runtime VPC access must select one network mode")
+    if "connector" in vpc:
+        _runtime_string(vpc["connector"], "RUNTIME_VPC")
+    if "egress" in vpc and vpc["egress"] not in {
+        "VPC_EGRESS_UNSPECIFIED",
+        "ALL_TRAFFIC",
+        "PRIVATE_RANGES_ONLY",
+    }:
+        fail("RUNTIME_VPC", "Runtime VPC egress is malformed")
+    if "networkInterfaces" in vpc:
+        interfaces = vpc["networkInterfaces"]
+        if not isinstance(interfaces, list) or not interfaces:
+            fail("RUNTIME_VPC", "Runtime network interfaces are malformed")
+        for raw_interface in interfaces:
+            interface = _require_object(
+                raw_interface, "RUNTIME_VPC", "Runtime network interface is malformed"
+            )
+            _require_exact_keys(
+                interface,
+                required=set(),
+                optional={"network", "subnetwork", "tags"},
+                code="RUNTIME_VPC",
+            )
+            if not ({"network", "subnetwork"} & set(interface)):
+                fail("RUNTIME_VPC", "Runtime network interface has no network identity")
+            for key in ("network", "subnetwork"):
+                if key in interface:
+                    _runtime_string(interface[key], "RUNTIME_VPC")
+            if "tags" in interface:
+                _runtime_string_list(interface["tags"], "RUNTIME_VPC")
+
+
+def _validate_runtime_volumes(value: Any) -> None:
+    if not isinstance(value, list):
+        fail("RUNTIME_VOLUME", "Runtime volumes are malformed")
+    sources = {"cloudSqlInstance", "emptyDir", "gcs", "nfs", "secret"}
+    for raw_volume in value:
+        volume = _require_object(
+            raw_volume, "RUNTIME_VOLUME", "Runtime volume is malformed"
+        )
+        _require_exact_keys(
+            volume,
+            required={"name"},
+            optional=sources,
+            code="RUNTIME_VOLUME",
+        )
+        _runtime_string(volume["name"], "RUNTIME_VOLUME")
+        selected = sources & set(volume)
+        if len(selected) != 1:
+            fail("RUNTIME_VOLUME", "Runtime volume must contain exactly one source")
+        source_name = next(iter(selected))
+        source = _require_object(
+            volume[source_name], "RUNTIME_VOLUME", "Runtime volume source is malformed"
+        )
+        if source_name == "cloudSqlInstance":
+            _require_exact_keys(
+                source, required={"instances"}, code="RUNTIME_VOLUME"
+            )
+            _runtime_string_list(
+                source["instances"], "RUNTIME_VOLUME", allow_empty=False
+            )
+        elif source_name == "emptyDir":
+            _require_exact_keys(
+                source,
+                required=set(),
+                optional={"medium", "sizeLimit"},
+                code="RUNTIME_VOLUME",
+            )
+            if "medium" in source and source["medium"] not in {
+                "MEDIUM_UNSPECIFIED", "MEMORY", "DISK"
+            }:
+                fail("RUNTIME_VOLUME", "Runtime emptyDir medium is malformed")
+            if "sizeLimit" in source:
+                _runtime_string(source["sizeLimit"], "RUNTIME_VOLUME")
+        elif source_name == "gcs":
+            _require_exact_keys(
+                source,
+                required={"bucket"},
+                optional={"mountOptions", "readOnly"},
+                code="RUNTIME_VOLUME",
+            )
+            _runtime_string(source["bucket"], "RUNTIME_VOLUME")
+            if "mountOptions" in source:
+                _runtime_string_list(source["mountOptions"], "RUNTIME_VOLUME")
+            if "readOnly" in source:
+                _runtime_bool(source["readOnly"], "RUNTIME_VOLUME")
+        elif source_name == "nfs":
+            _require_exact_keys(
+                source,
+                required={"server", "path"},
+                optional={"readOnly"},
+                code="RUNTIME_VOLUME",
+            )
+            _runtime_string(source["server"], "RUNTIME_VOLUME")
+            _runtime_string(source["path"], "RUNTIME_VOLUME")
+            if "readOnly" in source:
+                _runtime_bool(source["readOnly"], "RUNTIME_VOLUME")
+        else:
+            _require_exact_keys(
+                source,
+                required={"secret"},
+                optional={"defaultMode", "items"},
+                code="RUNTIME_VOLUME",
+            )
+            _validate_secret_reference(source["secret"])
+            if "defaultMode" in source:
+                _runtime_int(
+                    source["defaultMode"], "RUNTIME_VOLUME", minimum=0, maximum=511
+                )
+            if "items" in source:
+                items = source["items"]
+                if not isinstance(items, list):
+                    fail("RUNTIME_VOLUME", "Runtime secret volume items are malformed")
+                for raw_item in items:
+                    item = _require_object(
+                        raw_item, "RUNTIME_VOLUME", "Runtime secret volume item is malformed"
+                    )
+                    _require_exact_keys(
+                        item,
+                        required={"path", "version"},
+                        optional={"mode"},
+                        code="RUNTIME_VOLUME",
+                    )
+                    _runtime_string(item["path"], "RUNTIME_VOLUME")
+                    version = _runtime_string(item["version"], "RUNTIME_VOLUME")
+                    if not SECRET_ID_RE.fullmatch(version):
+                        fail("RUNTIME_VOLUME", "Runtime secret volume version is malformed")
+                    if "mode" in item:
+                        _runtime_int(
+                            item["mode"], "RUNTIME_VOLUME", minimum=0, maximum=511
+                        )
 
 
 def validate_runtime_service_document(document: Any, scope: Scope) -> dict[str, Any]:
@@ -1338,13 +1726,91 @@ def validate_runtime_service_document(document: Any, scope: Scope) -> dict[str, 
         optional={"ingress", "invokerIamDisabled", "iapEnabled"},
         code="RUNTIME_SERVICE",
     )
-    return validate_runtime_document(
-        {
-            "name": root["name"],
-            "runtime": {key: value for key, value in root.items() if key != "name"},
-        },
-        scope,
+    if root["name"] != scope.service_resource:
+        fail("SERVICE_IDENTITY_MISMATCH", "Runtime evidence identifies another service")
+    if "ingress" in root and root["ingress"] not in {
+        "INGRESS_TRAFFIC_UNSPECIFIED",
+        "INGRESS_TRAFFIC_ALL",
+        "INGRESS_TRAFFIC_INTERNAL_ONLY",
+        "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER",
+    }:
+        fail("RUNTIME_SERVICE", "Runtime ingress is malformed")
+    for key in ("invokerIamDisabled", "iapEnabled"):
+        if key in root:
+            _runtime_bool(root[key], "RUNTIME_SERVICE")
+    template = _require_object(
+        root["template"], "RUNTIME_TEMPLATE", "Runtime template is malformed"
     )
+    _require_exact_keys(
+        template,
+        required={"containers"},
+        optional={
+            "serviceAccount",
+            "maxInstanceRequestConcurrency",
+            "timeout",
+            "executionEnvironment",
+            "scaling",
+            "vpcAccess",
+            "volumes",
+        },
+        code="RUNTIME_TEMPLATE",
+    )
+    containers = template["containers"]
+    if not isinstance(containers, list) or not containers:
+        fail("RUNTIME_CONTAINERS", "Runtime containers are missing or malformed")
+    seen_containers: set[str] = set()
+    for container in containers:
+        _validate_runtime_container(container)
+        name = container["name"]
+        if name in seen_containers:
+            fail("RUNTIME_CONTAINER", "Runtime container name is duplicated")
+        seen_containers.add(name)
+    if "serviceAccount" in template:
+        _runtime_string(template["serviceAccount"], "RUNTIME_SERVICE_ACCOUNT")
+    if "maxInstanceRequestConcurrency" in template:
+        _runtime_int(
+            template["maxInstanceRequestConcurrency"],
+            "RUNTIME_CONCURRENCY",
+            minimum=0,
+            maximum=1000,
+        )
+    if "timeout" in template:
+        timeout = _runtime_string(template["timeout"], "RUNTIME_TIMEOUT")
+        if not DURATION_RE.fullmatch(timeout):
+            fail("RUNTIME_TIMEOUT", "Runtime timeout is malformed")
+    if "executionEnvironment" in template and template["executionEnvironment"] not in {
+        "EXECUTION_ENVIRONMENT_UNSPECIFIED",
+        "EXECUTION_ENVIRONMENT_GEN1",
+        "EXECUTION_ENVIRONMENT_GEN2",
+    }:
+        fail("RUNTIME_EXECUTION_ENVIRONMENT", "Runtime execution environment is malformed")
+    if "scaling" in template:
+        _validate_runtime_scaling(template["scaling"])
+    if "vpcAccess" in template:
+        _validate_runtime_vpc(template["vpcAccess"])
+    if "volumes" in template:
+        _validate_runtime_volumes(template["volumes"])
+    volumes = template.get("volumes", [])
+    volume_names = [volume["name"] for volume in volumes]
+    if len(volume_names) != len(set(volume_names)):
+        fail("RUNTIME_VOLUME", "Runtime volume name is duplicated")
+    for container in containers:
+        mounts = container.get("volumeMounts", [])
+        mount_names = [mount["name"] for mount in mounts]
+        if len(mount_names) != len(set(mount_names)):
+            fail("RUNTIME_VOLUME_MOUNT", "Runtime volume mount is duplicated")
+        if not set(mount_names).issubset(volume_names):
+            fail("RUNTIME_VOLUME_MOUNT", "Runtime volume mount has no matching volume")
+    canonical = json.dumps(
+        {key: root[key] for key in sorted(root) if key != "name"},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return {
+        "classification": "RUNTIME_CANONICAL",
+        "scope": scope.output(),
+        "sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    }
 
 
 def validate_runtime_comparison(document: Any) -> dict[str, str]:
@@ -1463,6 +1929,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--output", choices=("json", "reference"), default="json"
     )
 
+    reference_parser = subparsers.add_parser("secret-reference-result")
+    add_scope(reference_parser)
+    reference_parser.add_argument("--evidence-root", required=True)
+    reference_parser.add_argument("--input-file", required=True)
+    reference_parser.add_argument(
+        "--output", choices=("json", "resource-version"), default="json"
+    )
+
     secret_parser = subparsers.add_parser("secret-version")
     add_scope(secret_parser)
     secret_parser.add_argument("--expected-secret", required=True)
@@ -1488,6 +1962,9 @@ def build_parser() -> argparse.ArgumentParser:
     build_parser.add_argument("--expected-source-tree", required=True)
     build_parser.add_argument("--expected-image-tag", required=True)
     build_parser.add_argument("--raw", action="store_true")
+    build_parser.add_argument(
+        "--output", choices=("json", "digest", "image-ref"), default="json"
+    )
 
     submission_parser = subparsers.add_parser("build-submission")
     add_scope(submission_parser)
@@ -1499,6 +1976,14 @@ def build_parser() -> argparse.ArgumentParser:
     add_scope(tag_parser)
     tag_parser.add_argument("--expected-image-tag", required=True)
     tag_parser.add_argument("--raw", action="store_true")
+
+    artifact_parser = subparsers.add_parser("artifact-image-request")
+    add_scope(artifact_parser)
+    artifact_parser.add_argument("--expected-image-tag", required=True)
+    artifact_parser.add_argument("--expected-digest", required=True)
+    artifact_parser.add_argument(
+        "--output", choices=("json", "resource", "url"), default="json"
+    )
 
     authorization_parser = subparsers.add_parser("authorize-image")
     add_scope(authorization_parser)
@@ -1546,6 +2031,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         scope = require_scope(args.project, args.region, args.service)
+        if args.command == "artifact-image-request":
+            result = validate_artifact_image_request(
+                expected_image_tag=args.expected_image_tag,
+                expected_digest=args.expected_digest,
+                scope=scope,
+            )
+            result["scope"] = scope.output()
+            if args.output == "resource":
+                print(result["resource"])
+            elif args.output == "url":
+                print(result["url"])
+            else:
+                _emit(result)
+            return 0
+        if args.command == "secret-reference-result":
+            input_path = validate_evidence_file_path(
+                args.evidence_root, args.input_file, must_exist=True
+            )
+            result = validate_secret_reference_result(
+                _strict_load_path(input_path), scope
+            )
+            if args.output == "resource-version":
+                print(result["secretResource"], result["version"])
+            else:
+                _emit(result)
+            return 0
         if args.command == "secret-version":
             _validate_numeric_version(args.expected_version)
             _secret_resource(args.expected_secret, args.project)
@@ -1819,6 +2330,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 scope=scope,
             )
             result["scope"] = scope.output()
+            if args.output == "digest":
+                print(result["imageDigest"])
+                return 0
+            if args.output == "image-ref":
+                print(result["imageDigestRef"])
+                return 0
         elif args.command == "build-submission":
             scope, evidence = scoped_payload(
                 document,

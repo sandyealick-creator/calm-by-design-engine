@@ -187,9 +187,11 @@ source SHA/tree substitutions, declared candidate tag, and exactly one matching
 `results.images[]` BuiltImage canonical digest, exact Artifact Registry Package
 resource, and valid optional `pushTiming`/OCI media type. Build and push
 chronologies use exact nanosecond-aware RFC 3339 comparison, including offset
-normalization. An
-independently queried DockerImage must identify the same repository, package,
-tag, and digest before a deployable digest reference is derived. This is Cloud
+normalization, and any `pushTiming` must be fully contained within the Build
+execution interval. An exact, non-paginated Artifact Registry
+`DockerImages.Get` is constructed from the validated candidate tag and Build
+digest. Its DockerImage must identify the same repository, package, tag, and
+digest before a deployable digest reference is derived. This is Cloud
 Build artifact-output binding, not a SLSA attestation.
 
 `scripts/validate_deployment_state.py` is the standard-library-only strict local
@@ -197,13 +199,18 @@ evidence validator; `tests/test_deployment_state.py` contains its isolated
 fixtures. Its scoped contracts cover revision and traffic identity, candidate
 tag/revision nonexistence, bounded terminal-build evidence, exact DockerImage
 tag resolution with Build-result digest equality, safe runtime comparison,
-numeric `SESSION_SECRET` references whose versions are validated before every
-HTTP classification, and complete expected traffic/rollback maps. Traffic
-evidence records both the complete gcloud-emitted map and a resolved
-effective serving map. The current verified service state is one untagged
-floating `LATEST` target at 100%, bound during Phase 2B to
+scope-bound numeric `SESSION_SECRET` references revalidated before metadata URL
+construction and every HTTP classification, and complete expected
+traffic/rollback maps. Runtime comparison requires a schema-valid Cloud Run v2
+safe projection with nonempty named containers; plaintext environment and
+probe-header values are excluded and unselected fields are not claimed equal.
+Traffic evidence records both the complete gcloud-emitted map and a resolved
+effective serving map. The historical Phase 2B observation was one untagged
+floating `LATEST` target at 100%, bound at that time to
 `cbd-assess-00009-mkz` with digest
 `sha256:6fd949d0e3ab3d4780f927088048009521ab8fb82f03253171e971862c31bcc3`.
+It does not establish current live service state; fresh verification remains
+required.
 An eventual authorized `--no-traffic` deployment may convert that floating
 target to the fixed current revision; the raw maps may therefore differ while
 the effective serving allocation must remain identical and the candidate must
