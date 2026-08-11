@@ -1,996 +1,1047 @@
 # Controlled deployment provenance and rollback runbook
 
-This is an unexecuted future operator procedure. No build, publication,
-deployment, live verification, traffic movement, or rollback described here has
-been performed or rehearsed. Every Cloud, integration, and participant-related
-step requires its own explicit authorization from the project owner.
+This is a future operator procedure. Correcting and testing this document does
+not authorize or claim a build, deployment, live test, traffic change, rollback,
+or participant enrollment. Each numbered Cloud phase requires a fresh, explicit
+authorization bound to its exact account, project, region, service, revisions,
+digests, and intended change.
 
-The phase blocks below are intentionally independent. Run each authorized phase
-in a fresh Bash process. Each block defines its own values and validation logic,
-enables `set -euo pipefail`, and runs inside a subshell. Never assume a later
-phase inherits functions, options, variables, or discovered state from an
-earlier block. Copy non-secret identifiers and digests from the approved release
-record into each new phase. An unresolved `REPLACE_...` value stops that phase.
+The local validator is `scripts/validate_deployment_state.py`. It accepts strict
+JSON on standard input, rejects duplicate object keys and malformed structures,
+and never invokes `gcloud`, reads credentials, contacts a network, or mutates a
+resource. Validation failures are stops; operators must not replace failed
+evidence with manually interpreted YAML, flattened formatter output, approval
+literals, or copied values.
 
-Do not paste several phase blocks into one script. Authorization stop points
-between phases require an operator to review the prior evidence first.
+## 1. Authorization boundaries and fixed identities
 
-## 1. Record the exact clean source
+Record these fields before any separately authorized phase:
 
-Create a new release record, then replace `SOURCE_SHA` with the approved full
-commit SHA. This local phase performs no Cloud operation.
+```text
+ACCOUNT                 exact authorized user account
+PROJECT_ID              exact project
+REGION                  exact Cloud Run and Artifact Registry region
+SERVICE                 exact Cloud Run service
+SOURCE_SHA              approved 40-character commit
+SOURCE_TREE             approved 40-character Git tree
+AR_REPOSITORY           exact Artifact Registry repository
+IMAGE_NAME              exact image package
+CANDIDATE_TAG            unique tag; normally SOURCE_SHA
+CANDIDATE_REVISION       full intended revision name
+CANDIDATE_SUFFIX         suffix that derives CANDIDATE_REVISION
+BASELINE_REVISION        freshly verified fixed known-good revision
+BASELINE_DIGEST          freshly verified immutable baseline digest
+EXPECTED_ORIGIN          exact approved repository URL
+EXPECTED_BRANCH          exact approved release branch
+EXPECTED_ORIGIN_MAIN     exact approved local remote-tracking SHA
+```
+
+Build, candidate deployment, smoke testing, integration testing, every traffic
+movement, rollback, and participant enrollment are independent authorization
+boundaries. Evidence from one phase does not authorize the next.
+
+The current Phase 2B baseline was `cbd-assess-00009-mkz` at
+`sha256:6fd949d0e3ab3d4780f927088048009521ab8fb82f03253171e971862c31bcc3`,
+but a future authorization must freshly verify it rather than trusting this
+historical record.
+
+Every executable Cloud evidence block below uses this strict local binder. It
+adds the already-approved scope to one strict JSON response without interpreting
+or printing it. Duplicate keys, malformed JSON, or a non-object response stop
+the pipeline. The validator then requires the bound scope to equal its command
+arguments.
+
+In this procedure, a `*.raw.json` file preserves the exact standard-output bytes
+emitted by the named local command. For `gcloud --format=json(...)`, those bytes
+are gcloud's field-projected JSON output; they are not transport-level HTTP
+response bytes. For `authorized_curl` with its output option, the file contains the selected
+HTTP response-body bytes while the status is captured separately. Duplicate-key
+detection begins when `bind_scope` or the validator parses those preserved bytes.
+It detects duplicates present at that boundary, but cannot prove that an upstream
+CLI did not already parse, normalize, or discard duplicate keys before emitting
+its JSON. All downstream duplicate detection remains fail-closed.
+
+```bash
+bind_scope() {
+  local payload_key="$1"
+  python3.12 -c '
+import json, sys
+def pairs(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+try:
+    evidence = json.load(sys.stdin, object_pairs_hook=pairs)
+    if not isinstance(evidence, dict):
+        raise ValueError("evidence is not an object")
+    output = {
+        "scope": {"project": sys.argv[2], "region": sys.argv[3], "service": sys.argv[4]},
+        sys.argv[1]: evidence,
+    }
+    print(json.dumps(output, sort_keys=True, separators=(",", ":")))
+except Exception:
+    print("scope binding failed", file=sys.stderr)
+    raise SystemExit(2)
+' "$payload_key" "$PROJECT_ID" "$REGION" "$SERVICE"
+}
+
+emit_bearer_config() {
+  local access_token
+  access_token="$(
+    gcloud auth print-access-token --account="$ACCOUNT" --project="$PROJECT_ID" \
+      | python3.12 -c '
+import re, sys
+token = sys.stdin.read().rstrip("\r\n")
+if not re.fullmatch(r"[A-Za-z0-9._~-]+", token):
+    raise SystemExit(2)
+sys.stdout.write(token)
+'
+  )" || return 1
+  printf '%s\n' 'silent' 'show-error'
+  printf 'header = "Authorization: Bearer %s"\n' "$access_token"
+  unset access_token
+}
+
+authorized_curl() {
+  local curl_config curl_status
+  curl_config="$(emit_bearer_config)" || return 1
+  curl --config <(printf '%s\n' "$curl_config") "$@"
+  curl_status=$?
+  unset curl_config
+  return "$curl_status"
+}
+```
+
+`emit_bearer_config` emits only fixed curl directives plus a locally validated
+token character set. `authorized_curl` completes that validation before it
+invokes curl, passes the transient configuration through a file descriptor, and
+removes its shell variable afterward. URLs and output paths are separate quoted
+curl arguments after validator-backed identifier and path checks; neither can
+become another curl directive. The token is never placed in argv, an environment
+variable, a persistent file, or evidence.
+
+## 2. Local source preflight
+
+This phase is local and performs no Cloud operation.
 
 ```bash
 (
   set -euo pipefail
+  set -o noclobber
   fail() { printf 'source preflight failed: %s\n' "$1" >&2; exit 1; }
-  require_value() {
-    local name="$1" value="${!1-}"
-    [[ -n "$value" && "$value" != REPLACE_* ]] || fail "$name is unresolved"
-  }
 
-  SOURCE_SHA='REPLACE_WITH_FULL_40_CHARACTER_SOURCE_SHA'
-  require_value SOURCE_SHA
-  [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail 'SOURCE_SHA format'
+  SOURCE_SHA='REPLACE_WITH_APPROVED_FULL_SOURCE_SHA'
+  SOURCE_TREE='REPLACE_WITH_APPROVED_FULL_SOURCE_TREE'
+  EXPECTED_ORIGIN='https://github.com/sandyealick-creator/calm-by-design-engine.git'
+  EXPECTED_BRANCH='REPLACE_WITH_APPROVED_RELEASE_BRANCH'
+  EXPECTED_ORIGIN_MAIN='REPLACE_WITH_APPROVED_LOCAL_ORIGIN_MAIN_SHA'
 
-  if ! STATUS_OUTPUT="$(git status --porcelain=v1 --untracked-files=all)"; then
-    fail 'git status command'
-  fi
-  [[ -z "$STATUS_OUTPUT" ]] || fail 'working tree or index is not clean'
-
-  if ! HEAD_SHA="$(git rev-parse HEAD)"; then fail 'HEAD lookup'; fi
-  [[ "$HEAD_SHA" == "$SOURCE_SHA" ]] || fail 'HEAD does not equal SOURCE_SHA'
-  if ! SOURCE_TREE="$(git rev-parse "${SOURCE_SHA}^{tree}")"; then
-    fail 'source tree lookup'
-  fi
+  [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail 'source SHA format'
   [[ "$SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]] || fail 'source tree format'
-
-  git show -s --format='%H %T %s' "$SOURCE_SHA" || fail 'source evidence output'
-  printf 'source_sha=%s\nsource_tree=%s\n' "$SOURCE_SHA" "$SOURCE_TREE"
+  [[ "$(git remote)" == origin ]] || fail 'remote set differs from approval'
+  [[ "$(git remote get-url --all origin | wc -l | tr -d " ")" == 1 ]] \
+    || fail 'origin has multiple URLs'
+  [[ "$(git remote get-url origin)" == "$EXPECTED_ORIGIN" ]] \
+    || fail 'repository origin differs from approval'
+  [[ "$(git branch --show-current)" == "$EXPECTED_BRANCH" ]] \
+    || fail 'release branch differs from approval'
+  [[ "$(git rev-parse refs/remotes/origin/main)" == "$EXPECTED_ORIGIN_MAIN" ]] \
+    || fail 'local origin/main differs from approval; do not fetch here'
+  [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]] || fail 'HEAD differs from source SHA'
+  [[ "$(git rev-parse "${SOURCE_SHA}^{tree}")" == "$SOURCE_TREE" ]] \
+    || fail 'source tree differs from approval'
+  [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] \
+    || fail 'worktree or index is not clean'
+  git show -s --format='%H %T %s' "$SOURCE_SHA"
 )
 ```
 
-Record `SOURCE_SHA`, `SOURCE_TREE`, the subject, and the empty status result.
-Stop if the phase exits nonzero.
+Record the empty status result, SHA, tree, and subject. A floating Cloud Run
+`LATEST` target is not a standalone source-validation or candidate-image-build
+blocker. It is handled before candidate deployment in Sections 6–8.
 
-## 2. Prove the standard traffic precondition
-
-The standard rollout is valid only when exactly one named revision receives
-100% of traffic and no tag or other allocation changes that distribution.
-
-Repository-local evidence does not establish the exact gcloud field schema,
-filtered JSON structure, omission behavior, or representation needed to prove
-that state safely. This checkpoint therefore has no executable initial-traffic
-query. The block below is an intentional unconditional stop, not an invitation
-to enter an approval literal or copy traffic values manually.
+Before the first separately authorized Cloud operation, bind the shell to the
+exact authorization and validate only the local gcloud identity context:
 
 ```bash
 (
   set -euo pipefail
-  fail() { printf 'initial traffic validation blocked: %s\n' "$1" >&2; exit 1; }
-  fail 'verified gcloud traffic schema and machine-parser wiring are unavailable; a reviewed repository correction is required before build or deployment'
+  fail() { printf 'identity preflight failed: %s\n' "$1" >&2; exit 1; }
+
+  AUTHORIZED_ACCOUNT='REPLACE_WITH_EXACT_AUTHORIZED_ACCOUNT'
+  AUTHORIZED_PROJECT='REPLACE_WITH_EXACT_AUTHORIZED_PROJECT'
+  AUTHORIZED_REGION='REPLACE_WITH_EXACT_AUTHORIZED_REGION'
+  AUTHORIZED_SERVICE='REPLACE_WITH_EXACT_AUTHORIZED_SERVICE'
+  ACCOUNT="$AUTHORIZED_ACCOUNT"
+  PROJECT_ID="$AUTHORIZED_PROJECT"
+  REGION="$AUTHORIZED_REGION"
+  SERVICE="$AUTHORIZED_SERVICE"
+
+  ACTIVE_JSON="$(gcloud auth list --filter='status:ACTIVE' \
+    --format='json(account,status)')" || fail 'active-account query'
+  printf '%s' "$ACTIVE_JSON" | python3.12 -c '
+import json, sys
+expected = sys.argv[1]
+def pairs(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            raise ValueError
+        result[key] = value
+    return result
+try:
+    data = json.load(sys.stdin, object_pairs_hook=pairs)
+except Exception:
+    raise SystemExit(2)
+if data != [{"account": expected, "status": "ACTIVE"}]:
+    raise SystemExit(2)
+' "$AUTHORIZED_ACCOUNT" || fail 'active account is not the one authorized account'
+  [[ "$(gcloud config get-value account)" == "$AUTHORIZED_ACCOUNT" ]] \
+    || fail 'selected account mismatch'
+  [[ "$(gcloud config get-value project)" == "$AUTHORIZED_PROJECT" ]] \
+    || fail 'configured project mismatch'
+  [[ "$REGION" == "$AUTHORIZED_REGION" && "$SERVICE" == "$AUTHORIZED_SERVICE" ]] \
+    || fail 'region or service mismatch'
 )
 ```
 
-An authorized tooling review must precede a future repository correction. That
-review must establish a project-, region-, and service-bound query returning
-only the complete traffic allocation in strict JSON. The future parser must
-reject empty, null, scalar, truncated, malformed, duplicate, or unexpected
-structures and fields. It must require exactly one target with one explicit
-`revisionName`, integer `percent` equal to 100, no tag, and no
-`latestRevision` assignment. It must derive `PREVIOUS_REVISION` from that parsed
-target, query that exact revision through a separately verified filtered schema,
-and require one unambiguous immutable `sha256` image digest. The release record
-must bind the exact project, region, service, canonical original allocation,
-derived revision, and digest before any later activity.
+Any empty, plural, malformed, or different identity stops before a resource
+query. Do not correct account or project selection inside a deployment phase.
 
-No `TRAFFIC_PREFLIGHT_STATE`, manually copied revision, approval string, or
-other operator-entered value can enable the present procedure. A split, tagged,
-latest-revision, incomplete, ambiguous, or non-100% original allocation requires
-a separately reviewed preservation-and-restoration plan rather than the standard
-procedure.
+## 3. Strict traffic and baseline evidence
 
-## 3. Secret-reference and runtime-configuration gate
+A separately authorized read-only preflight must capture the complete traffic
+control map as strict JSON, including the exact latest-ready revision:
 
-Before candidate deployment, a separately authorized operator must confirm that
-the existing service has the approved runtime configuration, all required
-Secret Manager references, and `SESSION_SECRET`. Record reference names or
-resource references only, never values or payloads.
+```bash
+gcloud run services describe "$SERVICE" \
+  --account="$ACCOUNT" \
+  --project="$PROJECT_ID" \
+  --region="$REGION" \
+  --format='json(status.latestReadyRevisionName,status.traffic)' \
+  | bind_scope serviceState \
+  | python3.12 scripts/validate_deployment_state.py traffic \
+      --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+      --latest-ready-revision="$BASELINE_REVISION"
+```
 
-Cloud Run field shapes can vary by API surface. This runbook does not invent a
-secret-inspection query. Use only a separately approved, verified field-filtered
-query that exposes reference metadata without plaintext values. After review,
-the release record may contain these non-secret gate literals:
+The validator preserves fixed versus floating target type, revision identity,
+percentage, and tag, while excluding service URLs from its output. It requires a
+nonempty list totaling exactly 100 and rejects duplicate, null, malformed, or
+unexpected targets.
 
-- `SECRET_REFERENCE_GATE=APPROVED_REFERENCE_METADATA_ONLY`
-- `RUNTIME_CONFIGURATION_GATE=APPROVED_EXISTING_SERVICE_CONFIGURATION`
+For the exact baseline revision, obtain only identity, conditions, and digest:
 
-Secret setup, safe reference inspection, and configuration-inheritance
-verification remain deployment blockers until those gates are approved.
+```bash
+gcloud run revisions describe "$BASELINE_REVISION" \
+  --account="$ACCOUNT" \
+  --project="$PROJECT_ID" \
+  --region="$REGION" \
+  --format='json(metadata.name,status.conditions,status.imageDigest)' \
+  | bind_scope revision \
+  | python3.12 scripts/validate_deployment_state.py revision \
+      --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+      --expected-revision="$BASELINE_REVISION" \
+      --expected-digest="$BASELINE_DIGEST"
+```
 
-## 4. Build from an isolated commit-derived context
+Exactly one `Ready=True` condition, the exact name, and the exact immutable
+digest are required. Preserve the validator's command-output and resolved-effective map
+representations in the release record.
 
-This repository has no tracked submodules, symlinks, `.gitmodules`, or
-archive-altering `.gitattributes` at this checkpoint. The validator below reads
-the exact approved Git tree with NUL-delimited output and stops if any of those
-unsupported inputs, any unsupported object mode, or any unsafe path appears.
+## 4. Safe `SESSION_SECRET` and runtime-configuration gate
 
-After separate build authorization, start this phase in a fresh shell and copy
-only approved release-record identifiers. It creates a new temporary directory,
-archives the exact Git object, compares the archive file list with the tracked
-tree, and submits the isolated context instead of the live worktree.
+The real `SESSION_SECRET` reference remains unresolved. Repeating its query
+requires separate authorization. Use the Cloud Run v2 `services.get` endpoint
+with this partial-response selector only:
+
+```text
+template/containers/env/name,
+template/containers/env/valueSource/secretKeyRef/secret,
+template/containers/env/valueSource/secretKeyRef/version
+```
+
+Do not request `template/containers/env/value`. The future request must stream
+the access token directly to the request mechanism and preserve the filtered HTTP
+response-body bytes only in a unique, validator-approved evidence file before strict
+validation. The token itself is never written:
 
 ```bash
 (
   set -euo pipefail
-  fail() { printf 'build phase failed: %s\n' "$1" >&2; exit 1; }
-  require_value() {
-    local name="$1" value="${!1-}"
-    [[ -n "$value" && "$value" != REPLACE_* ]] || fail "$name is unresolved"
-  }
-  require_component() {
-    local name="$1" value="${!1-}"
-    require_value "$name"
-    [[ "$value" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || fail "$name format"
-  }
+  set -o noclobber
+  fail() { printf 'session reference gate failed: %s\n' "$1" >&2; exit 1; }
+  : "${EVIDENCE_ROOT:?preapproved evidence directory is required}"
+  : "${SOURCE_SHA:?approved source SHA is required}"
+  SESSION_RAW="$EVIDENCE_ROOT/${SOURCE_SHA}-session-reference.raw.json"
+  SESSION_REFERENCE_RESULT_FILE="$EVIDENCE_ROOT/${SOURCE_SHA}-session-reference.result.json"
+  python3.12 scripts/validate_deployment_state.py evidence-path \
+    --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    --evidence-root="$EVIDENCE_ROOT" --output-file="$SESSION_RAW" \
+    --output-file="$SESSION_REFERENCE_RESULT_FILE" >/dev/null \
+    || fail 'unsafe or preexisting evidence path'
+  SESSION_URL="https://run.googleapis.com/v2/projects/${PROJECT_ID}/locations/${REGION}/services/${SERVICE}?fields=template%2Fcontainers%2Fenv%2Fname%2Ctemplate%2Fcontainers%2Fenv%2FvalueSource%2FsecretKeyRef%2Fsecret%2Ctemplate%2Fcontainers%2Fenv%2FvalueSource%2FsecretKeyRef%2Fversion"
+  authorized_curl --fail --url "$SESSION_URL" \
+    > "$SESSION_RAW" || fail 'exact session reference request'
+  bind_scope serviceConfig < "$SESSION_RAW" \
+    | python3.12 scripts/validate_deployment_state.py session-secret \
+        --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    > "$SESSION_REFERENCE_RESULT_FILE" || fail 'session reference validation'
+)
+```
 
+The validator emits only the `SESSION_SECRET` name, referenced secret metadata,
+and version selector. It rejects missing or duplicate entries, incomplete
+references, nulls, malformed response shapes, and any supplied plaintext
+`value` field. It never emits unrelated environment-variable names.
+
+The reference validator accepts only a secret ID or full Secret Manager resource
+and an exact positive numeric version. It rejects `latest`, aliases, whitespace,
+control characters, URLs, assignments, and value-like strings. Save its
+allowlisted result only in a preapproved metadata evidence directory. Then a
+separately authorized phase may run this exact metadata-only construction. It
+does not list secrets or versions and never accesses a payload:
+
+```bash
+(
+  set -euo pipefail
+  set -o noclobber
+  fail() { printf 'secret metadata gate failed: %s\n' "$1" >&2; exit 1; }
+  : "${EVIDENCE_ROOT:?preapproved evidence directory is required}"
+  : "${SESSION_REFERENCE_RESULT_FILE:?validated reference result is required}"
+  python3.12 scripts/validate_deployment_state.py evidence-path \
+    --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    --evidence-root="$EVIDENCE_ROOT" \
+    --input-file="$SESSION_REFERENCE_RESULT_FILE" >/dev/null \
+    || fail 'unsafe evidence directory or reference file'
+
+  read -r SECRET_REFERENCE SECRET_VERSION < <(python3.12 -c '
+import json, sys
+def pairs(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            raise ValueError
+        result[key] = value
+    return result
+data = json.load(open(sys.argv[1], encoding="utf-8"), object_pairs_hook=pairs)
+if set(data) != {"classification", "name", "scope", "secret", "version"} \
+        or data.get("classification") != "VALID_SECRET_MANAGER_REFERENCE":
+    raise SystemExit(2)
+print(data["secret"], data["version"])
+' "$SESSION_REFERENCE_RESULT_FILE") || fail 'strict reference result parsing'
+
+  case "$SECRET_REFERENCE" in
+    projects/*) SECRET_RESOURCE="$SECRET_REFERENCE" ;;
+    *) SECRET_RESOURCE="projects/${PROJECT_ID}/secrets/${SECRET_REFERENCE}" ;;
+  esac
+  SECRET_URL="https://secretmanager.googleapis.com/v1/${SECRET_RESOURCE}?fields=name"
+  VERSION_RESOURCE="${SECRET_RESOURCE}/versions/${SECRET_VERSION}"
+  VERSION_URL="https://secretmanager.googleapis.com/v1/${VERSION_RESOURCE}?fields=name%2Cstate"
+  SECRET_BODY="$EVIDENCE_ROOT/secret-metadata-body.json"
+  VERSION_BODY="$EVIDENCE_ROOT/secret-version-body.json"
+  python3.12 scripts/validate_deployment_state.py evidence-path \
+    --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    --evidence-root="$EVIDENCE_ROOT" --output-file="$SECRET_BODY" \
+    --output-file="$VERSION_BODY" >/dev/null \
+    || fail 'unsafe or preexisting metadata evidence path'
+
+  SECRET_STATUS="$(authorized_curl --url "$SECRET_URL" \
+    --output "$SECRET_BODY" --write-out '%{http_code}')" \
+    || fail 'exact secret metadata request'
+
+  if [[ "$SECRET_STATUS" == 200 ]]; then
+    VERSION_STATUS="$(authorized_curl --url "$VERSION_URL" \
+      --output "$VERSION_BODY" --write-out '%{http_code}')" \
+      || fail 'exact version metadata request'
+  elif [[ "$SECRET_STATUS" == 404 ]]; then
+    VERSION_STATUS=SKIPPED
+  else
+    fail 'secret query was neither exact success nor exact not-found'
+  fi
+
+  SECRET_ARGS=(
+    secret-version --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE"
+    --expected-secret="$SECRET_REFERENCE" --expected-version="$SECRET_VERSION"
+    --evidence-root="$EVIDENCE_ROOT" --secret-status="$SECRET_STATUS"
+    --version-status="$VERSION_STATUS" --secret-evidence-file="$SECRET_BODY"
+  )
+  if [[ "$VERSION_STATUS" != SKIPPED ]]; then
+    SECRET_ARGS+=(--version-evidence-file="$VERSION_BODY")
+  fi
+  python3.12 scripts/validate_deployment_state.py "${SECRET_ARGS[@]}"
+)
+```
+
+Require `EXISTING_ENABLED`. Missing, disabled, destroyed, malformed,
+permission-denied, ambiguous, or nonnumeric-version evidence stops deployment.
+
+Before deployment, capture and approve only safe configuration metadata:
+
+- environment-variable names and Secret Manager references, never plaintext
+  values;
+- runtime service account;
+- CPU, memory, concurrency, and timeout;
+- revision and service scaling;
+- ingress and authentication policy;
+- execution environment and networking;
+- probes, ports, volumes, mounts, and other material template settings.
+
+Installed gcloud implementation shows that omitted material flags do not create
+corresponding configuration changes on an existing service. The candidate
+command in Section 7 therefore inherits the existing service template except
+for image and revision identity. That claim does not replace comparison. Before
+and after deployment, run the same exact partial-response query below. It
+excludes container image, revision identity, plaintext environment values,
+service URLs, and payloads while retaining the approved runtime controls:
+
+```bash
+capture_runtime_snapshot() {
+  local destination="$1"
+  local runtime_url
+  python3.12 scripts/validate_deployment_state.py evidence-path \
+    --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    --evidence-root="$EVIDENCE_ROOT" --output-file="$destination" >/dev/null \
+    || return 1
+  runtime_url="https://run.googleapis.com/v2/projects/${PROJECT_ID}/locations/${REGION}/services/${SERVICE}?fields=name%2Cingress%2CinvokerIamDisabled%2CiapEnabled%2Ctemplate%2FserviceAccount%2Ctemplate%2FmaxInstanceRequestConcurrency%2Ctemplate%2Ftimeout%2Ctemplate%2FexecutionEnvironment%2Ctemplate%2Fscaling%2Ctemplate%2FvpcAccess%2Ctemplate%2Fcontainers%2Fname%2Ctemplate%2Fcontainers%2Fenv%2Fname%2Ctemplate%2Fcontainers%2Fenv%2FvalueSource%2FsecretKeyRef%2Fsecret%2Ctemplate%2Fcontainers%2Fenv%2FvalueSource%2FsecretKeyRef%2Fversion%2Ctemplate%2Fcontainers%2Fresources%2Ctemplate%2Fcontainers%2Fports%2Ctemplate%2Fcontainers%2FstartupProbe%2Ctemplate%2Fcontainers%2FlivenessProbe%2Ctemplate%2Fcontainers%2FvolumeMounts%2Ctemplate%2Fvolumes"
+  authorized_curl --fail --url "$runtime_url" \
+    > "$destination" || return 1
+  bind_scope serviceConfig < "$destination" \
+    | python3.12 scripts/validate_deployment_state.py runtime-snapshot \
+        --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    >/dev/null
+}
+
+```
+
+Section 7 invokes this function once immediately before and once immediately
+after deployment, then passes both strictly parsed HTTP response bodies to `runtime-equal`.
+Require `RUNTIME_UNCHANGED`. Any missing field, plaintext `value`, unknown key,
+wrong service identity, malformed projection, or hash difference stops. The
+comparator revalidates both complete raw files; their retention or deletion
+follows the separately approved evidence policy.
+
+## 5. Separately authorized immutable candidate build
+
+Historical Container Analysis provenance and SLSA level may remain unavailable.
+Do not enable Container Analysis. Capture new candidate evidence directly.
+
+Before building, execute the exact tag-resource GET below. It requests only the
+resource name. The validator accepts only a structurally exact HTTP 404 with API
+status `NOT_FOUND`; HTTP 200 is a collision, 401/403 is permission denial, and
+every malformed, empty, plural, or other result stops. It never lists tags.
+
+```bash
+(
+  set -euo pipefail
+  set -o noclobber
+  fail() { printf 'candidate build failed: %s\n' "$1" >&2; exit 1; }
+
+  SOURCE_SHA='REPLACE_WITH_APPROVED_SOURCE_SHA'
+  SOURCE_TREE='REPLACE_WITH_APPROVED_SOURCE_TREE'
+  ACCOUNT='REPLACE_WITH_AUTHORIZED_ACCOUNT'
   PROJECT_ID='REPLACE_WITH_PROJECT_ID'
   REGION='REPLACE_WITH_REGION'
-  AR_REPOSITORY='REPLACE_WITH_ARTIFACT_REGISTRY_REPOSITORY'
+  SERVICE='REPLACE_WITH_SERVICE'
+  AR_REPOSITORY='REPLACE_WITH_REPOSITORY'
   IMAGE_NAME='REPLACE_WITH_IMAGE_NAME'
-  SOURCE_SHA='REPLACE_WITH_RECORDED_SOURCE_SHA'
-  SOURCE_TREE='REPLACE_WITH_RECORDED_SOURCE_TREE'
-  TRAFFIC_PREFLIGHT_STATE='REPLACE_WITH_APPROVED_PREFLIGHT_STATE'
-  PREVIOUS_REVISION='REPLACE_WITH_RECORDED_PREVIOUS_REVISION'
-  PREVIOUS_IMAGE_DIGEST='REPLACE_WITH_RECORDED_PREVIOUS_IMAGE_DIGEST'
-  PYTHON_BIN='python3.12'
-  CANDIDATE_IMAGE_DIGEST=''
+  CANDIDATE_TAG="$SOURCE_SHA"
+  IMAGE_URI="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPOSITORY}/${IMAGE_NAME}"
+  CANDIDATE_IMAGE_TAG="${IMAGE_URI}:${CANDIDATE_TAG}"
+  TAG_RESOURCE="projects/${PROJECT_ID}/locations/${REGION}/repositories/${AR_REPOSITORY}/packages/${IMAGE_NAME}/tags/${CANDIDATE_TAG}"
+  : "${EVIDENCE_ROOT:?preapproved evidence directory is required}"
+  declare -F bind_scope >/dev/null || fail 'bind_scope is not loaded'
 
-  for name in PROJECT_ID REGION AR_REPOSITORY IMAGE_NAME SOURCE_SHA SOURCE_TREE \
-    TRAFFIC_PREFLIGHT_STATE PREVIOUS_REVISION PREVIOUS_IMAGE_DIGEST; do
-    require_value "$name"
-  done
-  for name in PROJECT_ID REGION AR_REPOSITORY IMAGE_NAME; do
-    require_component "$name"
-  done
-  [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail 'SOURCE_SHA format'
-  [[ "$SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]] || fail 'SOURCE_TREE format'
-  [[ "$PREVIOUS_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
-    || fail 'PREVIOUS_IMAGE_DIGEST format'
-  [[ "$TRAFFIC_PREFLIGHT_STATE" == ONE_REVISION_AT_100_NO_TAGS ]] \
-    || fail 'standard traffic precondition'
+  [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]] || fail 'HEAD mismatch'
+  [[ "$(git rev-parse "${SOURCE_SHA}^{tree}")" == "$SOURCE_TREE" ]] \
+    || fail 'tree mismatch'
+  [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] \
+    || fail 'worktree or index is not clean'
 
-  if ! STATUS_OUTPUT="$(git status --porcelain=v1 --untracked-files=all)"; then
-    fail 'git status command'
-  fi
-  [[ -z "$STATUS_OUTPUT" ]] || fail 'working tree or index is not clean'
-  if ! HEAD_SHA="$(git rev-parse HEAD)"; then fail 'HEAD lookup'; fi
-  [[ "$HEAD_SHA" == "$SOURCE_SHA" ]] || fail 'HEAD does not equal SOURCE_SHA'
-  if ! CURRENT_TREE="$(git rev-parse "${SOURCE_SHA}^{tree}")"; then
-    fail 'tree lookup'
-  fi
-  [[ "$CURRENT_TREE" == "$SOURCE_TREE" ]] || fail 'recorded tree mismatch'
-  command -v "$PYTHON_BIN" >/dev/null 2>&1 || fail 'python3.12 is unavailable'
-
-  fail 'BLOCKED: machine-validated initial traffic evidence is unavailable; a reviewed repository correction is required before build'
+  TAG_COLLISION_BODY="$EVIDENCE_ROOT/candidate-tag-preflight.json"
+  python3.12 scripts/validate_deployment_state.py evidence-path \
+    --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    --evidence-root="$EVIDENCE_ROOT" --output-file="$TAG_COLLISION_BODY" \
+    --expected-image-tag="$CANDIDATE_IMAGE_TAG" >/dev/null \
+    || fail 'unsafe build identity or candidate-tag evidence path'
+  TAG_URL="https://artifactregistry.googleapis.com/v1/${TAG_RESOURCE}?fields=name"
+  TAG_STATUS="$(authorized_curl --url "$TAG_URL" \
+    --output "$TAG_COLLISION_BODY" --write-out '%{http_code}')" \
+    || fail 'candidate tag GET failed'
+  python3.12 scripts/validate_deployment_state.py nonexistence \
+      --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+      --kind=CANDIDATE_TAG --expected-resource="$TAG_RESOURCE" \
+      --http-status="$TAG_STATUS" < "$TAG_COLLISION_BODY"
 
   TMP_BASE="${TMPDIR:-/tmp}"
   [[ "$TMP_BASE" == /* && "$TMP_BASE" != / && -d "$TMP_BASE" && -w "$TMP_BASE" ]] \
     || fail 'temporary base is unsafe'
-  BUILD_ROOT=''
-  if ! BUILD_ROOT="$(mktemp -d \
-    "${TMP_BASE%/}/cbd-build.${SOURCE_SHA}.XXXXXXXX")"; then
-    fail 'temporary directory creation'
-  fi
-  [[ -n "$BUILD_ROOT" && -d "$BUILD_ROOT" ]] || fail 'temporary directory missing'
-  case "$BUILD_ROOT" in
-    "${TMP_BASE%/}/cbd-build.${SOURCE_SHA}."*) ;;
-    *) fail 'temporary directory path is unexpected' ;;
-  esac
+  BUILD_ROOT="$(mktemp -d "${TMP_BASE%/}/cbd-build.${SOURCE_SHA}.XXXXXXXX")" \
+    || fail 'temporary context creation'
+  [[ "$BUILD_ROOT" == "${TMP_BASE%/}/cbd-build.${SOURCE_SHA}."* \
+    && -d "$BUILD_ROOT" ]] || fail 'temporary context path'
+  mkdir -- "$BUILD_ROOT/context" || fail 'context directory creation'
+  git archive --format=tar --output="$BUILD_ROOT/source.tar" "$SOURCE_SHA"
+  [[ "$(git get-tar-commit-id < "$BUILD_ROOT/source.tar")" == "$SOURCE_SHA" ]] \
+    || fail 'archive commit mismatch'
 
-  ARCHIVE_PATH="${BUILD_ROOT}/source.tar"
-  BUILD_CONTEXT="${BUILD_ROOT}/context"
-  mkdir -- "$BUILD_CONTEXT" || fail 'context directory creation'
-
-  git archive --format=tar --output="$ARCHIVE_PATH" "$SOURCE_SHA" \
-    || fail 'git archive creation'
-  if ! ARCHIVED_COMMIT="$(git get-tar-commit-id < "$ARCHIVE_PATH")"; then
-    fail 'archive commit identification'
-  fi
-  [[ "$ARCHIVED_COMMIT" == "$SOURCE_SHA" ]] || fail 'archive commit mismatch'
-
-  if ! "$PYTHON_BIN" - "$SOURCE_SHA" "$ARCHIVE_PATH" "$BUILD_CONTEXT" <<'PY'
-import os
-import re
-import subprocess
-import sys
-import tarfile
+  python3.12 - "$SOURCE_SHA" "$BUILD_ROOT/source.tar" "$BUILD_ROOT/context" <<'PY' \
+    || fail 'exact tree/archive validation'
+import fnmatch, os, re, subprocess, sys, tarfile
 from pathlib import Path, PurePosixPath
 
-
-def stop(message: str) -> None:
-    raise SystemExit(f"tree/archive validation failed: {message}")
-
-
-source_sha, archive_name, context_name = sys.argv[1:]
-if not re.fullmatch(r"[0-9a-f]{40}", source_sha):
-    stop("source SHA")
-
-context = Path(context_name)
-if not context.is_absolute() or not context.is_dir() or any(context.iterdir()):
-    stop("context must be a new empty absolute directory")
-
-try:
-    result = subprocess.run(
-        ["git", "ls-tree", "-rz", source_sha],
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-except subprocess.CalledProcessError:
-    stop("exact-tree query")
-
-records = result.stdout.split(b"\0")
+source_sha, archive_path, context_path = sys.argv[1:]
+context = Path(context_path)
+def stop():
+    raise SystemExit(2)
+if not re.fullmatch(r"[0-9a-f]{40}", source_sha) or not context.is_absolute() \
+        or not context.is_dir() or any(context.iterdir()):
+    stop()
+tree = subprocess.run(
+    ["git", "ls-tree", "-rz", "--full-tree", source_sha],
+    check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+).stdout
+records = tree.split(b"\0")
 if not records or records[-1] != b"":
-    stop("tree output is not NUL terminated")
+    stop()
 records.pop()
-if not records:
-    stop("approved tree is empty")
-
-tracked: dict[str, tuple[str, str]] = {}
-tracked_bytes: set[bytes] = set()
+tracked = {}
+sensitive = (
+    ".env", "*.env", "env.yaml", "*credentials*.json", "service-account*.json",
+    "*-key.json", "*.pem", "*.p12", "*.log", "*_export.csv", "*_export.json",
+    "logs/*", "participant_data/*", "scratch/*", "tmp/*",
+)
 for record in records:
     try:
         header, raw_path = record.split(b"\t", 1)
-        mode_raw, type_raw, oid_raw = header.split(b" ", 2)
-    except ValueError:
-        stop("malformed tree record")
-    if not raw_path or raw_path in tracked_bytes:
-        stop("empty or duplicate tree path")
-    tracked_bytes.add(raw_path)
-    try:
-        mode = mode_raw.decode("ascii")
-        object_type = type_raw.decode("ascii")
-        oid = oid_raw.decode("ascii")
+        mode, kind, oid = (part.decode("ascii") for part in header.split(b" ", 2))
         path = raw_path.decode("utf-8", "strict")
-    except UnicodeDecodeError:
-        stop("unsupported tree encoding")
-    if object_type != "blob" or mode not in {"100644", "100755"}:
-        stop("unsupported object type or mode")
-    if not re.fullmatch(r"[0-9a-f]{40}", oid):
-        stop("malformed blob identity")
-    if "\n" in path or "\r" in path or any(ord(char) < 32 or ord(char) == 127 for char in path):
-        stop("unsupported control character in tree path")
-    if path.startswith("/") or path.endswith("/") or "//" in path:
-        stop("absolute or malformed tree path")
+    except Exception:
+        stop()
     parts = path.split("/")
-    if any(part in {"", ".", ".."} for part in parts):
-        stop("tree traversal component")
-    if PurePosixPath(path).as_posix() != path:
-        stop("tree path normalization changed")
-    if parts[-1] in {".gitmodules", ".gitattributes"}:
-        stop("unsupported Git metadata input")
+    if kind != "blob" or mode not in {"100644", "100755"} \
+            or not re.fullmatch(r"[0-9a-f]{40}", oid) or path in tracked \
+            or path.startswith("/") or path.endswith("/") or "//" in path \
+            or any(part in {"", ".", ".."} for part in parts) \
+            or PurePosixPath(path).as_posix() != path \
+            or any(ord(char) < 32 or ord(char) == 127 for char in path) \
+            or parts[-1] in {".gitmodules", ".gitattributes"} \
+            or any(fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(parts[-1], pattern)
+                   for pattern in sensitive):
+        stop()
     tracked[path] = (mode, oid)
-
-required = {"Dockerfile", "requirements.txt"}
-if not required.issubset(tracked):
-    stop("required build input is absent from approved tree")
-
-expected_directories: set[str] = set()
-for path in tracked:
-    parts = path.split("/")
-    for index in range(1, len(parts)):
-        expected_directories.add("/".join(parts[:index]))
-
-archive_files: dict[str, tarfile.TarInfo] = {}
-archive_directories: set[str] = set()
-seen_members: set[str] = set()
-try:
-    archive = tarfile.open(archive_name, mode="r:")
-except (OSError, tarfile.TarError):
-    stop("archive open")
-
-with archive:
+if not {"Dockerfile", "requirements.txt"}.issubset(tracked):
+    stop()
+directories = {
+    "/".join(path.split("/")[:index])
+    for path in tracked for index in range(1, len(path.split("/")))
+}
+with tarfile.open(archive_path, "r:") as archive:
+    files, archive_directories = {}, set()
     for member in archive.getmembers():
-        raw_name = member.name
-        name = raw_name[:-1] if member.isdir() and raw_name.endswith("/") else raw_name
-        if not name or name in seen_members:
-            stop("empty or duplicate archive member")
-        seen_members.add(name)
-        if "\n" in name or "\r" in name or any(ord(char) < 32 or ord(char) == 127 for char in name):
-            stop("unsupported control character in archive path")
-        if name.startswith("/") or name.endswith("/") or "//" in name:
-            stop("absolute or malformed archive path")
-        parts = name.split("/")
-        if any(part in {"", ".", ".."} for part in parts):
-            stop("archive traversal component")
-        if PurePosixPath(name).as_posix() != name:
-            stop("archive path normalization changed")
-        if member.isdir():
-            if name not in expected_directories:
-                stop("unexpected archive directory")
+        name = member.name[:-1] if member.isdir() and member.name.endswith("/") else member.name
+        if member.isdir() and name in directories:
             archive_directories.add(name)
-        elif member.isfile():
-            if name not in tracked:
-                stop("unexpected archive file")
-            archive_files[name] = member
+        elif member.isfile() and name in tracked and name not in files:
+            files[name] = member
         else:
-            stop("symlink, hard link, device, FIFO, or unsupported archive member")
-
-    if set(archive_files) != set(tracked):
-        stop("archive file manifest differs from approved tree")
-    if archive_directories != expected_directories:
-        stop("archive directory manifest differs from approved tree")
-
+            stop()
+    if set(files) != set(tracked) or archive_directories != directories:
+        stop()
     for path, (mode, oid) in tracked.items():
-        member = archive_files[path]
-        expected_executable = mode == "100755"
-        archive_executable = bool(member.mode & 0o111)
-        if archive_executable != expected_executable or member.mode & 0o7000:
-            stop("archive executable mode differs from approved tree")
-        extracted = archive.extractfile(member)
-        if extracted is None:
-            stop("archive file cannot be read")
-        archive_content = extracted.read()
-        try:
-            blob = subprocess.run(
-                ["git", "cat-file", "blob", oid],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            ).stdout
-        except subprocess.CalledProcessError:
-            stop("approved blob lookup")
-        if archive_content != blob:
-            stop("archive content differs from approved blob")
-
-    for directory in sorted(expected_directories, key=lambda value: (value.count("/"), value)):
-        (context / directory).mkdir(exist_ok=False)
-    for path, (mode, _oid) in tracked.items():
-        destination = context.joinpath(*path.split("/"))
-        member = archive_files[path]
+        member = files[path]
+        if bool(member.mode & 0o111) != (mode == "100755") or member.mode & 0o7000:
+            stop()
         source = archive.extractfile(member)
+        blob = subprocess.run(
+            ["git", "cat-file", "blob", oid], check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        ).stdout
+        if source is None or source.read() != blob:
+            stop()
+    for directory in sorted(directories, key=lambda item: (item.count("/"), item)):
+        (context / directory).mkdir()
+    for path, (mode, _oid) in tracked.items():
+        source = archive.extractfile(files[path])
         if source is None:
-            stop("validated archive file cannot be reopened")
+            stop()
+        destination = context.joinpath(*path.split("/"))
         with destination.open("xb") as output:
-            while True:
-                chunk = source.read(1024 * 1024)
-                if not chunk:
-                    break
-                output.write(chunk)
+            output.write(source.read())
         os.chmod(destination, 0o755 if mode == "100755" else 0o644)
-
 print(f"validated_tree_files={len(tracked)}")
 PY
-  then
-    fail 'exact-tree, archive, or extraction validation'
-  fi
 
-  [[ -f "${BUILD_CONTEXT}/Dockerfile" ]] || fail 'Dockerfile missing from context'
-  [[ -f "${BUILD_CONTEXT}/requirements.txt" ]] \
-    || fail 'production lock missing from context'
-
-  if ! SENSITIVE_PATH="$(cd "$BUILD_CONTEXT" && find . \
-    \( -name '.env' -o -name '*.env' -o -name 'env.yaml' \
-       -o -name '*credentials*.json' -o -name 'service-account*.json' \
-       -o -name '*-key.json' -o -name '*.pem' -o -name '*.p12' \
-       -o -name '*.log' -o -name '*_export.csv' -o -name '*_export.json' \
-       -o -path './logs' -o -path './logs/*' \
-       -o -path './participant_data' -o -path './participant_data/*' \
-       -o -path './scratch' -o -path './scratch/*' \
-       -o -path './tmp' -o -path './tmp/*' \) -print -quit)"; then
-    fail 'isolated-context sensitive-path scan'
-  fi
-  [[ -z "$SENSITIVE_PATH" ]] || fail 'sensitive path exists in approved commit'
-
-  IMAGE_URI="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPOSITORY}/${IMAGE_NAME}"
-  if ! gcloud builds submit "$BUILD_CONTEXT" \
+  BUILD_SUBMISSION_RAW="$EVIDENCE_ROOT/${SOURCE_SHA}-build-submission.raw.json"
+  python3.12 scripts/validate_deployment_state.py evidence-path \
+    --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    --evidence-root="$EVIDENCE_ROOT" --output-file="$BUILD_SUBMISSION_RAW" \
+    --expected-image-tag="$CANDIDATE_IMAGE_TAG" >/dev/null \
+    || fail 'unsafe or preexisting build-submission evidence path'
+  gcloud builds submit "$BUILD_ROOT/context" \
+    --account="$ACCOUNT" \
     --project="$PROJECT_ID" \
     --region="$REGION" \
-    --tag="${IMAGE_URI}:${SOURCE_SHA}"; then
-    fail 'authorized build did not succeed'
-  fi
+    --tag="$CANDIDATE_IMAGE_TAG" \
+    --substitutions="_SOURCE_SHA=${SOURCE_SHA},_SOURCE_TREE=${SOURCE_TREE},_CANDIDATE_IMAGE=${CANDIDATE_IMAGE_TAG}" \
+    --async \
+    --format='json(id)' > "$BUILD_SUBMISSION_RAW" || fail 'build submission'
+  BUILD_ID="$(bind_scope buildSubmission < "$BUILD_SUBMISSION_RAW" \
+    | python3.12 scripts/validate_deployment_state.py build-submission \
+        --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+        --output=build-id)" || fail 'strict build identifier capture'
 
-  CANDIDATE_IMAGE_DIGEST=''
-  if ! CANDIDATE_IMAGE_DIGEST="$(gcloud artifacts docker images describe \
-    "${IMAGE_URI}:${SOURCE_SHA}" \
-    --project="$PROJECT_ID" \
-    --format='value(image_summary.digest)')"; then
-    fail 'candidate digest lookup'
-  fi
-  [[ "$CANDIDATE_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
-    || fail 'CANDIDATE_IMAGE_DIGEST format'
-  CANDIDATE_IMAGE_REF="${IMAGE_URI}@${CANDIDATE_IMAGE_DIGEST}"
-
-  printf 'build_context=%s\nsource_sha=%s\nsource_tree=%s\ncandidate_image=%s\n' \
-    "$BUILD_CONTEXT" "$SOURCE_SHA" "$SOURCE_TREE" "$CANDIDATE_IMAGE_REF"
-)
-```
-
-Record the build identifier, success status, exact command, isolated context
-path, source SHA/tree, and immutable image reference. The temporary directory is
-newly created and intentionally has no automatic deletion command; removal must
-be a separately reviewed operation against the exact recorded path.
-
-The isolated context contains only files tracked by the approved commit, so
-ignored and untracked local files are excluded by construction. The committed
-`.gcloudignore` may further filter tracked files during upload. Exact gcloud
-upload-manifest behavior remains an authorized tooling-verification item; this
-procedure does not claim it was live-verified. No build has been performed.
-
-## 5. Validate the candidate name and deploy by digest with zero traffic
-
-`CANDIDATE_REVISION` is the intended full Cloud Run revision name. The deploy
-flag receives only the derived suffix. This fresh phase requires a conservative
-locally documented name form: lowercase letters, digits, and hyphens; a
-lowercase-letter start; no trailing hyphen; and a full name of at most 63
-characters. Authorized tooling must confirm these constraints before execution.
-After that review, record
-`REVISION_NAMING_GATE=APPROVED_CLOUD_RUN_NAMING_CONSTRAINTS`.
-
-Repository-local evidence does not establish a trustworthy gcloud service-scoped
-filter, output schema, or zero-result representation for revision collision
-checking. Do not guess one. Before this phase, a separately authorized tooling
-verification must establish and record an exact field-filtered query that is
-bound to project, region, service, and the full candidate revision. It must
-distinguish command failure from a successful zero-match result and reject
-partial, malformed, duplicate, unrelated, or ambiguous records. A regional list
-or the presence of the previous revision is not evidence of candidate absence.
-
-Only a successful, machine-parsed, service-bound zero-match result may
-eventually permit deployment. The verified procedure must distinguish command
-failure, one exact match, and successful validated zero matches, and must reject
-multiple, duplicate, malformed, unrelated, partial, ambiguous, or unexpected
-records. Its evidence must bind the exact project, region, service, and full
-`CANDIDATE_REVISION`.
-
-That tooling verification has not occurred. The deployment block therefore
-terminates unconditionally immediately before construction of the image URI and
-the `gcloud run deploy` command. Approval strings, copied scope values, manually
-asserted counts, prose confirmation, or replacement placeholders cannot bypass
-the stop. Enabling collision clearance requires a separately reviewed repository
-correction; operators must not invent replacement values in this runbook.
-
-```bash
-(
-  set -euo pipefail
-  fail() { printf 'candidate deployment failed: %s\n' "$1" >&2; exit 1; }
-  require_value() {
-    local name="$1" value="${!1-}"
-    [[ -n "$value" && "$value" != REPLACE_* ]] || fail "$name is unresolved"
-  }
-
-  PROJECT_ID='REPLACE_WITH_PROJECT_ID'
-  REGION='REPLACE_WITH_REGION'
-  SERVICE='REPLACE_WITH_SERVICE'
-  AR_REPOSITORY='REPLACE_WITH_ARTIFACT_REGISTRY_REPOSITORY'
-  IMAGE_NAME='REPLACE_WITH_IMAGE_NAME'
-  SOURCE_SHA='REPLACE_WITH_RECORDED_SOURCE_SHA'
-  CANDIDATE_REVISION='REPLACE_WITH_INTENDED_FULL_REVISION_NAME'
-  CANDIDATE_IMAGE_DIGEST='REPLACE_WITH_RECORDED_CANDIDATE_IMAGE_DIGEST'
-  PREVIOUS_REVISION='REPLACE_WITH_RECORDED_PREVIOUS_REVISION'
-  PREVIOUS_IMAGE_DIGEST='REPLACE_WITH_RECORDED_PREVIOUS_IMAGE_DIGEST'
-  TRAFFIC_PREFLIGHT_STATE='REPLACE_WITH_APPROVED_PREFLIGHT_STATE'
-  SECRET_REFERENCE_GATE='REPLACE_WITH_APPROVED_SECRET_REFERENCE_GATE'
-  RUNTIME_CONFIGURATION_GATE='REPLACE_WITH_APPROVED_RUNTIME_CONFIG_GATE'
-  REVISION_NAMING_GATE='REPLACE_WITH_APPROVED_NAMING_CONSTRAINT_GATE'
-
-  for name in PROJECT_ID REGION SERVICE AR_REPOSITORY IMAGE_NAME SOURCE_SHA \
-    CANDIDATE_REVISION CANDIDATE_IMAGE_DIGEST PREVIOUS_REVISION \
-    PREVIOUS_IMAGE_DIGEST TRAFFIC_PREFLIGHT_STATE SECRET_REFERENCE_GATE \
-    RUNTIME_CONFIGURATION_GATE REVISION_NAMING_GATE; do
-    require_value "$name"
+  BUILD_COMPLETE=false
+  BUILD_SUCCESS_RAW_FILE=''
+  for ((poll=1; poll<=90; poll++)); do
+    BUILD_POLL_RAW="$EVIDENCE_ROOT/${BUILD_ID}-poll-${poll}.raw.json"
+    python3.12 scripts/validate_deployment_state.py evidence-path \
+      --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+      --evidence-root="$EVIDENCE_ROOT" --output-file="$BUILD_POLL_RAW" \
+      --expected-image-tag="$CANDIDATE_IMAGE_TAG" >/dev/null \
+      || fail 'unsafe or preexisting build-poll evidence path'
+    set +e
+    gcloud builds describe "$BUILD_ID" \
+      --account="$ACCOUNT" --project="$PROJECT_ID" --region="$REGION" \
+      --format='json(name,id,projectId,status,images,substitutions,createTime,startTime,finishTime,results.images)' \
+      > "$BUILD_POLL_RAW"
+    describe_rc=$?
+    if [[ "$describe_rc" == 0 ]]; then
+      python3.12 scripts/validate_deployment_state.py build --raw \
+          --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+          --expected-build-id="$BUILD_ID" --expected-source-sha="$SOURCE_SHA" \
+          --expected-source-tree="$SOURCE_TREE" \
+          --expected-image-tag="$CANDIDATE_IMAGE_TAG" \
+          < "$BUILD_POLL_RAW" >/dev/null
+      build_rc=$?
+    else
+      build_rc=2
+    fi
+    set -e
+    case "$build_rc" in
+      0) BUILD_COMPLETE=true; BUILD_SUCCESS_RAW_FILE="$BUILD_POLL_RAW"; break ;;
+      3) sleep 10 ;;
+      *) fail 'build failed, was malformed, or reached a non-success state' ;;
+    esac
   done
-  [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail 'SOURCE_SHA format'
-  [[ "$CANDIDATE_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
-    || fail 'CANDIDATE_IMAGE_DIGEST format'
-  [[ "$PREVIOUS_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
-    || fail 'PREVIOUS_IMAGE_DIGEST format'
-  [[ "$TRAFFIC_PREFLIGHT_STATE" == ONE_REVISION_AT_100_NO_TAGS ]] \
-    || fail 'standard traffic precondition'
-  [[ "$SECRET_REFERENCE_GATE" == APPROVED_REFERENCE_METADATA_ONLY ]] \
-    || fail 'secret-reference gate'
-  [[ "$RUNTIME_CONFIGURATION_GATE" == APPROVED_EXISTING_SERVICE_CONFIGURATION ]] \
-    || fail 'runtime-configuration gate'
-  [[ "$REVISION_NAMING_GATE" == APPROVED_CLOUD_RUN_NAMING_CONSTRAINTS ]] \
-    || fail 'authorized revision-naming verification gate'
+  [[ "$BUILD_COMPLETE" == true ]] || fail 'build did not complete within 900 seconds'
 
-  [[ "$SERVICE" =~ ^[a-z]([a-z0-9-]*[a-z0-9])?$ ]] || fail 'SERVICE format'
-  [[ "$CANDIDATE_REVISION" =~ ^[a-z]([a-z0-9-]*[a-z0-9])?$ ]] \
-    || fail 'CANDIDATE_REVISION format'
-  (( ${#CANDIDATE_REVISION} <= 63 )) || fail 'CANDIDATE_REVISION length'
-  PREFIX="${SERVICE}-"
-  [[ "$CANDIDATE_REVISION" == "$PREFIX"* ]] || fail 'service prefix mismatch'
-  CANDIDATE_REVISION_SUFFIX="${CANDIDATE_REVISION#${SERVICE}-}"
-  [[ -n "$CANDIDATE_REVISION_SUFFIX" ]] || fail 'revision suffix is empty'
-  [[ "$CANDIDATE_REVISION_SUFFIX" =~ ^[a-z]([a-z0-9-]*[a-z0-9])?$ ]] \
-    || fail 'revision suffix format'
-  [[ "$CANDIDATE_REVISION_SUFFIX" != -* && "$CANDIDATE_REVISION_SUFFIX" != *- ]] \
-    || fail 'revision suffix boundary'
-  [[ "${SERVICE}-${CANDIDATE_REVISION_SUFFIX}" == "$CANDIDATE_REVISION" ]] \
-    || fail 'derived revision mismatch'
+  TAG_RESULT_BODY="$EVIDENCE_ROOT/${BUILD_ID}-docker-image.raw.json"
+  IMAGE_AUTHORIZATION_FILE="$EVIDENCE_ROOT/${BUILD_ID}-image-authorization.json"
+  python3.12 scripts/validate_deployment_state.py evidence-path \
+    --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    --evidence-root="$EVIDENCE_ROOT" --output-file="$TAG_RESULT_BODY" \
+    --output-file="$IMAGE_AUTHORIZATION_FILE" \
+    --expected-image-tag="$CANDIDATE_IMAGE_TAG" >/dev/null \
+    || fail 'unsafe or preexisting image evidence path'
+  gcloud artifacts docker images describe "$CANDIDATE_IMAGE_TAG" \
+    --account="$ACCOUNT" --project="$PROJECT_ID" \
+    --format='json(name,uri,tags)' > "$TAG_RESULT_BODY" \
+    || fail 'exact candidate DockerImage resolution'
+  python3.12 scripts/validate_deployment_state.py tag-resolution --raw \
+    --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    --expected-image-tag="$CANDIDATE_IMAGE_TAG" < "$TAG_RESULT_BODY" >/dev/null \
+    || fail 'candidate DockerImage validation'
+  python3.12 scripts/validate_deployment_state.py authorize-image \
+    --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    --evidence-root="$EVIDENCE_ROOT" \
+    --build-evidence-file="$BUILD_SUCCESS_RAW_FILE" \
+    --tag-evidence-file="$TAG_RESULT_BODY" --expected-build-id="$BUILD_ID" \
+    --expected-source-sha="$SOURCE_SHA" --expected-source-tree="$SOURCE_TREE" \
+    --expected-image-tag="$CANDIDATE_IMAGE_TAG" > "$IMAGE_AUTHORIZATION_FILE" \
+    || fail 'three-way image digest authorization'
 
-  fail 'BLOCKED: verified service-scoped collision query, parser, and zero-result semantics are unavailable; a reviewed repository correction is required before deployment'
-
-  IMAGE_URI="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPOSITORY}/${IMAGE_NAME}"
-  CANDIDATE_IMAGE_REF="${IMAGE_URI}@${CANDIDATE_IMAGE_DIGEST}"
-  if ! gcloud run deploy "$SERVICE" \
-    --project="$PROJECT_ID" \
-    --region="$REGION" \
-    --image="$CANDIDATE_IMAGE_REF" \
-    --no-traffic \
-    --revision-suffix="$CANDIDATE_REVISION_SUFFIX"; then
-    fail 'zero-traffic candidate deployment'
-  fi
-  printf 'candidate_revision=%s\ncandidate_image=%s\n' \
-    "$CANDIDATE_REVISION" "$CANDIDATE_IMAGE_REF"
+  printf 'validated_build_context=%s\n' "$BUILD_ROOT/context"
 )
 ```
 
-This command supplies no plaintext settings and changes no explicit IAM,
-ingress, scaling, service-account, CPU, memory, or networking flag. Whether the
-existing service configuration is inherited exactly remains an authorized
-deployment-verification item. `--no-traffic` is mandatory.
+Exit 0 requires the exact tag to have been absent, a byte-exact safe Git context,
+one valid build ID, `SUCCESS` within the bounded polling window, exact Build
+resource name/project/SHA/tree/image substitutions, exactly one declared
+`images[]` tag, and exactly one matching `results.images[]` BuiltImage with its
+canonical digest, exact Artifact Registry Package resource, valid optional OCI
+media type, and—when present—an exact nanosecond-aware chronological `pushTiming`
+TimeSpan. The Build create/start/finish chronology is likewise compared without
+microsecond or floating-point precision loss. The independently queried
+DockerImage must identify that same project, location, repository, image, tag,
+and digest. `authorize-image` requires equality of the Build-result digest, the
+DockerImage URI digest, and the final digest-qualified image reference. This is
+Build artifact-output binding, not a SLSA attestation. Every queued or working
+state is retry-only; cancelled, expired, timed out, failed, unknown, empty, or
+contradictory evidence stops.
 
-## 6. Inspect the exact candidate, Ready condition, and actual traffic
+There is deliberately no cleanup trap or deletion command. Record `BUILD_ROOT`.
+Retention or deletion of that exact directory requires its own reviewed action.
+The release-record destination must be approved before execution. No build is
+authorized by this document.
 
-Run this fresh, separately authorized read-only phase after deployment. It
-returns only revision identity, conditions, digest, and service traffic status.
+## 6. Exact candidate-revision collision gate
+
+Derive and validate the intended name locally:
+
+```bash
+[[ "$CANDIDATE_REVISION" == "${SERVICE}-${CANDIDATE_SUFFIX}" ]]
+[[ "$CANDIDATE_REVISION" =~ ^[a-z]([a-z0-9-]*[a-z0-9])?$ ]]
+(( ${#CANDIDATE_REVISION} <= 63 ))
+```
+
+Then execute this exact Cloud Run v2 revision-resource GET. It requests only
+`name`; no revision listing is permitted:
 
 ```bash
 (
   set -euo pipefail
-  fail() { printf 'candidate inspection failed: %s\n' "$1" >&2; exit 1; }
-  require_value() {
-    local name="$1" value="${!1-}"
-    [[ -n "$value" && "$value" != REPLACE_* ]] || fail "$name is unresolved"
-  }
-
-  PROJECT_ID='REPLACE_WITH_PROJECT_ID'
-  REGION='REPLACE_WITH_REGION'
-  SERVICE='REPLACE_WITH_SERVICE'
-  CANDIDATE_REVISION='REPLACE_WITH_RECORDED_FULL_CANDIDATE_REVISION'
-  CANDIDATE_IMAGE_DIGEST='REPLACE_WITH_RECORDED_CANDIDATE_IMAGE_DIGEST'
-  PREVIOUS_REVISION='REPLACE_WITH_RECORDED_PREVIOUS_REVISION'
-  TRAFFIC_PREFLIGHT_STATE='REPLACE_WITH_APPROVED_PREFLIGHT_STATE'
-
-  for name in PROJECT_ID REGION SERVICE CANDIDATE_REVISION \
-    CANDIDATE_IMAGE_DIGEST PREVIOUS_REVISION TRAFFIC_PREFLIGHT_STATE; do
-    require_value "$name"
-  done
-  [[ "$CANDIDATE_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
-    || fail 'CANDIDATE_IMAGE_DIGEST format'
-  [[ "$TRAFFIC_PREFLIGHT_STATE" == ONE_REVISION_AT_100_NO_TAGS ]] \
-    || fail 'standard traffic precondition'
-
-  CANDIDATE_STATUS=''
-  if ! CANDIDATE_STATUS="$(gcloud run revisions describe "$CANDIDATE_REVISION" \
-    --project="$PROJECT_ID" \
-    --region="$REGION" \
-    --format='yaml(metadata.name,status.conditions.type,status.conditions.status,status.conditions.reason,status.imageDigest)')"; then
-    fail 'filtered candidate query'
-  fi
-  [[ -n "$CANDIDATE_STATUS" ]] || fail 'candidate status is empty'
-
-  TRAFFIC_STATUS=''
-  if ! TRAFFIC_STATUS="$(gcloud run services describe "$SERVICE" \
-    --project="$PROJECT_ID" \
-    --region="$REGION" \
-    --format='yaml(status.latestReadyRevisionName,status.traffic)')"; then
-    fail 'filtered traffic query'
-  fi
-  [[ -n "$TRAFFIC_STATUS" ]] || fail 'traffic status is empty'
-  printf '%s\n%s\n' "$CANDIDATE_STATUS" "$TRAFFIC_STATUS"
+  set -o noclobber
+  fail() { printf 'candidate revision collision gate failed: %s\n' "$1" >&2; exit 1; }
+  : "${EVIDENCE_ROOT:?preapproved evidence directory is required}"
+  REVISION_RESOURCE="projects/${PROJECT_ID}/locations/${REGION}/services/${SERVICE}/revisions/${CANDIDATE_REVISION}"
+  REVISION_BODY="$EVIDENCE_ROOT/candidate-revision-preflight.json"
+  python3.12 scripts/validate_deployment_state.py evidence-path \
+    --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    --evidence-root="$EVIDENCE_ROOT" --output-file="$REVISION_BODY" >/dev/null \
+    || fail 'unsafe or preexisting revision evidence path'
+  REVISION_URL="https://run.googleapis.com/v2/${REVISION_RESOURCE}?fields=name"
+  REVISION_STATUS="$(authorized_curl --url "$REVISION_URL" \
+    --output "$REVISION_BODY" --write-out '%{http_code}')" \
+    || fail 'exact candidate revision GET'
+  python3.12 scripts/validate_deployment_state.py nonexistence \
+      --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+      --kind=CANDIDATE_REVISION --expected-resource="$REVISION_RESOURCE" \
+      --http-status="$REVISION_STATUS" < "$REVISION_BODY"
 )
 ```
 
-The operator must verify that the returned `metadata.name` is exactly
-`CANDIDATE_REVISION`, `status.imageDigest` ends in the recorded digest, and
-exactly one condition has `type: Ready` and `status: 'True'`. An absent Ready
-condition, `False`, `Unknown`, empty output, multiple or ambiguous Ready values,
-wrong revision name, or digest mismatch stops the procedure.
+Only `CANDIDATE_REVISION_AVAILABLE` permits the separately authorized deploy.
+Exact success is a collision; permission denial, malformed output, wrong
+identity, an unexpected status, or command failure stops.
 
-The traffic output must prove that the candidate is absent from traffic or has
-zero percent and that the original `PREVIOUS_REVISION` still receives exactly
-100% with no tag or other allocation. Do not infer zero traffic only from the
-deploy flag.
+## 7. Separately authorized zero-traffic candidate deployment
 
-Only after that evidence is reviewed may the release record contain:
-
-- `CANDIDATE_READY_GATE=READY_TRUE_EXACT_REVISION_AND_DIGEST`
-- `ZERO_TRAFFIC_GATE=CANDIDATE_ZERO_PREVIOUS_100_NO_TAGS`
-
-No smoke test, integration test, or traffic movement is permitted for False,
-Unknown, absent, empty, ambiguous, or otherwise unapproved readiness evidence.
-
-## 7. Separately authorized candidate testing
-
-Smoke testing and integration testing are separate authorization gates. Use
-test-only contacts and records. Verify startup, application health, request-log
-privacy, browser redemption and recovery origin, test-only Airtable fields,
-approved Gemini behavior, controlled GHL delivery, monitoring, and rollback
-visibility. Participant enrollment remains unauthorized.
-
-After separately reviewing successful evidence, the release record may contain:
-
-- `SMOKE_TEST_GATE=APPROVED_TEST_ONLY_SMOKE_EVIDENCE`
-- `INTEGRATION_TEST_GATE=APPROVED_TEST_ONLY_INTEGRATION_EVIDENCE`
-
-## 8. Move traffic gradually with a fresh authorization each time
-
-Run this self-contained phase once per separately authorized percentage change.
-Copy all bindings from the reviewed release record. Before every movement, an
-authorized tooling check must have confirmed the exact filtered JSON field
-schema used below and recorded
-`TRAFFIC_QUERY_SCHEMA_GATE=APPROVED_FILTERED_TRAFFIC_AND_REVISION_JSON_SCHEMA`.
-That gate establishes output structure only; this phase still performs fresh
-queries and validates the actual revision identities, immutable digests, Ready
-conditions, complete current allocation, and exact authorized from-map.
-
-Each authorization records both canonical maps in candidate-then-previous order,
-for example `candidate=0,previous=100` followed by `candidate=10,previous=90`,
-using the full revision names rather than those illustrative words. It also
-records the exact two revision names and digests. A later increase requires a
-new authorization, a new fresh phase, and the prior target as its newly verified
-from-map. A historical zero-traffic gate is not valid after traffic has moved.
+After separate zero-traffic deployment authorization, run this block. It
+requires the exact successful gcloud-emitted Build and DockerImage evidence, revalidates
+their complete current envelope and digest equality, captures pre-state before
+mutation, validates the exact candidate revision afterward, makes post-candidate
+latest-ready binding mandatory, validates zero traffic, and compares runtime
+hashes:
 
 ```bash
 (
   set -euo pipefail
-  fail() { printf 'traffic movement failed: %s\n' "$1" >&2; exit 1; }
-  require_value() {
-    local name="$1" value="${!1-}"
-    [[ -n "$value" && "$value" != REPLACE_* ]] || fail "$name is unresolved"
-  }
-  require_component() {
-    local name="$1" value="${!1-}"
-    require_value "$name"
-    [[ "$value" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || fail "$name format"
-  }
-  validate_state() {
-    local expected_candidate_percent="$1" expected_previous_percent="$2"
-    "$PYTHON_BIN" - \
-      "$CANDIDATE_REVISION" "$CANDIDATE_IMAGE_DIGEST" \
-      "$PREVIOUS_REVISION" "$PREVIOUS_IMAGE_DIGEST" \
-      "$expected_candidate_percent" "$expected_previous_percent" \
-      "$CANDIDATE_STATUS" "$PREVIOUS_STATUS" "$TRAFFIC_STATUS" <<'PY'
-import json
-import re
-import sys
+  set -o noclobber
+  fail() { printf 'zero-traffic deployment gate failed: %s\n' "$1" >&2; exit 1; }
+  : "${EVIDENCE_ROOT:?preapproved evidence directory is required}"
+  : "${AUTHORIZED_BUILD_EVIDENCE_FILE:?authorized successful Build evidence is required}"
+  : "${AUTHORIZED_TAG_EVIDENCE_FILE:?authorized DockerImage evidence is required}"
+  : "${BUILD_ID:?authorized build ID is required}"
+  : "${SOURCE_SHA:?authorized source SHA is required}"
+  : "${SOURCE_TREE:?authorized source tree is required}"
+  : "${CANDIDATE_IMAGE_TAG:?authorized candidate image tag is required}"
+  declare -F bind_scope >/dev/null || fail 'bind_scope is not loaded'
+  declare -F capture_runtime_snapshot >/dev/null \
+    || fail 'capture_runtime_snapshot is not loaded'
 
+  python3.12 scripts/validate_deployment_state.py evidence-path \
+    --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    --evidence-root="$EVIDENCE_ROOT" \
+    --input-file="$AUTHORIZED_BUILD_EVIDENCE_FILE" \
+    --input-file="$AUTHORIZED_TAG_EVIDENCE_FILE" \
+    --expected-image-tag="$CANDIDATE_IMAGE_TAG" >/dev/null \
+    || fail 'stale, cross-scope, or unsafe image evidence paths'
+  CANDIDATE_IMAGE_DIGEST_REF="$(
+    python3.12 scripts/validate_deployment_state.py authorize-image \
+      --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+      --evidence-root="$EVIDENCE_ROOT" \
+      --build-evidence-file="$AUTHORIZED_BUILD_EVIDENCE_FILE" \
+      --tag-evidence-file="$AUTHORIZED_TAG_EVIDENCE_FILE" \
+      --expected-build-id="$BUILD_ID" --expected-source-sha="$SOURCE_SHA" \
+      --expected-source-tree="$SOURCE_TREE" \
+      --expected-image-tag="$CANDIDATE_IMAGE_TAG" --output=image-ref
+  )" || fail 'current build/tag/digest authorization'
 
-def stop(message: str) -> None:
-    raise SystemExit(f"traffic-state validation failed: {message}")
+  PRE_SERVICE_RAW="$EVIDENCE_ROOT/pre-deploy-traffic.json"
+  POST_SERVICE_RAW="$EVIDENCE_ROOT/post-deploy-traffic.json"
+  PRE_RUNTIME_RAW="$EVIDENCE_ROOT/pre-runtime.raw.json"
+  POST_RUNTIME_RAW="$EVIDENCE_ROOT/post-runtime.raw.json"
+  python3.12 scripts/validate_deployment_state.py evidence-path \
+    --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    --evidence-root="$EVIDENCE_ROOT" --output-file="$PRE_SERVICE_RAW" \
+    --output-file="$POST_SERVICE_RAW" --output-file="$PRE_RUNTIME_RAW" \
+    --output-file="$POST_RUNTIME_RAW" >/dev/null \
+    || fail 'unsafe or preexisting deployment evidence path'
 
+  gcloud run services describe "$SERVICE" \
+    --account="$ACCOUNT" --project="$PROJECT_ID" --region="$REGION" \
+    --format='json(status.latestReadyRevisionName,status.traffic)' \
+    > "$PRE_SERVICE_RAW"
+  bind_scope serviceState < "$PRE_SERVICE_RAW" \
+    | python3.12 scripts/validate_deployment_state.py traffic \
+        --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+        --latest-ready-revision="$BASELINE_REVISION" >/dev/null
+  capture_runtime_snapshot "$PRE_RUNTIME_RAW"
 
-(
-    candidate_revision,
-    candidate_digest,
-    previous_revision,
-    previous_digest,
-    candidate_percent_raw,
-    previous_percent_raw,
-    candidate_raw,
-    previous_raw,
-    traffic_raw,
-) = sys.argv[1:]
+  gcloud run deploy "$SERVICE" \
+    --account="$ACCOUNT" --project="$PROJECT_ID" --region="$REGION" \
+    --image="$CANDIDATE_IMAGE_DIGEST_REF" \
+    --revision-suffix="$CANDIDATE_SUFFIX" --no-traffic --quiet
 
+  gcloud run revisions describe "$CANDIDATE_REVISION" \
+    --account="$ACCOUNT" --project="$PROJECT_ID" --region="$REGION" \
+    --format='json(metadata.name,status.conditions,status.imageDigest)' \
+    | bind_scope revision \
+    | python3.12 scripts/validate_deployment_state.py revision \
+        --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+        --expected-revision="$CANDIDATE_REVISION" \
+        --expected-digest="${CANDIDATE_IMAGE_DIGEST_REF##*@}"
 
-def document(raw: str, label: str) -> dict:
-    if not raw.strip():
-        stop(f"{label} output is empty")
-    try:
-        value = json.loads(raw)
-    except json.JSONDecodeError:
-        stop(f"{label} output is malformed")
-    if not isinstance(value, dict):
-        stop(f"{label} output is ambiguous")
-    return value
+  gcloud run services describe "$SERVICE" \
+    --account="$ACCOUNT" --project="$PROJECT_ID" --region="$REGION" \
+    --format='json(status.latestReadyRevisionName,status.traffic)' \
+    > "$POST_SERVICE_RAW"
+  bind_scope serviceState < "$POST_SERVICE_RAW" \
+    | python3.12 scripts/validate_deployment_state.py traffic \
+        --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+        --latest-ready-revision="$CANDIDATE_REVISION" >/dev/null
 
+  python3.12 scripts/validate_deployment_state.py zero-traffic \
+      --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+      --candidate-revision="$CANDIDATE_REVISION" \
+      --baseline-revision="$BASELINE_REVISION" \
+      --pre-latest-ready-revision="$BASELINE_REVISION" \
+      --post-latest-ready-revision="$CANDIDATE_REVISION" \
+      --evidence-root="$EVIDENCE_ROOT" --pre-evidence-file="$PRE_SERVICE_RAW" \
+      --post-evidence-file="$POST_SERVICE_RAW"
 
-def normalized_digest(value: object, label: str) -> str:
-    if not isinstance(value, str) or not value:
-        stop(f"{label} digest is empty or malformed")
-    digest = value.rsplit("@", 1)[-1]
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
-        stop(f"{label} digest is not immutable")
-    return digest
-
-
-def validate_revision(raw: str, expected_name: str, expected_digest: str, label: str) -> None:
-    value = document(raw, label)
-    metadata = value.get("metadata")
-    status = value.get("status")
-    if not isinstance(metadata, dict) or metadata.get("name") != expected_name:
-        stop(f"{label} revision identity mismatch")
-    if not isinstance(status, dict):
-        stop(f"{label} status is absent")
-    if normalized_digest(status.get("imageDigest"), label) != expected_digest:
-        stop(f"{label} digest mismatch")
-    conditions = status.get("conditions")
-    if not isinstance(conditions, list):
-        stop(f"{label} conditions are absent or malformed")
-    if any(
-        not isinstance(item, dict)
-        or not isinstance(item.get("type"), str)
-        or not isinstance(item.get("status"), str)
-        for item in conditions
-    ):
-        stop(f"{label} condition record is malformed")
-    ready = [item for item in conditions if isinstance(item, dict) and item.get("type") == "Ready"]
-    if len(ready) != 1 or ready[0].get("status") != "True":
-        stop(f"{label} does not have exactly one Ready=True condition")
-
-
-validate_revision(candidate_raw, candidate_revision, candidate_digest, "candidate")
-validate_revision(previous_raw, previous_revision, previous_digest, "previous")
-
-try:
-    expected_candidate = int(candidate_percent_raw)
-    expected_previous = int(previous_percent_raw)
-except ValueError:
-    stop("authorized percentages are malformed")
-
-traffic_document = document(traffic_raw, "traffic")
-status = traffic_document.get("status")
-traffic = status.get("traffic") if isinstance(status, dict) else None
-if not isinstance(traffic, list) or not traffic:
-    stop("complete traffic allocation is absent or malformed")
-
-allowed_names = {candidate_revision, previous_revision}
-allocation: dict[str, int] = {}
-allowed_fields = {"revisionName", "percent", "tag", "latestRevision", "url"}
-for target in traffic:
-    if not isinstance(target, dict) or not set(target).issubset(allowed_fields):
-        stop("traffic target is malformed or has an unverified field")
-    name = target.get("revisionName")
-    percent = target.get("percent")
-    if not isinstance(name, str) or name not in allowed_names:
-        stop("unexpected, missing, or third revision in traffic")
-    if name in allocation:
-        stop("duplicate traffic revision")
-    if isinstance(percent, bool) or not isinstance(percent, int) or not 0 <= percent <= 100:
-        stop("traffic percentage is malformed")
-    tag = target.get("tag")
-    if tag is not None and tag != "":
-        stop("tagged traffic is not permitted")
-    latest = target.get("latestRevision")
-    if latest is not None and latest is not False:
-        stop("latestRevision allocation is ambiguous")
-    allocation[name] = percent
-
-actual_candidate = allocation.get(candidate_revision, 0)
-actual_previous = allocation.get(previous_revision, 0)
-if actual_candidate + actual_previous != 100:
-    stop("traffic allocation does not total 100")
-if actual_candidate != expected_candidate or actual_previous != expected_previous:
-    stop("actual allocation differs from authorized map")
-
-print(
-    f"validated_allocation={candidate_revision}={actual_candidate},"
-    f"{previous_revision}={actual_previous}"
-)
-PY
-  }
-
-  PROJECT_ID='REPLACE_WITH_PROJECT_ID'
-  REGION='REPLACE_WITH_REGION'
-  SERVICE='REPLACE_WITH_SERVICE'
-  PYTHON_BIN='python3.12'
-  CANDIDATE_REVISION='REPLACE_WITH_RECORDED_CANDIDATE_REVISION'
-  CANDIDATE_IMAGE_DIGEST='REPLACE_WITH_RECORDED_CANDIDATE_IMAGE_DIGEST'
-  PREVIOUS_REVISION='REPLACE_WITH_RECORDED_PREVIOUS_REVISION'
-  PREVIOUS_IMAGE_DIGEST='REPLACE_WITH_RECORDED_PREVIOUS_IMAGE_DIGEST'
-  TRAFFIC_PREFLIGHT_STATE='REPLACE_WITH_APPROVED_PREFLIGHT_STATE'
-  TRAFFIC_QUERY_SCHEMA_GATE='REPLACE_WITH_APPROVED_FILTERED_JSON_SCHEMA_GATE'
-  SMOKE_TEST_GATE='REPLACE_WITH_APPROVED_SMOKE_GATE'
-  INTEGRATION_TEST_GATE='REPLACE_WITH_APPROVED_INTEGRATION_GATE'
-  TRAFFIC_AUTHORIZATION='REPLACE_WITH_BOUND_AUTHORIZATION_FOR_THIS_EXACT_CHANGE'
-  AUTHORIZED_PROJECT_ID='REPLACE_WITH_AUTHORIZED_PROJECT_ID'
-  AUTHORIZED_REGION='REPLACE_WITH_AUTHORIZED_REGION'
-  AUTHORIZED_SERVICE='REPLACE_WITH_AUTHORIZED_SERVICE'
-  AUTHORIZED_CANDIDATE_REVISION='REPLACE_WITH_AUTHORIZED_CANDIDATE_REVISION'
-  AUTHORIZED_CANDIDATE_DIGEST='REPLACE_WITH_AUTHORIZED_CANDIDATE_DIGEST'
-  AUTHORIZED_PREVIOUS_REVISION='REPLACE_WITH_AUTHORIZED_PREVIOUS_REVISION'
-  AUTHORIZED_PREVIOUS_DIGEST='REPLACE_WITH_AUTHORIZED_PREVIOUS_DIGEST'
-  CURRENT_CANDIDATE_PERCENT='REPLACE_WITH_AUTHORIZED_CURRENT_CANDIDATE_PERCENT'
-  CURRENT_PREVIOUS_PERCENT='REPLACE_WITH_AUTHORIZED_CURRENT_PREVIOUS_PERCENT'
-  TARGET_CANDIDATE_PERCENT='REPLACE_WITH_AUTHORIZED_TARGET_CANDIDATE_PERCENT'
-  TARGET_PREVIOUS_PERCENT='REPLACE_WITH_AUTHORIZED_TARGET_PREVIOUS_PERCENT'
-  AUTHORIZED_CURRENT_ALLOCATION='REPLACE_WITH_EXACT_CANONICAL_FROM_MAP'
-  AUTHORIZED_TARGET_ALLOCATION='REPLACE_WITH_EXACT_CANONICAL_TARGET_MAP'
-
-  for name in PROJECT_ID REGION SERVICE CANDIDATE_REVISION \
-    CANDIDATE_IMAGE_DIGEST PREVIOUS_REVISION PREVIOUS_IMAGE_DIGEST \
-    TRAFFIC_PREFLIGHT_STATE TRAFFIC_QUERY_SCHEMA_GATE SMOKE_TEST_GATE \
-    INTEGRATION_TEST_GATE TRAFFIC_AUTHORIZATION AUTHORIZED_PROJECT_ID \
-    AUTHORIZED_REGION AUTHORIZED_SERVICE AUTHORIZED_CANDIDATE_REVISION \
-    AUTHORIZED_CANDIDATE_DIGEST AUTHORIZED_PREVIOUS_REVISION \
-    AUTHORIZED_PREVIOUS_DIGEST CURRENT_CANDIDATE_PERCENT \
-    CURRENT_PREVIOUS_PERCENT TARGET_CANDIDATE_PERCENT TARGET_PREVIOUS_PERCENT \
-    AUTHORIZED_CURRENT_ALLOCATION AUTHORIZED_TARGET_ALLOCATION; do
-    require_value "$name"
-  done
-  for name in PROJECT_ID REGION; do require_component "$name"; done
-  command -v "$PYTHON_BIN" >/dev/null 2>&1 || fail 'python3.12 is unavailable'
-  [[ "$SERVICE" =~ ^[a-z]([a-z0-9-]*[a-z0-9])?$ ]] || fail 'SERVICE format'
-  [[ "$CANDIDATE_REVISION" =~ ^[a-z]([a-z0-9-]*[a-z0-9])?$ ]] \
-    || fail 'candidate revision format'
-  [[ "$PREVIOUS_REVISION" =~ ^[a-z]([a-z0-9-]*[a-z0-9])?$ ]] \
-    || fail 'previous revision format'
-  [[ "$CANDIDATE_REVISION" == "${SERVICE}-"* ]] || fail 'candidate service prefix'
-  [[ "$PREVIOUS_REVISION" == "${SERVICE}-"* ]] || fail 'previous service prefix'
-  [[ "$CANDIDATE_REVISION" != "$PREVIOUS_REVISION" ]] || fail 'revisions are identical'
-  (( ${#CANDIDATE_REVISION} <= 63 && ${#PREVIOUS_REVISION} <= 63 )) \
-    || fail 'revision length'
-  [[ "$CANDIDATE_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
-    || fail 'candidate digest format'
-  [[ "$PREVIOUS_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
-    || fail 'previous digest format'
-  [[ "$TRAFFIC_PREFLIGHT_STATE" == ONE_REVISION_AT_100_NO_TAGS ]] \
-    || fail 'standard traffic precondition'
-  [[ "$TRAFFIC_QUERY_SCHEMA_GATE" == APPROVED_FILTERED_TRAFFIC_AND_REVISION_JSON_SCHEMA ]] \
-    || fail 'filtered traffic and revision schema gate'
-  [[ "$SMOKE_TEST_GATE" == APPROVED_TEST_ONLY_SMOKE_EVIDENCE ]] \
-    || fail 'smoke-test gate'
-  [[ "$INTEGRATION_TEST_GATE" == APPROVED_TEST_ONLY_INTEGRATION_EVIDENCE ]] \
-    || fail 'integration-test gate'
-  [[ "$TRAFFIC_AUTHORIZATION" == APPROVED_EXACT_SCOPE_REVISIONS_DIGESTS_FROM_MAP_AND_TARGET_MAP ]] \
-    || fail 'bound traffic authorization'
-  [[ "$AUTHORIZED_PROJECT_ID" == "$PROJECT_ID" ]] \
-    || fail 'authorized project binding'
-  [[ "$AUTHORIZED_REGION" == "$REGION" ]] \
-    || fail 'authorized region binding'
-  [[ "$AUTHORIZED_SERVICE" == "$SERVICE" ]] \
-    || fail 'authorized service binding'
-  [[ "$AUTHORIZED_CANDIDATE_REVISION" == "$CANDIDATE_REVISION" ]] \
-    || fail 'authorized candidate revision binding'
-  [[ "$AUTHORIZED_CANDIDATE_DIGEST" == "$CANDIDATE_IMAGE_DIGEST" ]] \
-    || fail 'authorized candidate digest binding'
-  [[ "$AUTHORIZED_PREVIOUS_REVISION" == "$PREVIOUS_REVISION" ]] \
-    || fail 'authorized previous revision binding'
-  [[ "$AUTHORIZED_PREVIOUS_DIGEST" == "$PREVIOUS_IMAGE_DIGEST" ]] \
-    || fail 'authorized previous digest binding'
-  [[ "$CURRENT_CANDIDATE_PERCENT" =~ ^(0|[1-9]|[1-9][0-9])$ ]] \
-    || fail 'current candidate percentage format'
-  [[ "$CURRENT_PREVIOUS_PERCENT" =~ ^([1-9]|[1-9][0-9]|100)$ ]] \
-    || fail 'current previous percentage format'
-  [[ "$TARGET_CANDIDATE_PERCENT" =~ ^([1-9]|[1-9][0-9])$ ]] \
-    || fail 'target candidate percentage format'
-  [[ "$TARGET_PREVIOUS_PERCENT" =~ ^([1-9]|[1-9][0-9])$ ]] \
-    || fail 'target previous percentage format'
-  (( CURRENT_CANDIDATE_PERCENT + CURRENT_PREVIOUS_PERCENT == 100 )) \
-    || fail 'current percentages do not total 100'
-  (( TARGET_CANDIDATE_PERCENT + TARGET_PREVIOUS_PERCENT == 100 )) \
-    || fail 'target percentages do not total 100'
-  (( TARGET_CANDIDATE_PERCENT > CURRENT_CANDIDATE_PERCENT )) \
-    || fail 'target is not a gradual candidate increase'
-  EXPECTED_CURRENT_ALLOCATION="${CANDIDATE_REVISION}=${CURRENT_CANDIDATE_PERCENT},${PREVIOUS_REVISION}=${CURRENT_PREVIOUS_PERCENT}"
-  EXPECTED_TARGET_ALLOCATION="${CANDIDATE_REVISION}=${TARGET_CANDIDATE_PERCENT},${PREVIOUS_REVISION}=${TARGET_PREVIOUS_PERCENT}"
-  [[ "$AUTHORIZED_CURRENT_ALLOCATION" == "$EXPECTED_CURRENT_ALLOCATION" ]] \
-    || fail 'authorized current allocation binding'
-  [[ "$AUTHORIZED_TARGET_ALLOCATION" == "$EXPECTED_TARGET_ALLOCATION" ]] \
-    || fail 'authorized target allocation binding'
-
-  fail 'BLOCKED: machine-validated initial traffic evidence is unavailable; a reviewed repository correction is required before traffic movement'
-
-  CANDIDATE_STATUS=''
-  if ! CANDIDATE_STATUS="$(gcloud run revisions describe "$CANDIDATE_REVISION" \
-    --project="$PROJECT_ID" \
-    --region="$REGION" \
-    --format='json(metadata.name,status.conditions,status.imageDigest)')"; then
-    fail 'fresh filtered candidate query'
-  fi
-  [[ -n "$CANDIDATE_STATUS" ]] || fail 'candidate query returned empty output'
-  PREVIOUS_STATUS=''
-  if ! PREVIOUS_STATUS="$(gcloud run revisions describe "$PREVIOUS_REVISION" \
-    --project="$PROJECT_ID" \
-    --region="$REGION" \
-    --format='json(metadata.name,status.conditions,status.imageDigest)')"; then
-    fail 'fresh filtered previous-revision query'
-  fi
-  [[ -n "$PREVIOUS_STATUS" ]] || fail 'previous query returned empty output'
-  TRAFFIC_STATUS=''
-  if ! TRAFFIC_STATUS="$(gcloud run services describe "$SERVICE" \
-    --project="$PROJECT_ID" \
-    --region="$REGION" \
-    --format='json(status.traffic)')"; then
-    fail 'fresh filtered current-traffic query'
-  fi
-  [[ -n "$TRAFFIC_STATUS" ]] || fail 'current traffic query returned empty output'
-  if ! validate_state "$CURRENT_CANDIDATE_PERCENT" "$CURRENT_PREVIOUS_PERCENT"; then
-    fail 'current revision or traffic state differs from authorization'
-  fi
-
-  if ! gcloud run services update-traffic "$SERVICE" \
-    --project="$PROJECT_ID" \
-    --region="$REGION" \
-    --to-revisions="$AUTHORIZED_TARGET_ALLOCATION"; then
-    fail 'authorized traffic update'
-  fi
-  TRAFFIC_STATUS=''
-  if ! TRAFFIC_STATUS="$(gcloud run services describe "$SERVICE" \
-    --project="$PROJECT_ID" \
-    --region="$REGION" \
-    --format='json(status.traffic)')"; then
-    fail 'filtered post-movement traffic query'
-  fi
-  [[ -n "$TRAFFIC_STATUS" ]] || fail 'post-movement traffic output is empty'
-  if ! validate_state "$TARGET_CANDIDATE_PERCENT" "$TARGET_PREVIOUS_PERCENT"; then
-    fail 'post-movement allocation differs from authorized target'
-  fi
+  capture_runtime_snapshot "$POST_RUNTIME_RAW"
+  python3.12 scripts/validate_deployment_state.py runtime-equal \
+    --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    --evidence-root="$EVIDENCE_ROOT" \
+    --pre-evidence-file="$PRE_RUNTIME_RAW" \
+    --post-evidence-file="$POST_RUNTIME_RAW"
 )
 ```
 
-Stop after each movement for the approved observation period. Preserve filtered
-evidence without secret or participant content. A post-movement mismatch or a
-failed observation stops all further increases and requires the separately
-authorized rollback procedure; do not automatically issue another traffic
-command. Do not move 100% through this gradual block; final cutover requires its
-own reviewed procedure.
+`CANDIDATE_IMAGE_DIGEST_REF` must contain `@sha256:` and must not use an image
+tag or implicit latest image. Do not add environment, secret, IAM, ingress,
+service-account, scaling, CPU, memory, concurrency, timeout, networking, probe,
+or volume flags unless a new review explicitly authorizes a complete restatement
+of configuration.
 
-## 9. Roll back to the verified pre-release state
+Exit 0 requires exact candidate name, digest, and `Ready=True`; observed
+post-deployment latest-ready revision equal to the candidate; unchanged
+effective allocation; baseline at 100%; candidate absent or untagged at zero;
+only the documented floating-to-fixed raw transformation; and identical safe
+runtime hashes.
 
-This standard rollback is valid only because preflight proved that the original
-state was one named revision at 100% with no tags. It restores that exact state,
-not an arbitrarily selected older revision. A preexisting split requires its
-separate approved full-map rollback plan instead.
+Do not require byte-for-byte equality between a floating raw pre-map and the
+documented fixed post-map. Any effective drift, candidate traffic, candidate
+tag, unexpected target, missing target, changed tag, or changed percentage is a
+deployment failure. Do not issue a compensating traffic command without a
+separate rollback authorization.
 
-Repository-local evidence does not establish the exact gcloud schemas needed to
-query and prove rollback state safely. The present rollback procedure therefore
-terminates unconditionally and contains no traffic-changing command. Approval
-literals, copied revision names, manually described allocations, or sample
-values cannot enable rollback. A separately reviewed repository correction is
-required after authorized tooling verification.
+## 8. Separately authorized candidate testing
 
-That future correction must use minimum-field, project-, region-, and
-service-bound JSON queries. Before any traffic command, its parser must:
+Smoke and integration testing are independent authorizations and must use only
+owner-controlled test contacts and records. Before testing, require exact
+candidate readiness, digest, zero-traffic evidence, runtime configuration
+preservation, enabled `SESSION_SECRET` version, an approved test access method,
+and rollback readiness.
 
-- verify that the recorded original allocation is exactly the one explicit
-  `PREVIOUS_REVISION` at integer 100%, with no tag or `latestRevision`;
-- query that exact revision, require its immutable digest to equal
-  `PREVIOUS_IMAGE_DIGEST`, and require exactly one condition whose `type` is
-  `Ready` and whose `status` is exactly `True`;
-- reject absent, False, Unknown, duplicate, malformed, partial, or mismatched
-  readiness evidence;
-- parse the complete current allocation, rejecting empty, null, scalar,
-  truncated, malformed, duplicate, incomplete, tagged, latest-revision, third-
-  revision, unexpected-field, non-integer, out-of-range, or non-100% states;
-- canonicalize the complete observed current map and require rollback
-  authorization to bind the exact project, region, service, release-record
-  identity, previous revision and digest, observed map, and exact original target
-  map; and
-- permit `--to-revisions="${PREVIOUS_REVISION}=100"` only for that validated
-  standard original allocation. Any other original allocation requires its own
-  separately reviewed full-map restoration plan.
+Predefine observation duration and failure thresholds before any live request.
+Controlled testing must cover startup, health, request-log privacy, proxy/IP
+behavior, cookies, access and recovery redemption, intended HTTPS origin,
+test-only Airtable fields, approved Gemini behavior, controlled GHL delivery,
+monitoring, and failure visibility. Participant enrollment remains unauthorized.
 
-After the one separately authorized rollback command, the future parser must
-query the complete allocation again and require exact equality with the recorded
-original map. Command failure, observation failure, malformed output, drift, or
-final mismatch is rollback failure and must not trigger another traffic command.
-Evidence must contain only non-secret release identifiers and must not contain
-participant data.
+## 9. Separately authorized fixed-revision traffic movement
+
+Before each movement, bind authorization to the exact project, region, service,
+candidate and baseline revisions/digests, complete current map, complete target
+map, unchanged tag map or explicitly reviewed tag change, observation duration,
+failure thresholds, and rollback target.
+
+Use fixed revisions only. Percentages must explicitly name every serving fixed
+revision and total 100 so gcloud cannot proportionally adjust an omitted target.
+For each individually authorized movement, supply separately approved complete
+current and target service-state JSON files, then execute:
+
+```bash
+compare_complete_map() {
+  local purpose="$1" observed_file="$2" expected_file="$3"
+  python3.12 scripts/validate_deployment_state.py traffic-map \
+    --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    --purpose="$purpose" --evidence-root="$EVIDENCE_ROOT" \
+    --observed-file="$observed_file" --expected-file="$expected_file"
+}
+
+(
+  set -euo pipefail
+  set -o noclobber
+  fail() { printf 'traffic movement gate failed: %s\n' "$1" >&2; exit 1; }
+  : "${EVIDENCE_ROOT:?preapproved evidence directory is required}"
+  : "${AUTHORIZED_CURRENT_MAP_FILE:?approved current map is required}"
+  : "${AUTHORIZED_TARGET_MAP_FILE:?approved target map is required}"
+  compare_complete_map TRAFFIC "$AUTHORIZED_TARGET_MAP_FILE" \
+    "$AUTHORIZED_TARGET_MAP_FILE"
+  COMPLETE_FIXED_TARGET_MAP="$(python3.12 scripts/validate_deployment_state.py traffic-map \
+    --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    --purpose=TRAFFIC --evidence-root="$EVIDENCE_ROOT" \
+    --observed-file="$AUTHORIZED_TARGET_MAP_FILE" \
+    --expected-file="$AUTHORIZED_TARGET_MAP_FILE" --output=command-map)" \
+    || fail 'authorized command-map derivation'
+  CURRENT_TAG_MAP="$(python3.12 scripts/validate_deployment_state.py traffic-map \
+    --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    --purpose=TRAFFIC --evidence-root="$EVIDENCE_ROOT" \
+    --observed-file="$AUTHORIZED_CURRENT_MAP_FILE" \
+    --expected-file="$AUTHORIZED_CURRENT_MAP_FILE" --output=tag-map)" \
+    || fail 'authorized current tag-map derivation'
+  TARGET_TAG_MAP="$(python3.12 scripts/validate_deployment_state.py traffic-map \
+    --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    --purpose=TRAFFIC --evidence-root="$EVIDENCE_ROOT" \
+    --observed-file="$AUTHORIZED_TARGET_MAP_FILE" \
+    --expected-file="$AUTHORIZED_TARGET_MAP_FILE" --output=tag-map)" \
+    || fail 'authorized target tag-map derivation'
+  [[ "$CURRENT_TAG_MAP" == "$TARGET_TAG_MAP" ]] || fail 'authorized tag-map change'
+  [[ -n "$COMPLETE_FIXED_TARGET_MAP" ]] || fail 'empty target command map'
+  OBSERVED_PRE="$EVIDENCE_ROOT/traffic-movement-pre.json"
+  OBSERVED_POST="$EVIDENCE_ROOT/traffic-movement-post.json"
+  python3.12 scripts/validate_deployment_state.py evidence-path \
+    --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    --evidence-root="$EVIDENCE_ROOT" --output-file="$OBSERVED_PRE" \
+    --output-file="$OBSERVED_POST" >/dev/null \
+    || fail 'unsafe or preexisting traffic evidence path'
+
+  gcloud run services describe "$SERVICE" \
+    --account="$ACCOUNT" --project="$PROJECT_ID" --region="$REGION" \
+    --format='json(status.latestReadyRevisionName,status.traffic)' \
+    > "$OBSERVED_PRE"
+  compare_complete_map TRAFFIC "$OBSERVED_PRE" "$AUTHORIZED_CURRENT_MAP_FILE"
+
+  gcloud run services update-traffic "$SERVICE" \
+    --account="$ACCOUNT" --project="$PROJECT_ID" --region="$REGION" \
+    --to-revisions="$COMPLETE_FIXED_TARGET_MAP" --quiet
+
+  gcloud run services describe "$SERVICE" \
+    --account="$ACCOUNT" --project="$PROJECT_ID" --region="$REGION" \
+    --format='json(status.latestReadyRevisionName,status.traffic)' \
+    > "$OBSERVED_POST"
+  compare_complete_map TRAFFIC "$OBSERVED_POST" "$AUTHORIZED_TARGET_MAP_FILE"
+)
+```
+
+Do not use `LATEST`, `--to-latest`, or a partial percentage map. This standard
+block requires the authorized current and target tag maps to be identical before
+mutation; it does not authorize tag changes. Any current-map mismatch stops
+before mutation. Any post-map mismatch or failed observation stops further
+movement and requires a separately authorized rollback; do not automatically
+retry.
+
+## 10. Separately authorized rollback
+
+Rollback targets the exact known-good fixed revision and immutable digest, never
+whatever happens to be latest. Require:
+
+- the exact expected current map before mutation;
+- exact readiness and digest for the known-good revision;
+- a complete fixed-revision rollback percentage map totaling 100;
+- the complete recorded tag map;
+- separate rollback authorization bound to those values.
+
+After separate rollback authorization bound to the complete files and variables
+below, execute exactly one rollback command and one post-query:
 
 ```bash
 (
   set -euo pipefail
-  fail() { printf 'rollback failed: %s\n' "$1" >&2; exit 1; }
-  fail 'BLOCKED: verified rollback schemas and complete pre/post-state parser wiring are unavailable; a reviewed repository correction is required before rollback'
+  set -o noclobber
+  fail() { printf 'rollback gate failed: %s\n' "$1" >&2; exit 1; }
+  : "${EVIDENCE_ROOT:?preapproved evidence directory is required}"
+  : "${AUTHORIZED_ROLLBACK_CURRENT_MAP_FILE:?approved current map is required}"
+  : "${AUTHORIZED_ROLLBACK_TARGET_MAP_FILE:?approved rollback map is required}"
+  compare_complete_map ROLLBACK "$AUTHORIZED_ROLLBACK_TARGET_MAP_FILE" \
+    "$AUTHORIZED_ROLLBACK_TARGET_MAP_FILE"
+  COMPLETE_FIXED_ROLLBACK_MAP="$(python3.12 scripts/validate_deployment_state.py traffic-map \
+    --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    --purpose=ROLLBACK --evidence-root="$EVIDENCE_ROOT" \
+    --observed-file="$AUTHORIZED_ROLLBACK_TARGET_MAP_FILE" \
+    --expected-file="$AUTHORIZED_ROLLBACK_TARGET_MAP_FILE" --output=command-map)" \
+    || fail 'rollback command-map derivation'
+  COMPLETE_ROLLBACK_TAG_MAP="$(python3.12 scripts/validate_deployment_state.py traffic-map \
+    --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    --purpose=ROLLBACK --evidence-root="$EVIDENCE_ROOT" \
+    --observed-file="$AUTHORIZED_ROLLBACK_TARGET_MAP_FILE" \
+    --expected-file="$AUTHORIZED_ROLLBACK_TARGET_MAP_FILE" --output=tag-map)" \
+    || fail 'rollback tag-map derivation'
+  if [[ "$COMPLETE_ROLLBACK_TAG_MAP" == - ]]; then
+    ROLLBACK_TAG_MODE=CLEAR
+  else
+    ROLLBACK_TAG_MODE=SET
+  fi
+
+  gcloud run revisions describe "$BASELINE_REVISION" \
+    --account="$ACCOUNT" --project="$PROJECT_ID" --region="$REGION" \
+    --format='json(metadata.name,status.conditions,status.imageDigest)' \
+    | bind_scope revision \
+    | python3.12 scripts/validate_deployment_state.py revision \
+        --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+        --expected-revision="$BASELINE_REVISION" \
+        --expected-digest="$BASELINE_DIGEST"
+
+  ROLLBACK_PRE="$EVIDENCE_ROOT/rollback-pre.json"
+  ROLLBACK_POST="$EVIDENCE_ROOT/rollback-post.json"
+  python3.12 scripts/validate_deployment_state.py evidence-path \
+    --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    --evidence-root="$EVIDENCE_ROOT" --output-file="$ROLLBACK_PRE" \
+    --output-file="$ROLLBACK_POST" >/dev/null \
+    || fail 'unsafe or preexisting rollback evidence path'
+  gcloud run services describe "$SERVICE" \
+    --account="$ACCOUNT" --project="$PROJECT_ID" --region="$REGION" \
+    --format='json(status.latestReadyRevisionName,status.traffic)' \
+    > "$ROLLBACK_PRE"
+  compare_complete_map ROLLBACK "$ROLLBACK_PRE" \
+    "$AUTHORIZED_ROLLBACK_CURRENT_MAP_FILE"
+
+  if [[ "$ROLLBACK_TAG_MODE" == SET ]]; then
+    gcloud run services update-traffic "$SERVICE" \
+      --account="$ACCOUNT" --project="$PROJECT_ID" --region="$REGION" \
+      --set-tags="$COMPLETE_ROLLBACK_TAG_MAP" \
+      --to-revisions="$COMPLETE_FIXED_ROLLBACK_MAP" --quiet
+  else
+    gcloud run services update-traffic "$SERVICE" \
+      --account="$ACCOUNT" --project="$PROJECT_ID" --region="$REGION" \
+      --clear-tags --to-revisions="$COMPLETE_FIXED_ROLLBACK_MAP" --quiet
+  fi
+
+  gcloud run services describe "$SERVICE" \
+    --account="$ACCOUNT" --project="$PROJECT_ID" --region="$REGION" \
+    --format='json(status.latestReadyRevisionName,status.traffic)' \
+    > "$ROLLBACK_POST"
+  compare_complete_map ROLLBACK "$ROLLBACK_POST" \
+    "$AUTHORIZED_ROLLBACK_TARGET_MAP_FILE"
 )
 ```
 
-After a future successful rollback, record the verified original map, observed
-pre-rollback map, final map, reason, time, operator, impact, and follow-up
-decision. Preserve the candidate revision and image for investigation unless a
-separate retention or security authorization requires otherwise.
+Installed help specifies that tag changes occur before the percentage change
+when both are supplied. Any malformed input, precondition mismatch, command
+failure, or final mismatch stops and reports failure without an automatic second
+traffic command.
 
-## 10. Remaining gates
+## 11. Remaining gates
 
-Before deployment or participant enrollment, the owner must still authorize and
-verify the gcloud command/output schemas, exact upload behavior, Linux/container
-build, Artifact Registry permissions, Secret Manager references, required
-runtime configuration, candidate smoke and integration behavior, Cloud Run
-proxy/log privacy, Airtable/GHL compatibility, delivery, approved Gemini use,
-browser and recovery behavior, monitoring, and rollback rehearsal.
+Corrected local procedure tests do not prove Cloud permissions, exact current
+configuration, build success, candidate behavior, or rollback behavior. Before
+deployment or participant enrollment, separately authorize and verify:
 
-Participant enrollment remains unauthorized.
+- the corrected `SESSION_SECRET` reference query and enabled exact version;
+- all required safe runtime metadata and authentication policy;
+- exact candidate tag and revision nonexistence;
+- build and Artifact Registry permissions;
+- immutable candidate build evidence;
+- candidate readiness, zero traffic, and configuration preservation;
+- test-only Cloud Run, Airtable, Gemini, GHL, browser, proxy, and log behavior;
+- monitoring thresholds and rollback rehearsal.
+
+Deployment, traffic movement, rollback, live testing, and participant enrollment
+remain unauthorized until their respective explicit approvals.

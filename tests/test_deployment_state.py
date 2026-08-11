@@ -1,0 +1,1643 @@
+import contextlib
+import io
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest import mock
+
+from scripts import validate_deployment_state as validator
+
+
+DIGEST = "sha256:" + "a" * 64
+OTHER_DIGEST = "sha256:" + "b" * 64
+BASELINE = "cbd-assess-00009-mkz"
+CANDIDATE = "cbd-assess-phase2d"
+PROJECT = "eng-drake-502618-h6"
+REGION = "us-east1"
+SERVICE = "cbd-assess"
+SOURCE_SHA = "a" * 40
+SOURCE_TREE = "b" * 40
+BUILD_ID = "12345678-1234-1234-1234-123456789abc"
+IMAGE_TAG = f"{REGION}-docker.pkg.dev/{PROJECT}/cbd/cbd-assess:{SOURCE_SHA}"
+TAG_RESOURCE = (
+    f"projects/{PROJECT}/locations/{REGION}/repositories/cbd/"
+    f"packages/cbd-assess/tags/{SOURCE_SHA}"
+)
+PACKAGE_RESOURCE = (
+    f"projects/{PROJECT}/locations/{REGION}/repositories/cbd/packages/cbd-assess"
+)
+DOCKER_IMAGE_RESOURCE = (
+    f"projects/{PROJECT}/locations/{REGION}/repositories/cbd/"
+    f"dockerImages/cbd-assess@{DIGEST}"
+)
+
+
+def scope(project=PROJECT, region=REGION, service=SERVICE):
+    return {"project": project, "region": region, "service": service}
+
+
+def scoped(key, evidence, **scope_overrides):
+    return {"scope": scope(**scope_overrides), key: evidence}
+
+
+def revision_document(*, name=BASELINE, digest=DIGEST, conditions=None):
+    if conditions is None:
+        conditions = [{"type": "Ready", "status": "True"}]
+    return {
+        "metadata": {"name": name},
+        "status": {"conditions": conditions, "imageDigest": digest},
+    }
+
+
+def traffic_document(*targets, latest_ready=BASELINE):
+    return {
+        "status": {
+            "latestReadyRevisionName": latest_ready,
+            "traffic": list(targets),
+        }
+    }
+
+
+def fixed(revision, percent, *, tag=None):
+    result = {"revisionName": revision, "percent": percent}
+    if tag is not None:
+        result["tag"] = tag
+    return result
+
+
+def latest(percent, *, tag=None):
+    result = {"latestRevision": True, "percent": percent}
+    if tag is not None:
+        result["tag"] = tag
+    return result
+
+
+def session_document(*entries):
+    return {"template": {"containers": [{"env": list(entries)}]}}
+
+
+def session_reference(secret="session-secret", version="7"):
+    return {
+        "name": "SESSION_SECRET",
+        "valueSource": {
+            "secretKeyRef": {"secret": secret, "version": version}
+        },
+    }
+
+
+def secret_metadata(*, secret_result="FOUND", version_result="FOUND", state="ENABLED"):
+    secret = {"result": secret_result}
+    version = {"result": version_result}
+    if secret_result == "FOUND":
+        secret["name"] = f"projects/{PROJECT}/secrets/session-secret"
+    if version_result == "FOUND":
+        version.update(
+            {
+                "name": f"projects/{PROJECT}/secrets/session-secret/versions/7",
+                "state": state,
+            }
+        )
+    return {
+        "requestedSecret": "session-secret",
+        "requestedVersion": "7",
+        "secret": secret,
+        "version": version,
+    }
+
+
+class ValidatorTestCase(unittest.TestCase):
+    def assert_validation_code(self, code, function, *args, **kwargs):
+        with self.assertRaises(validator.ValidationError) as caught:
+            function(*args, **kwargs)
+        self.assertEqual(caught.exception.code, code)
+
+
+class JsonSafetyTests(ValidatorTestCase):
+    def test_empty_malformed_truncated_yaml_and_flattened_input(self):
+        cases = [
+            ("", "EMPTY_INPUT"),
+            ("   ", "EMPTY_INPUT"),
+            ("{broken", "MALFORMED_JSON"),
+            ('{"status":', "MALFORMED_JSON"),
+            ("key: value", "MALFORMED_JSON"),
+            ("status.traffic[0].percent: 100", "MALFORMED_JSON"),
+        ]
+        for raw, code in cases:
+            with self.subTest(raw=raw):
+                self.assert_validation_code(code, validator.strict_loads, raw)
+
+    def test_duplicate_json_object_keys(self):
+        self.assert_validation_code(
+            "DUPLICATE_JSON_KEY",
+            validator.strict_loads,
+            '{"status":{},"status":{}}',
+        )
+
+    def test_scalar_and_null_are_rejected_when_an_object_is_required(self):
+        for raw in ("null", "42", '"text"', "[]"):
+            with self.subTest(raw=raw):
+                value = validator.strict_loads(raw)
+                with self.assertRaises(validator.ValidationError):
+                    validator.validate_revision_document(value, BASELINE, DIGEST)
+
+    def test_structurally_unexpected_documents(self):
+        for document in (None, [], "text", {"unexpected": {}}):
+            with self.subTest(document=document):
+                with self.assertRaises(validator.ValidationError):
+                    validator.validate_revision_document(document, BASELINE, DIGEST)
+
+
+class RevisionTests(ValidatorTestCase):
+    def test_exact_identity_digest_and_one_ready_true(self):
+        result = validator.validate_revision_document(
+            revision_document(
+                conditions=[
+                    {"type": "ContainerHealthy", "status": "True"},
+                    {"type": "Ready", "status": "True", "reason": "Ready"},
+                ]
+            ),
+            BASELINE,
+            DIGEST,
+        )
+        self.assertEqual(
+            result,
+            {
+                "digest": DIGEST,
+                "readiness": "READY_TRUE",
+                "revision": BASELINE,
+            },
+        )
+
+    def test_missing_duplicate_contradictory_and_null_readiness(self):
+        cases = [
+            ([], "READINESS_MISSING"),
+            ([{"type": "ContainerHealthy", "status": "True"}], "READINESS_NOT_UNIQUE"),
+            (
+                [
+                    {"type": "Ready", "status": "True"},
+                    {"type": "Ready", "status": "True"},
+                ],
+                "CONDITION_DUPLICATE",
+            ),
+            (
+                [
+                    {"type": "Ready", "status": "True"},
+                    {"type": "Ready", "status": "False"},
+                ],
+                "CONDITION_DUPLICATE",
+            ),
+            ([{"type": "Ready", "status": "False"}], "READINESS_NOT_TRUE"),
+            ([{"type": "Ready", "status": None}], "CONDITION_MALFORMED"),
+            ([None], "CONDITION_MALFORMED"),
+        ]
+        for conditions, code in cases:
+            with self.subTest(code=code):
+                self.assert_validation_code(
+                    code,
+                    validator.validate_revision_document,
+                    revision_document(conditions=conditions),
+                    BASELINE,
+                    DIGEST,
+                )
+
+    def test_wrong_revision_identity(self):
+        self.assert_validation_code(
+            "REVISION_IDENTITY_MISMATCH",
+            validator.validate_revision_document,
+            revision_document(name=CANDIDATE),
+            BASELINE,
+            DIGEST,
+        )
+
+    def test_wrong_digest(self):
+        self.assert_validation_code(
+            "REVISION_DIGEST_MISMATCH",
+            validator.validate_revision_document,
+            revision_document(digest=OTHER_DIGEST),
+            BASELINE,
+            DIGEST,
+        )
+
+    def test_null_required_revision_structure(self):
+        for document in (
+            {"metadata": None, "status": {}},
+            {"metadata": {"name": BASELINE}, "status": None},
+            {
+                "metadata": {"name": BASELINE},
+                "status": {"conditions": None, "imageDigest": DIGEST},
+            },
+        ):
+            with self.subTest(document=document):
+                with self.assertRaises(validator.ValidationError):
+                    validator.validate_revision_document(document, BASELINE, DIGEST)
+
+
+class TrafficTests(ValidatorTestCase):
+    def test_one_floating_latest_target(self):
+        state = validator.parse_traffic_document(traffic_document(latest(100)))
+        self.assertIn('"type":"LATEST"', state.raw_canonical())
+        self.assertEqual(
+            json.loads(state.effective_canonical(BASELINE)),
+            [{"percent": 100, "revision": BASELINE, "tag": None}],
+        )
+
+    def test_one_fixed_revision_and_absent_tag(self):
+        state = validator.parse_traffic_document(
+            traffic_document(fixed(BASELINE, 100))
+        )
+        self.assertEqual(
+            json.loads(state.raw_canonical()),
+            [
+                {
+                    "percent": 100,
+                    "revision": BASELINE,
+                    "tag": None,
+                    "type": "FIXED",
+                }
+            ],
+        )
+
+    def test_multiple_and_tagged_targets(self):
+        state = validator.parse_traffic_document(
+            traffic_document(
+                fixed(BASELINE, 80, tag="stable"),
+                fixed(CANDIDATE, 20, tag="candidate"),
+            )
+        )
+        records = json.loads(state.raw_canonical())
+        self.assertEqual({item["tag"] for item in records}, {"stable", "candidate"})
+
+    def test_service_url_is_validated_but_not_emitted(self):
+        target = fixed(BASELINE, 100)
+        target["url"] = "https://service-url-must-not-appear.example"
+        state = validator.parse_traffic_document(traffic_document(target))
+        self.assertNotIn("service-url-must-not-appear", state.raw_canonical())
+        self.assertNotIn("service-url-must-not-appear", state.effective_canonical(None))
+
+    def test_canonical_ordering_is_deterministic(self):
+        first = validator.parse_traffic_document(
+            traffic_document(fixed(CANDIDATE, 30), fixed(BASELINE, 70))
+        )
+        second = validator.parse_traffic_document(
+            traffic_document(fixed(BASELINE, 70), fixed(CANDIDATE, 30))
+        )
+        self.assertEqual(first.raw_canonical(), second.raw_canonical())
+        self.assertEqual(first.effective_canonical(None), second.effective_canonical(None))
+
+    def test_missing_null_duplicate_invalid_and_bad_totals(self):
+        cases = [
+            ([{"percent": 100}], "TRAFFIC_TARGET_TYPE"),
+            ([{"revisionName": BASELINE}], "TRAFFIC_TARGET"),
+            ([{"revisionName": None, "percent": 100}], "TRAFFIC_REVISION"),
+            ([fixed(BASELINE, 50), fixed(BASELINE, 50)], "TRAFFIC_DUPLICATE"),
+            ([fixed(BASELINE, -1), fixed(CANDIDATE, 101)], "TRAFFIC_PERCENT"),
+            ([fixed(BASELINE, True)], "TRAFFIC_PERCENT"),
+            ([fixed(BASELINE, 99)], "TRAFFIC_TOTAL"),
+            ([fixed(BASELINE, 100), fixed(CANDIDATE, 1)], "TRAFFIC_TOTAL"),
+            ([{"latestRevision": None, "percent": 100}], "TRAFFIC_TARGET_TYPE"),
+            (
+                [
+                    {
+                        "latestRevision": True,
+                        "revisionName": BASELINE,
+                        "percent": 100,
+                    }
+                ],
+                "TRAFFIC_TARGET_TYPE",
+            ),
+        ]
+        for targets, code in cases:
+            with self.subTest(code=code):
+                self.assert_validation_code(
+                    code,
+                    validator.parse_traffic_document,
+                    traffic_document(*targets),
+                )
+
+    def test_null_scalar_and_unexpected_traffic_documents(self):
+        cases = [None, [], {}, {"status": None}, {"status": {"traffic": []}}]
+        for document in cases:
+            with self.subTest(document=document):
+                with self.assertRaises(validator.ValidationError):
+                    validator.parse_traffic_document(document)
+
+    def test_latest_resolution_requires_one_exact_revision(self):
+        state = validator.parse_traffic_document(traffic_document(latest(100)))
+        self.assert_validation_code(
+            "LATEST_RESOLUTION", state.effective_canonical, None
+        )
+        self.assert_validation_code(
+            "LATEST_RESOLUTION_MISMATCH", state.effective_canonical, CANDIDATE
+        )
+
+    def test_raw_latest_to_fixed_transition_with_candidate_absent(self):
+        result = validator.validate_zero_traffic_transition(
+            traffic_document(latest(100)),
+            traffic_document(fixed(BASELINE, 100), latest_ready=CANDIDATE),
+            candidate_revision=CANDIDATE,
+            baseline_revision=BASELINE,
+            pre_latest_ready_revision=BASELINE,
+            post_latest_ready_revision=CANDIDATE,
+        )
+        self.assertEqual(result["candidateTraffic"], "ABSENT")
+        self.assertEqual(result["baselinePercent"], 100)
+        self.assertTrue(result["effectiveAllocationPreserved"])
+
+    def test_raw_latest_to_fixed_transition_with_candidate_explicit_zero(self):
+        result = validator.validate_zero_traffic_transition(
+            traffic_document(latest(100)),
+            traffic_document(
+                fixed(BASELINE, 100), fixed(CANDIDATE, 0), latest_ready=CANDIDATE
+            ),
+            candidate_revision=CANDIDATE,
+            baseline_revision=BASELINE,
+            pre_latest_ready_revision=BASELINE,
+            post_latest_ready_revision=CANDIDATE,
+        )
+        self.assertEqual(result["candidateTraffic"], "EXPLICIT_ZERO")
+
+    def test_unexpected_effective_map_drift(self):
+        self.assert_validation_code(
+            "EFFECTIVE_TRAFFIC_DRIFT",
+            validator.validate_zero_traffic_transition,
+            traffic_document(latest(100)),
+            traffic_document(
+                fixed(BASELINE, 90),
+                fixed("cbd-assess-unexpected", 10),
+                latest_ready=CANDIDATE,
+            ),
+            candidate_revision=CANDIDATE,
+            baseline_revision=BASELINE,
+            pre_latest_ready_revision=BASELINE,
+            post_latest_ready_revision=CANDIDATE,
+        )
+
+    def test_candidate_nonzero_or_tagged_is_rejected(self):
+        cases = [
+            [fixed(BASELINE, 99), fixed(CANDIDATE, 1)],
+            [fixed(BASELINE, 100), fixed(CANDIDATE, 0, tag="candidate")],
+        ]
+        for targets in cases:
+            with self.subTest(targets=targets):
+                with self.assertRaises(validator.ValidationError) as caught:
+                    validator.validate_zero_traffic_transition(
+                        traffic_document(latest(100)),
+                        traffic_document(*targets, latest_ready=CANDIDATE),
+                        candidate_revision=CANDIDATE,
+                        baseline_revision=BASELINE,
+                        pre_latest_ready_revision=BASELINE,
+                        post_latest_ready_revision=CANDIDATE,
+                    )
+                self.assertEqual(caught.exception.code, "CANDIDATE_HAS_TRAFFIC")
+
+    def test_tag_drift_is_rejected(self):
+        self.assert_validation_code(
+            "EFFECTIVE_TRAFFIC_DRIFT",
+            validator.validate_zero_traffic_transition,
+            traffic_document(latest(100, tag="stable")),
+            traffic_document(fixed(BASELINE, 100), latest_ready=CANDIDATE),
+            candidate_revision=CANDIDATE,
+            baseline_revision=BASELINE,
+            pre_latest_ready_revision=BASELINE,
+            post_latest_ready_revision=CANDIDATE,
+        )
+
+    def test_raw_change_beyond_documented_transformation_is_rejected(self):
+        pre = traffic_document(fixed(BASELINE, 100))
+        post = traffic_document(
+            fixed(BASELINE, 100),
+            fixed("cbd-assess-unexpected", 0),
+            latest_ready=CANDIDATE,
+        )
+        self.assert_validation_code(
+            "RAW_TRAFFIC_TRANSFORMATION",
+            validator.validate_zero_traffic_transition,
+            pre,
+            post,
+            candidate_revision=CANDIDATE,
+            baseline_revision=BASELINE,
+            pre_latest_ready_revision=BASELINE,
+            post_latest_ready_revision=CANDIDATE,
+        )
+
+
+class SessionSecretTests(ValidatorTestCase):
+    def test_valid_reference_outputs_only_selected_metadata(self):
+        document = session_document(
+            {"name": "UNRELATED_PLAINTEXT_SENTINEL"},
+            {
+                "name": "UNRELATED_SECRET",
+                "valueSource": {
+                    "secretKeyRef": {
+                        "secret": "unrelated-secret",
+                        "version": "2",
+                    }
+                },
+            },
+            session_reference(),
+        )
+        result = validator.parse_session_secret_document(document)
+        rendered = json.dumps(result, sort_keys=True)
+        self.assertEqual(result["classification"], "VALID_SECRET_MANAGER_REFERENCE")
+        self.assertEqual(result["secret"], "session-secret")
+        self.assertEqual(result["version"], "7")
+        self.assertNotIn("UNRELATED", rendered)
+
+    def test_missing_duplicate_plaintext_null_and_incomplete_reference(self):
+        missing_secret = session_reference()
+        del missing_secret["valueSource"]["secretKeyRef"]["secret"]
+        missing_version = session_reference()
+        del missing_version["valueSource"]["secretKeyRef"]["version"]
+        cases = [
+            ([], "BLOCKER_SESSION_SECRET_MISSING"),
+            (
+                [session_reference(), session_reference()],
+                "BLOCKER_SESSION_SECRET_DUPLICATE",
+            ),
+            (
+                [{"name": "SESSION_SECRET"}],
+                "BLOCKER_SESSION_SECRET_PLAINTEXT_OR_NON_REFERENCE",
+            ),
+            (
+                [{"name": "SESSION_SECRET", "valueSource": None}],
+                "BLOCKER_SESSION_SECRET_PLAINTEXT_OR_NON_REFERENCE",
+            ),
+            (
+                [session_reference(secret=None)],
+                "BLOCKER_SESSION_SECRET_PLAINTEXT_OR_NON_REFERENCE",
+            ),
+            (
+                [session_reference(version=None)],
+                "BLOCKER_SESSION_SECRET_PLAINTEXT_OR_NON_REFERENCE",
+            ),
+            (
+                [missing_secret],
+                "BLOCKER_SESSION_SECRET_PLAINTEXT_OR_NON_REFERENCE",
+            ),
+            (
+                [missing_version],
+                "BLOCKER_SESSION_SECRET_PLAINTEXT_OR_NON_REFERENCE",
+            ),
+        ]
+        for entries, code in cases:
+            with self.subTest(code=code):
+                self.assert_validation_code(
+                    code,
+                    validator.parse_session_secret_document,
+                    session_document(*entries),
+                )
+
+    def test_malformed_session_response(self):
+        for document in (None, [], {}, {"template": None}):
+            with self.subTest(document=document):
+                with self.assertRaises(validator.ValidationError):
+                    validator.parse_session_secret_document(document)
+
+    def test_plaintext_value_rejected_without_name_or_value_disclosure(self):
+        sentinel_name = "UNRELATED_NAME_MUST_NOT_APPEAR"
+        sentinel_value = "PLAINTEXT_VALUE_MUST_NOT_APPEAR"
+        raw = json.dumps(
+            scoped(
+                "serviceConfig",
+                session_document(
+                    {"name": sentinel_name, "value": sentinel_value},
+                    session_reference(),
+                ),
+            )
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(validator.sys, "stdin", io.StringIO(raw)):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                result = validator.main(
+                    [
+                        "session-secret",
+                        "--project",
+                        PROJECT,
+                        "--region",
+                        REGION,
+                        "--service",
+                        SERVICE,
+                    ]
+                )
+        self.assertEqual(result, 2)
+        rendered = stdout.getvalue() + stderr.getvalue()
+        self.assertIn("PLAINTEXT_VALUE_REJECTED", rendered)
+        self.assertNotIn(sentinel_name, rendered)
+        self.assertNotIn(sentinel_value, rendered)
+
+
+class SecretVersionTests(ValidatorTestCase):
+    def validate(self, document):
+        return validator.validate_secret_version_document(
+            document,
+            expected_secret="session-secret",
+            expected_version="7",
+            project=PROJECT,
+        )
+
+    def test_enabled_referenced_version(self):
+        result = self.validate(secret_metadata())
+        self.assertEqual(result["classification"], "EXISTING_ENABLED")
+        self.assertEqual(result["version"], "7")
+
+    def test_missing_disabled_and_destroyed_classifications(self):
+        cases = [
+            (
+                secret_metadata(
+                    secret_result="NOT_FOUND", version_result="NOT_FOUND"
+                ),
+                "MISSING_SECRET",
+            ),
+            (secret_metadata(version_result="NOT_FOUND"), "MISSING_VERSION"),
+            (secret_metadata(state="DISABLED"), "DISABLED"),
+            (secret_metadata(state="DESTROYED"), "DESTROYED"),
+        ]
+        for document, classification in cases:
+            with self.subTest(classification=classification):
+                self.assertEqual(self.validate(document)["classification"], classification)
+
+    def test_malformed_secret_version_metadata(self):
+        cases = [
+            None,
+            {},
+            {"requestedSecret": "session-secret"},
+            {
+                **secret_metadata(),
+                "version": {"result": "FOUND", "name": None, "state": "ENABLED"},
+            },
+            {
+                **secret_metadata(),
+                "version": {
+                    "result": "FOUND",
+                    "name": f"projects/{PROJECT}/secrets/session-secret/versions/7",
+                    "state": "UNKNOWN",
+                },
+            },
+        ]
+        for document in cases:
+            with self.subTest(document=document):
+                with self.assertRaises(validator.ValidationError):
+                    self.validate(document)
+
+    def test_exact_numeric_version_must_match(self):
+        document = secret_metadata()
+        document["requestedVersion"] = "8"
+        self.assert_validation_code(
+            "SECRET_VERSION_MISMATCH",
+            validator.validate_secret_version_document,
+            document,
+            expected_secret="session-secret",
+            expected_version="8",
+            project=PROJECT,
+        )
+
+
+class Phase2FSecretSafetyTests(ValidatorTestCase):
+    def test_secret_reference_grammar_accepts_only_name_or_full_resource(self):
+        for secret in (
+            "session-secret",
+            f"projects/{PROJECT}/secrets/session-secret",
+        ):
+            with self.subTest(secret=secret):
+                result = validator.parse_session_secret_document(
+                    session_document(session_reference(secret=secret, version="7"))
+                )
+                self.assertEqual(result["version"], "7")
+
+    def test_secret_reference_whitespace_control_and_value_like_text_rejected(self):
+        bad_references = (
+            "",
+            "   ",
+            " session-secret",
+            "session-secret ",
+            "session\nsecret",
+            "session\x00secret",
+            "secret=plaintext-value",
+            "https://example.invalid/secret",
+            f"projects/{PROJECT}/secrets/session-secret/versions/7",
+        )
+        for secret in bad_references:
+            with self.subTest(secret=repr(secret)):
+                with self.assertRaises(validator.ValidationError):
+                    validator.parse_session_secret_document(
+                        session_document(session_reference(secret=secret))
+                    )
+
+    def test_only_exact_numeric_version_selector_is_accepted(self):
+        for version in ("", " ", "latest", "LATEST", "0", "01", "7 ", "v7"):
+            with self.subTest(version=repr(version)):
+                with self.assertRaises(validator.ValidationError):
+                    validator.parse_session_secret_document(
+                        session_document(session_reference(version=version))
+                    )
+                with self.assertRaises(validator.ValidationError):
+                    validator.validate_secret_version_document(
+                        secret_metadata(),
+                        expected_secret="session-secret",
+                        expected_version=version,
+                        project=PROJECT,
+                    )
+
+    def test_missing_secret_requires_complete_noncontradictory_envelope(self):
+        valid = secret_metadata(secret_result="NOT_FOUND", version_result="NOT_FOUND")
+        self.assertEqual(
+            validator.validate_secret_version_document(
+                valid,
+                expected_secret="session-secret",
+                expected_version="7",
+                project=PROJECT,
+            )["classification"],
+            "MISSING_SECRET",
+        )
+        malformed = [
+            {**valid, "version": None},
+            {**valid, "version": {"result": "NOT_FOUND", "state": "ENABLED"}},
+            secret_metadata(secret_result="NOT_FOUND", version_result="FOUND"),
+            {**valid, "secret": {"result": "NOT_FOUND", "name": "payload"}},
+            {**valid, "version": {"result": "AMBIGUOUS"}},
+        ]
+        for document in malformed:
+            with self.subTest(document=document):
+                with self.assertRaises(validator.ValidationError):
+                    validator.validate_secret_version_document(
+                        document,
+                        expected_secret="session-secret",
+                        expected_version="7",
+                        project=PROJECT,
+                    )
+
+
+class Phase2FScopeAndTransitionTests(ValidatorTestCase):
+    def test_scope_binding_rejects_each_mismatch(self):
+        for override in (
+            {"project": "wrong-project-123"},
+            {"region": "us-west1"},
+            {"service": "other-service"},
+        ):
+            document = scoped("revision", revision_document(), **override)
+            with self.subTest(override=override):
+                self.assert_validation_code(
+                    "SCOPE_MISMATCH",
+                    validator.scoped_payload,
+                    document,
+                    "revision",
+                    project=PROJECT,
+                    region=REGION,
+                    service=SERVICE,
+                )
+
+    def test_post_latest_ready_binding_is_mandatory_and_must_be_candidate(self):
+        pre = traffic_document(latest(100))
+        post = traffic_document(fixed(BASELINE, 100), latest_ready=CANDIDATE)
+        self.assert_validation_code(
+            "POST_LATEST_REQUIRED",
+            validator.validate_zero_traffic_transition,
+            pre,
+            post,
+            candidate_revision=CANDIDATE,
+            baseline_revision=BASELINE,
+            pre_latest_ready_revision=BASELINE,
+        )
+        for supplied, observed in (
+            (BASELINE, CANDIDATE),
+            (CANDIDATE, BASELINE),
+        ):
+            with self.subTest(supplied=supplied, observed=observed):
+                self.assert_validation_code(
+                    "POST_LATEST_MISMATCH",
+                    validator.validate_zero_traffic_transition,
+                    pre,
+                    traffic_document(fixed(BASELINE, 100), latest_ready=observed),
+                    candidate_revision=CANDIDATE,
+                    baseline_revision=BASELINE,
+                    pre_latest_ready_revision=BASELINE,
+                    post_latest_ready_revision=supplied,
+                )
+
+
+class Phase2FGateTests(ValidatorTestCase):
+    def build_document(self, status="SUCCESS", **overrides):
+        document = {
+            "name": f"projects/{PROJECT}/locations/{REGION}/builds/{BUILD_ID}",
+            "id": BUILD_ID,
+            "projectId": PROJECT,
+            "status": status,
+            "images": [IMAGE_TAG],
+            "createTime": "2026-08-11T12:00:00Z",
+            "startTime": "2026-08-11T12:00:01Z",
+            "finishTime": "2026-08-11T12:01:00Z",
+            "substitutions": {
+                "_SOURCE_SHA": SOURCE_SHA,
+                "_SOURCE_TREE": SOURCE_TREE,
+                "_CANDIDATE_IMAGE": IMAGE_TAG,
+            },
+            "results": {
+                "images": [
+                    {
+                        "name": IMAGE_TAG,
+                        "digest": DIGEST,
+                        "artifactRegistryPackage": PACKAGE_RESOURCE,
+                    }
+                ]
+            },
+        }
+        document.update(overrides)
+        return document
+
+    def test_candidate_tag_and_revision_exact_not_found_and_collision(self):
+        authorized_scope = validator.require_scope(PROJECT, REGION, SERVICE)
+        not_found = {
+            "httpStatus": 404,
+            "body": {"error": {"code": 404, "status": "NOT_FOUND"}},
+        }
+        for kind in ("CANDIDATE_TAG", "CANDIDATE_REVISION"):
+            resource = (
+                TAG_RESOURCE
+                if kind == "CANDIDATE_TAG"
+                else authorized_scope.service_resource + f"/revisions/{CANDIDATE}"
+            )
+            with self.subTest(kind=kind):
+                self.assertEqual(
+                    validator.validate_nonexistence_document(
+                        not_found,
+                        expected_kind=kind,
+                        expected_resource=resource,
+                        scope=authorized_scope,
+                    )["classification"],
+                    f"{kind}_AVAILABLE",
+                )
+                self.assert_validation_code(
+                    f"{kind}_COLLISION",
+                    validator.validate_nonexistence_document,
+                    {"httpStatus": 200, "body": {"name": resource}},
+                    expected_kind=kind,
+                    expected_resource=resource,
+                    scope=authorized_scope,
+                )
+        for status in (401, 403, 500, 0):
+            with self.subTest(status=status):
+                with self.assertRaises(validator.ValidationError):
+                    validator.validate_nonexistence_document(
+                        {"httpStatus": status, "body": {}},
+                        expected_kind="CANDIDATE_TAG",
+                        expected_resource=TAG_RESOURCE,
+                        scope=authorized_scope,
+                    )
+
+    def test_build_identifier_source_image_and_terminal_state(self):
+        result = validator.validate_build_document(
+            self.build_document(),
+            expected_build_id=BUILD_ID,
+            expected_source_sha=SOURCE_SHA,
+            expected_source_tree=SOURCE_TREE,
+            expected_image_tag=IMAGE_TAG,
+            scope=validator.require_scope(PROJECT, REGION, SERVICE),
+        )
+        self.assertEqual(result["classification"], "BUILD_SUCCESS")
+        for bad_id in ("", "not-a-uuid", "12345678-1234"):
+            with self.subTest(bad_id=bad_id):
+                with self.assertRaises(validator.ValidationError):
+                    validator.validate_build_document(
+                        self.build_document(),
+                        expected_build_id=bad_id,
+                        expected_source_sha=SOURCE_SHA,
+                        expected_source_tree=SOURCE_TREE,
+                        expected_image_tag=IMAGE_TAG,
+                        scope=validator.require_scope(PROJECT, REGION, SERVICE),
+                    )
+        for state in validator.NONTERMINAL_BUILD_STATES:
+            with self.subTest(state=state):
+                nonterminal = self.build_document(state)
+                nonterminal.pop("finishTime")
+                nonterminal.pop("results")
+                with self.assertRaises(validator.NonterminalBuild):
+                    validator.validate_build_document(
+                        nonterminal,
+                        expected_build_id=BUILD_ID,
+                        expected_source_sha=SOURCE_SHA,
+                        expected_source_tree=SOURCE_TREE,
+                        expected_image_tag=IMAGE_TAG,
+                        scope=validator.require_scope(PROJECT, REGION, SERVICE),
+                    )
+        for state in validator.FAILED_BUILD_STATES | {"UNKNOWN", ""}:
+            with self.subTest(state=state):
+                with self.assertRaises(validator.ValidationError):
+                    validator.validate_build_document(
+                        self.build_document(state),
+                        expected_build_id=BUILD_ID,
+                        expected_source_sha=SOURCE_SHA,
+                        expected_source_tree=SOURCE_TREE,
+                        expected_image_tag=IMAGE_TAG,
+                        scope=validator.require_scope(PROJECT, REGION, SERVICE),
+                    )
+        for override in (
+            {"id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"},
+            {"images": [IMAGE_TAG + "-other"]},
+            {
+                "substitutions": {
+                    "_SOURCE_SHA": "c" * 40,
+                    "_SOURCE_TREE": SOURCE_TREE,
+                    "_CANDIDATE_IMAGE": IMAGE_TAG,
+                }
+            },
+        ):
+            with self.subTest(override=override):
+                with self.assertRaises(validator.ValidationError):
+                    validator.validate_build_document(
+                        self.build_document(**override),
+                        expected_build_id=BUILD_ID,
+                        expected_source_sha=SOURCE_SHA,
+                        expected_source_tree=SOURCE_TREE,
+                        expected_image_tag=IMAGE_TAG,
+                        scope=validator.require_scope(PROJECT, REGION, SERVICE),
+                    )
+
+    def test_tag_resolution_is_unique_canonical_and_build_bound(self):
+        evidence = {
+            "name": DOCKER_IMAGE_RESOURCE,
+            "uri": IMAGE_TAG.rsplit(":", 1)[0] + "@" + DIGEST,
+            "tags": [IMAGE_TAG],
+        }
+        result = validator.validate_tag_resolution_document(
+            evidence,
+            expected_image_tag=IMAGE_TAG,
+            scope=validator.require_scope(PROJECT, REGION, SERVICE),
+        )
+        self.assertEqual(result["imageDigestRef"], IMAGE_TAG.rsplit(":", 1)[0] + "@" + DIGEST)
+        for changed in (
+            {**evidence, "name": DOCKER_IMAGE_RESOURCE + "-other"},
+            {**evidence, "uri": evidence["uri"] + "," + OTHER_DIGEST},
+            {**evidence, "tags": [IMAGE_TAG + "-other"]},
+            [evidence, evidence],
+        ):
+            with self.subTest(changed=changed):
+                with self.assertRaises(validator.ValidationError):
+                    validator.validate_tag_resolution_document(
+                        changed,
+                        expected_image_tag=IMAGE_TAG,
+                        scope=validator.require_scope(PROJECT, REGION, SERVICE),
+                    )
+
+    def test_runtime_configuration_equality_and_drift(self):
+        authorized_scope = validator.require_scope(PROJECT, REGION, SERVICE)
+        runtime = {
+            "name": authorized_scope.service_resource,
+            "runtime": {
+                "serviceAccount": "runtime@example.invalid",
+                "containerConcurrency": 80,
+                "timeout": "300s",
+                "environment": [
+                    {"name": "SESSION_SECRET", "secret": "session-secret", "version": "7"}
+                ],
+            },
+        }
+        first = validator.validate_runtime_document(runtime, authorized_scope)
+        second = validator.validate_runtime_document(runtime, authorized_scope)
+        self.assertEqual(first, second)
+        self.assertEqual(
+            validator.validate_runtime_comparison(
+                {"preSha256": first["sha256"], "postSha256": second["sha256"]}
+            )["classification"],
+            "RUNTIME_UNCHANGED",
+        )
+        changed = json.loads(json.dumps(runtime))
+        changed["runtime"]["containerConcurrency"] = 81
+        changed_hash = validator.validate_runtime_document(changed, authorized_scope)["sha256"]
+        self.assert_validation_code(
+            "RUNTIME_DRIFT",
+            validator.validate_runtime_comparison,
+            {"preSha256": first["sha256"], "postSha256": changed_hash},
+        )
+        for unsafe in (
+            {**runtime, "name": "projects/wrong12/locations/us-east1/services/other"},
+            {**runtime, "runtime": {"value": "ADVERSARIAL_SECRET"}},
+            {**runtime, "runtime": {"unknown": "ADVERSARIAL_SECRET"}},
+        ):
+            with self.subTest(unsafe=unsafe):
+                with self.assertRaises(validator.ValidationError):
+                    validator.validate_runtime_document(unsafe, authorized_scope)
+
+    def test_exact_expected_traffic_and_rollback_maps(self):
+        observed = traffic_document(fixed(BASELINE, 100))
+        for purpose in ("TRAFFIC", "ROLLBACK"):
+            with self.subTest(purpose=purpose):
+                result = validator.validate_traffic_map_comparison(
+                    {"observed": observed, "expected": observed}, purpose=purpose
+                )
+                self.assertEqual(result["classification"], f"{purpose}_MAP_MATCH")
+                with self.assertRaises(validator.ValidationError):
+                    validator.validate_traffic_map_comparison(
+                        {
+                            "observed": observed,
+                            "expected": traffic_document(
+                                fixed(CANDIDATE, 100), latest_ready=CANDIDATE
+                            ),
+                        },
+                        purpose=purpose,
+                    )
+                with self.assertRaises(validator.ValidationError):
+                    validator.validate_traffic_map_comparison(
+                        {"observed": observed, "expected": traffic_document(latest(100))},
+                        purpose=purpose,
+                    )
+
+
+class Phase2HRegressionTests(ValidatorTestCase):
+    def setUp(self):
+        self.authorized_scope = validator.require_scope(PROJECT, REGION, SERVICE)
+        self.build = Phase2FGateTests().build_document()
+        self.docker_image = {
+            "name": DOCKER_IMAGE_RESOURCE,
+            "uri": IMAGE_TAG.rsplit(":", 1)[0] + "@" + DIGEST,
+            "tags": [IMAGE_TAG],
+        }
+
+    def validate_build(self, document):
+        return validator.validate_build_document(
+            document,
+            expected_build_id=BUILD_ID,
+            expected_source_sha=SOURCE_SHA,
+            expected_source_tree=SOURCE_TREE,
+            expected_image_tag=IMAGE_TAG,
+            scope=self.authorized_scope,
+        )
+
+    def authorize(self, build=None, docker_image=None):
+        return validator.validate_deployment_image_authorization(
+            self.build if build is None else build,
+            self.docker_image if docker_image is None else docker_image,
+            expected_build_id=BUILD_ID,
+            expected_source_sha=SOURCE_SHA,
+            expected_source_tree=SOURCE_TREE,
+            expected_image_tag=IMAGE_TAG,
+            scope=self.authorized_scope,
+        )
+
+    def test_latest_revision_rejects_integer_zero_and_one(self):
+        for value in (0, 1):
+            with self.subTest(value=value):
+                self.assert_validation_code(
+                    "TRAFFIC_TARGET_TYPE",
+                    validator.parse_traffic_document,
+                    traffic_document(
+                        {"revisionName": BASELINE, "latestRevision": value, "percent": 100}
+                    ),
+                )
+
+    def test_latest_revision_exact_boolean_contract(self):
+        self.assertEqual(
+            validator.parse_traffic_document(
+                traffic_document({"latestRevision": True, "percent": 100})
+            ).targets[0].target_type,
+            "LATEST",
+        )
+        self.assertEqual(
+            validator.parse_traffic_document(
+                traffic_document(
+                    {"revisionName": BASELINE, "latestRevision": False, "percent": 100}
+                )
+            ).targets[0].target_type,
+            "FIXED",
+        )
+        for value in (None, "true", "false", "0", "1"):
+            with self.subTest(value=value):
+                with self.assertRaises(validator.ValidationError):
+                    validator.parse_traffic_document(
+                        traffic_document(
+                            {"revisionName": BASELINE, "latestRevision": value, "percent": 100}
+                        )
+                    )
+
+    def test_impossible_build_timestamps_are_rejected(self):
+        for field, value in (
+            ("createTime", "2026-99-11T12:00:00Z"),
+            ("startTime", "2026-02-30T12:00:00Z"),
+            ("finishTime", "2026-08-11T25:00:00Z"),
+        ):
+            with self.subTest(field=field):
+                document = json.loads(json.dumps(self.build))
+                document[field] = value
+                self.assert_validation_code("BUILD_TIME", self.validate_build, document)
+
+    def test_build_timestamp_chronology_and_format(self):
+        reversed_build = json.loads(json.dumps(self.build))
+        reversed_build["finishTime"] = "2026-08-11T11:59:59Z"
+        self.assert_validation_code("BUILD_TIME_ORDER", self.validate_build, reversed_build)
+        for value in (
+            " 2026-08-11T12:00:00Z",
+            "2026-08-11T12:00:00.Z",
+            "2026-08-11 12:00:00Z",
+        ):
+            document = json.loads(json.dumps(self.build))
+            document["createTime"] = value
+            with self.subTest(value=value):
+                self.assert_validation_code("BUILD_TIME", self.validate_build, document)
+
+    def test_successful_build_requires_one_built_image(self):
+        for results in (None, {}, {"images": []}, {"images": [
+            self.build["results"]["images"][0], self.build["results"]["images"][0]
+        ]}):
+            document = json.loads(json.dumps(self.build))
+            if results is None:
+                document.pop("results")
+            else:
+                document["results"] = results
+            with self.subTest(results=results):
+                with self.assertRaises(validator.ValidationError):
+                    self.validate_build(document)
+
+    def test_built_image_name_digest_and_package_are_exact(self):
+        overrides = (
+            ("name", IMAGE_TAG.replace("/cbd/", "/other/"), "BUILT_IMAGE_NAME"),
+            ("digest", "sha256:short", "BUILT_IMAGE_DIGEST"),
+            ("artifactRegistryPackage", PACKAGE_RESOURCE.replace("/cbd/", "/other/"), "BUILT_IMAGE_PACKAGE"),
+        )
+        for field, value, code in overrides:
+            document = json.loads(json.dumps(self.build))
+            document["results"]["images"][0][field] = value
+            with self.subTest(field=field):
+                self.assert_validation_code(code, self.validate_build, document)
+
+    def test_manual_push_or_injected_claims_cannot_replace_build_results(self):
+        document = json.loads(json.dumps(self.build))
+        document.pop("results")
+        document["imageDigest"] = DIGEST
+        with self.assertRaises(validator.ValidationError):
+            self.validate_build(document)
+
+    def test_cross_repository_docker_image_is_rejected(self):
+        changed = json.loads(json.dumps(self.docker_image))
+        changed["name"] = changed["name"].replace("/repositories/cbd/", "/repositories/other/")
+        with self.assertRaises(validator.ValidationError):
+            validator.validate_tag_resolution_document(
+                changed, expected_image_tag=IMAGE_TAG, scope=self.authorized_scope
+            )
+
+    def test_build_and_tag_digest_mismatch_is_rejected(self):
+        changed = json.loads(json.dumps(self.docker_image))
+        changed["name"] = changed["name"].replace(DIGEST, OTHER_DIGEST)
+        changed["uri"] = changed["uri"].replace(DIGEST, OTHER_DIGEST)
+        self.assert_validation_code(
+            "IMAGE_DIGEST_MISMATCH", self.authorize, docker_image=changed
+        )
+
+    def test_exact_build_and_tag_digest_agreement_is_authorized(self):
+        result = self.authorize()
+        self.assertEqual(result["classification"], "DEPLOYMENT_IMAGE_AUTHORIZED")
+        self.assertEqual(result["imageDigestRef"], IMAGE_TAG.rsplit(":", 1)[0] + "@" + DIGEST)
+
+    def test_stale_build_scope_source_or_identity_is_rejected(self):
+        mutations = (
+            ("id", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+            ("projectId", "other-project"),
+        )
+        for field, value in mutations:
+            document = json.loads(json.dumps(self.build))
+            document[field] = value
+            with self.subTest(field=field):
+                with self.assertRaises(validator.ValidationError):
+                    self.authorize(build=document)
+        with self.assertRaises(validator.ValidationError):
+            validator.validate_deployment_image_authorization(
+                self.build,
+                self.docker_image,
+                expected_build_id=BUILD_ID,
+                expected_source_sha="c" * 40,
+                expected_source_tree=SOURCE_TREE,
+                expected_image_tag=IMAGE_TAG,
+                scope=self.authorized_scope,
+            )
+
+    def test_duplicate_traffic_tags_and_repeated_revisions_are_rejected(self):
+        cases = (
+            traffic_document(
+                fixed(BASELINE, 50, tag="stable"),
+                fixed(CANDIDATE, 50, tag="stable"),
+            ),
+            traffic_document(
+                fixed(BASELINE, 50, tag="stable"),
+                fixed(BASELINE, 50, tag="other"),
+            ),
+        )
+        for document in cases:
+            with self.subTest(document=document):
+                with self.assertRaises(validator.ValidationError):
+                    validator.parse_traffic_document(document)
+
+    def test_map_command_is_derived_from_validated_unique_targets(self):
+        expected = traffic_document(
+            fixed(BASELINE, 80, tag="stable"), fixed(CANDIDATE, 20)
+        )
+        result = validator.validate_traffic_map_comparison(
+            {"observed": expected, "expected": expected}, purpose="TRAFFIC"
+        )
+        self.assertEqual(
+            result["commandMap"], f"{BASELINE}=80,{CANDIDATE}=20"
+        )
+        self.assertEqual(result["tagMap"], f"stable={BASELINE}")
+
+    def test_duplicate_permission_and_not_found_fields_fail_before_classification(self):
+        raw = (
+            '{"error":{"code":403,"code":404,'
+            '"status":"PERMISSION_DENIED","status":"NOT_FOUND"}}'
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        args = [
+            "nonexistence", "--project", PROJECT, "--region", REGION,
+            "--service", SERVICE, "--kind", "CANDIDATE_REVISION",
+            "--expected-resource", f"projects/{PROJECT}/locations/{REGION}/services/{SERVICE}/revisions/{CANDIDATE}",
+            "--http-status", "404",
+        ]
+        with mock.patch.object(validator.sys, "stdin", io.StringIO(raw)):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                status = validator.main(args)
+        self.assertEqual(status, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("DUPLICATE_JSON_KEY", stderr.getvalue())
+        self.assertNotIn("PERMISSION_DENIED", stderr.getvalue())
+
+    def test_evidence_root_and_file_paths_fail_closed(self):
+        with tempfile.TemporaryDirectory(prefix="phase2h-path-test.") as created_root:
+            root = __import__("os").path.realpath(created_root)
+            safe_output = str(Path(root) / "new-output.json")
+            self.assertEqual(validator.validate_evidence_root(root), root)
+            self.assertEqual(
+                validator.validate_evidence_file_path(root, safe_output, must_exist=False),
+                safe_output,
+            )
+            existing = Path(root) / "existing.json"
+            existing.write_text("{}", encoding="utf-8")
+            self.assertEqual(
+                validator.validate_evidence_file_path(root, str(existing), must_exist=True),
+                str(existing),
+            )
+            for unsafe in (
+                "relative/path",
+                root + '/quote".json',
+                root + "/line\nbreak.json",
+                str(Path(root) / ".." / "escape.json"),
+                str(Path(root) / "missing.json"),
+            ):
+                with self.subTest(unsafe=unsafe):
+                    with self.assertRaises(validator.ValidationError):
+                        validator.validate_evidence_file_path(root, unsafe, must_exist=True)
+            if hasattr(os := __import__("os"), "symlink"):
+                link = Path(root) / "link.json"
+                os.symlink(existing, link)
+                with self.assertRaises(validator.ValidationError):
+                    validator.validate_evidence_file_path(root, str(link), must_exist=True)
+
+    def test_preexisting_output_is_rejected(self):
+        with tempfile.TemporaryDirectory(prefix="phase2h-output-test.") as created_root:
+            root = __import__("os").path.realpath(created_root)
+            existing = Path(root) / "result.json"
+            existing.write_text("{}", encoding="utf-8")
+            self.assert_validation_code(
+                "EVIDENCE_FILE_EXISTS",
+                validator.validate_evidence_file_path,
+                root,
+                str(existing),
+                must_exist=False,
+            )
+
+    def test_identifier_and_curl_directive_injection_is_rejected(self):
+        for project in ('bad"project', "bad\nproject", "bad\\project"):
+            with self.subTest(project=project):
+                with self.assertRaises(validator.ValidationError):
+                    validator.require_scope(project, REGION, SERVICE)
+        for image_tag in (
+            IMAGE_TAG + '"\nurl = "https://invalid.example',
+            IMAGE_TAG.replace("/cbd/", "/../"),
+            " " + IMAGE_TAG,
+        ):
+            with self.subTest(image_tag=image_tag):
+                with self.assertRaises(validator.ValidationError):
+                    validator._image_identity(image_tag, self.authorized_scope)
+
+    def test_authorize_image_cli_revalidates_strict_raw_files(self):
+        with tempfile.TemporaryDirectory(prefix="phase2h-authorize-test.") as created_root:
+            root = __import__("os").path.realpath(created_root)
+            build_file = Path(root) / "build.json"
+            tag_file = Path(root) / "tag.json"
+            build_file.write_text(json.dumps(self.build), encoding="utf-8")
+            tag_file.write_text(json.dumps(self.docker_image), encoding="utf-8")
+            args = [
+                "authorize-image", "--project", PROJECT, "--region", REGION,
+                "--service", SERVICE, "--evidence-root", root,
+                "--build-evidence-file", str(build_file),
+                "--tag-evidence-file", str(tag_file),
+                "--expected-build-id", BUILD_ID,
+                "--expected-source-sha", SOURCE_SHA,
+                "--expected-source-tree", SOURCE_TREE,
+                "--expected-image-tag", IMAGE_TAG,
+                "--output", "image-ref",
+            ]
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                status = validator.main(args)
+            self.assertEqual(status, 0)
+            self.assertEqual(
+                stdout.getvalue().strip(), IMAGE_TAG.rsplit(":", 1)[0] + "@" + DIGEST
+            )
+            self.assertEqual(stderr.getvalue(), "")
+            build_file.write_text(
+                '{"name":"safe","status":"SUCCESS","status":"FAILURE"}',
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                status = validator.main(args)
+            self.assertEqual(status, 2)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("DUPLICATE_JSON_KEY", stderr.getvalue())
+            self.assertNotIn("FAILURE", stderr.getvalue())
+
+    def test_strict_file_parser_protects_map_runtime_and_transition_inputs(self):
+        with tempfile.TemporaryDirectory(prefix="phase2h-strict-file-test.") as created_root:
+            root = __import__("os").path.realpath(created_root)
+            ambiguous = Path(root) / "ambiguous.json"
+            ambiguous.write_text('{"status":{},"status":{}}', encoding="utf-8")
+            self.assert_validation_code(
+                "DUPLICATE_JSON_KEY", validator._strict_load_path, str(ambiguous)
+            )
+
+    def test_secret_name_255_and_256_character_boundaries(self):
+        valid = "s" * 255
+        invalid = "s" * 256
+        for value in (valid, f"projects/{PROJECT}/secrets/{valid}"):
+            self.assertEqual(validator._validate_secret_reference(value), value)
+        for value in (invalid, f"projects/{PROJECT}/secrets/{invalid}"):
+            with self.assertRaises(validator.ValidationError):
+                validator._validate_secret_reference(value)
+
+    def test_documentation_uses_current_provenance_contract(self):
+        runbook = Path("DEPLOYMENT_RUNBOOK.md").read_text(encoding="utf-8")
+        self.assertIn("results.images", runbook)
+        self.assertIn("authorize-image", runbook)
+        self.assertNotIn('tag.update({"buildId"', runbook)
+
+    def test_documented_curl_authentication_fails_before_request(self):
+        runbook = Path("DEPLOYMENT_RUNBOOK.md").read_text(encoding="utf-8")
+        self.assertIn("authorized_curl()", runbook)
+        self.assertIn('curl_config="$(emit_bearer_config)" || return 1', runbook)
+        self.assertIn("curl --config <(printf '%s\\n' \"$curl_config\") \"$@\"", runbook)
+        self.assertNotIn("emit_bearer_config | curl", runbook)
+        self.assertEqual(runbook.count("authorized_curl --"), 6)
+
+
+class Phase2JRegressionTests(ValidatorTestCase):
+    def setUp(self):
+        self.authorized_scope = validator.require_scope(PROJECT, REGION, SERVICE)
+        self.build = Phase2FGateTests().build_document()
+
+    def validate_build(self, document):
+        return validator.validate_build_document(
+            document,
+            expected_build_id=BUILD_ID,
+            expected_source_sha=SOURCE_SHA,
+            expected_source_tree=SOURCE_TREE,
+            expected_image_tag=IMAGE_TAG,
+            scope=self.authorized_scope,
+        )
+
+    def invoke_build_raw(self, raw):
+        args = [
+            "build", "--project", PROJECT, "--region", REGION,
+            "--service", SERVICE, "--expected-build-id", BUILD_ID,
+            "--expected-source-sha", SOURCE_SHA,
+            "--expected-source-tree", SOURCE_TREE,
+            "--expected-image-tag", IMAGE_TAG, "--raw",
+        ]
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(validator.sys, "stdin", io.StringIO(raw)):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                status = validator.main(args)
+        return status, stdout.getvalue(), stderr.getvalue()
+
+    def test_nanosecond_reversals_at_seventh_eighth_and_ninth_digits_fail(self):
+        for create_time, start_time in (
+            ("2026-08-11T12:00:00.000000900Z", "2026-08-11T12:00:00.000000100Z"),
+            ("2026-08-11T12:00:00.000000090Z", "2026-08-11T12:00:00.000000010Z"),
+            ("2026-08-11T12:00:00.000000009Z", "2026-08-11T12:00:00.000000001Z"),
+        ):
+            document = json.loads(json.dumps(self.build))
+            document["createTime"] = create_time
+            document["startTime"] = start_time
+            with self.subTest(create_time=create_time):
+                self.assert_validation_code(
+                    "BUILD_TIME_ORDER", self.validate_build, document
+                )
+
+    def test_timestamp_precision_generated_forms_equality_and_offsets(self):
+        values = (
+            "2026-08-11T12:00:00Z",
+            "2026-08-11T12:00:00.123Z",
+            "2026-08-11T12:00:00.123456Z",
+            "2026-08-11T12:00:00.123456789Z",
+        )
+        for value in values:
+            with self.subTest(value=value):
+                self.assertIsInstance(
+                    validator._parse_build_timestamp(value, "test"),
+                    validator.ExactTimestamp,
+                )
+        instant = validator._parse_build_timestamp(
+            "2026-08-11T12:00:00.123456789Z", "test"
+        )
+        self.assertEqual(
+            instant,
+            validator._parse_build_timestamp(
+                "2026-08-11T07:00:00.123456789-05:00", "test"
+            ),
+        )
+        equal = json.loads(json.dumps(self.build))
+        equal["createTime"] = "2026-08-11T12:00:00.000000009Z"
+        equal["startTime"] = "2026-08-11T07:00:00.000000009-05:00"
+        self.assertEqual(self.validate_build(equal)["classification"], "BUILD_SUCCESS")
+
+    def test_timestamp_invalid_precision_calendar_and_offsets_fail(self):
+        invalid = (
+            "2026-08-11T12:00:00.1234567890Z",
+            "2026-08-11T12:00:00.Z",
+            "2026-08-11T12:00:00..1Z",
+            "2025-02-29T12:00:00Z",
+            "2026-08-11T12:00:00+24:00",
+            "2026-08-11T12:00:00-05:60",
+        )
+        for value in invalid:
+            with self.subTest(value=value):
+                self.assert_validation_code(
+                    "BUILD_TIME", validator._parse_build_timestamp, value, "test"
+                )
+        self.assertIsInstance(
+            validator._parse_build_timestamp("2024-02-29T12:00:00Z", "test"),
+            validator.ExactTimestamp,
+        )
+
+    def test_built_image_digest_is_field_specific_and_canonical(self):
+        self.assertEqual(validator._canonical_digest(DIGEST, "TEST_DIGEST"), DIGEST)
+        invalid = (
+            "prefix@" + DIGEST,
+            "@" + DIGEST,
+            DIGEST.upper(),
+            " " + DIGEST,
+            DIGEST + " ",
+            DIGEST + "@" + OTHER_DIGEST,
+            "sha256:" + "a" * 63,
+            "sha256:" + "a" * 65,
+            "sha512:" + "a" * 64,
+            DIGEST + "\ntrailing",
+        )
+        for value in invalid:
+            with self.subTest(value=repr(value)):
+                self.assert_validation_code(
+                    "TEST_DIGEST", validator._canonical_digest, value, "TEST_DIGEST"
+                )
+                document = json.loads(json.dumps(self.build))
+                document["results"]["images"][0]["digest"] = value
+                status, stdout, stderr = self.invoke_build_raw(json.dumps(document))
+                self.assertEqual(status, 2)
+                self.assertEqual(stdout, "")
+                self.assertIn("BUILT_IMAGE_DIGEST", stderr)
+
+    def test_push_timing_exact_structure_chronology_and_duplicate_keys(self):
+        valid = json.loads(json.dumps(self.build))
+        valid["results"]["images"][0]["pushTiming"] = {
+            "startTime": "2026-08-11T12:00:01.000000001Z",
+            "endTime": "2026-08-11T07:00:01.000000009-05:00",
+        }
+        self.assertEqual(self.validate_build(valid)["classification"], "BUILD_SUCCESS")
+        reversed_timing = json.loads(json.dumps(valid))
+        reversed_timing["results"]["images"][0]["pushTiming"] = {
+            "startTime": "2026-08-11T12:00:01.000000009Z",
+            "endTime": "2026-08-11T12:00:01.000000001Z",
+        }
+        self.assert_validation_code(
+            "BUILT_IMAGE_PUSH_TIMING_ORDER", self.validate_build, reversed_timing
+        )
+        malformed = (
+            "timing", [], None, True, 1,
+            {}, {"startTime": "2026-08-11T12:00:01Z"},
+            {"endTime": "2026-08-11T12:00:01Z"},
+            {"startTime": "bad", "endTime": "2026-08-11T12:00:01Z"},
+            {
+                "startTime": "2026-08-11T12:00:01Z",
+                "endTime": "2026-08-11T12:00:02Z",
+                "extra": "field",
+            },
+        )
+        for timing in malformed:
+            document = json.loads(json.dumps(self.build))
+            document["results"]["images"][0]["pushTiming"] = timing
+            with self.subTest(timing=timing):
+                with self.assertRaises(validator.ValidationError):
+                    self.validate_build(document)
+        raw = json.dumps(valid, separators=(",", ":"))
+        raw = raw.replace(
+            '"pushTiming":{"startTime":"2026-08-11T12:00:01.000000001Z",',
+            '"pushTiming":{"startTime":"2026-08-11T12:00:01.000000001Z",'
+            '"startTime":"2026-08-11T12:00:01.000000001Z",',
+        )
+        status, stdout, stderr = self.invoke_build_raw(raw)
+        self.assertEqual(status, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("DUPLICATE_JSON_KEY", stderr)
+
+    def test_built_image_package_and_oci_media_type_are_exact(self):
+        self.assertEqual(self.validate_build(self.build)["packageResource"], PACKAGE_RESOURCE)
+        for package in (
+            PACKAGE_RESOURCE + "/versions/" + DIGEST,
+            PACKAGE_RESOURCE.replace(f"projects/{PROJECT}/", "projects/other-project/") ,
+        ):
+            document = json.loads(json.dumps(self.build))
+            document["results"]["images"][0]["artifactRegistryPackage"] = package
+            with self.subTest(package=package):
+                self.assert_validation_code(
+                    "BUILT_IMAGE_PACKAGE", self.validate_build, document
+                )
+        for media_type in (None, "", "image/manifest", 1, True, []):
+            document = json.loads(json.dumps(self.build))
+            document["results"]["images"][0]["ociMediaType"] = media_type
+            with self.subTest(media_type=media_type):
+                self.assert_validation_code(
+                    "BUILT_IMAGE_OCI_MEDIA_TYPE", self.validate_build, document
+                )
+
+    def test_invalid_secret_version_precedes_every_http_classification(self):
+        not_found = {"error": {"code": 404, "status": "NOT_FOUND"}}
+        invalid_versions = (
+            "", "latest", "0", "01", "+1", "-1", "1.0", "1e1",
+            " 1", "1 ", "1\n", "version=1", "secret-value-like-text",
+        )
+        paths = (
+            (404, None, not_found, None),
+            (200, 200, {"name": "malformed"}, {"name": "malformed"}),
+            (403, None, {}, None),
+            (200, 200, "malformed", "malformed"),
+            (500, None, {}, None),
+        )
+        for version in invalid_versions:
+            for secret_status, version_status, secret_body, version_body in paths:
+                with self.subTest(version=repr(version), status=secret_status):
+                    self.assert_validation_code(
+                        "VERSION_SELECTOR",
+                        validator.validate_secret_http_evidence,
+                        secret_body,
+                        version_body,
+                        secret_status=secret_status,
+                        version_status=version_status,
+                        expected_secret="session-secret",
+                        expected_version=version,
+                        project=PROJECT,
+                    )
+
+    def test_invalid_secret_version_exact_404_cli_never_classifies_missing(self):
+        with tempfile.TemporaryDirectory(prefix="phase2j-secret-test.") as created_root:
+            root = __import__("os").path.realpath(created_root)
+            secret_file = Path(root) / "secret.json"
+            secret_file.write_text(
+                json.dumps({"error": {"code": 404, "status": "NOT_FOUND"}}),
+                encoding="utf-8",
+            )
+            args = [
+                "secret-version", "--project", PROJECT, "--region", REGION,
+                "--service", SERVICE, "--expected-secret", "session-secret",
+                "--expected-version", "latest", "--evidence-root", root,
+                "--secret-status", "404", "--version-status", "SKIPPED",
+                "--secret-evidence-file", str(secret_file),
+            ]
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                status = validator.main(args)
+            self.assertEqual(status, 2)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("VERSION_SELECTOR", stderr.getvalue())
+            self.assertNotIn("MISSING_SECRET", stderr.getvalue())
+
+
+class Phase2FCliTests(unittest.TestCase):
+    common = ["--project", PROJECT, "--region", REGION, "--service", SERVICE]
+
+    def invoke(self, args, document):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(validator.sys, "stdin", io.StringIO(json.dumps(document))):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                status = validator.main(args)
+        return status, stdout.getvalue(), stderr.getvalue()
+
+    def valid_commands(self):
+        pre = traffic_document(latest(100))
+        post = traffic_document(fixed(BASELINE, 100), latest_ready=CANDIDATE)
+        runtime_hash = "d" * 64
+        build = Phase2FGateTests().build_document()
+        docker_image = {
+            "name": DOCKER_IMAGE_RESOURCE,
+            "uri": IMAGE_TAG.rsplit(":", 1)[0] + "@" + DIGEST,
+            "tags": [IMAGE_TAG],
+        }
+        return [
+            (
+                ["revision", *self.common, "--expected-revision", BASELINE, "--expected-digest", DIGEST],
+                scoped("revision", revision_document()),
+            ),
+            (
+                ["traffic", *self.common, "--latest-ready-revision", BASELINE],
+                scoped("serviceState", pre),
+            ),
+            (
+                [
+                    "zero-traffic",
+                    *self.common,
+                    "--candidate-revision",
+                    CANDIDATE,
+                    "--baseline-revision",
+                    BASELINE,
+                    "--pre-latest-ready-revision",
+                    BASELINE,
+                    "--post-latest-ready-revision",
+                    CANDIDATE,
+                ],
+                scoped("transition", {"pre": pre, "post": post}),
+            ),
+            (["session-secret", *self.common], scoped("serviceConfig", session_document(session_reference()))),
+            (
+                ["secret-version", *self.common, "--expected-secret", "session-secret", "--expected-version", "7"],
+                scoped("secretMetadata", secret_metadata()),
+            ),
+            (
+                ["nonexistence", *self.common, "--kind", "CANDIDATE_TAG", "--expected-resource", TAG_RESOURCE],
+                scoped("existence", {"httpStatus": 404, "body": {"error": {"code": 404, "status": "NOT_FOUND"}}}),
+            ),
+            (
+                ["build", *self.common, "--expected-build-id", BUILD_ID, "--expected-source-sha", SOURCE_SHA, "--expected-source-tree", SOURCE_TREE, "--expected-image-tag", IMAGE_TAG],
+                scoped("build", build),
+            ),
+            (
+                ["tag-resolution", *self.common, "--expected-image-tag", IMAGE_TAG],
+                scoped("tag", docker_image),
+            ),
+            (
+                ["runtime-snapshot", *self.common],
+                scoped("serviceConfig", {"name": f"projects/{PROJECT}/locations/{REGION}/services/{SERVICE}", "template": {"timeout": "300s"}}),
+            ),
+            (
+                ["runtime-equal", *self.common],
+                scoped("comparison", {"preSha256": runtime_hash, "postSha256": runtime_hash}),
+            ),
+            (
+                ["traffic-map", *self.common, "--purpose", "TRAFFIC"],
+                scoped("comparison", {"observed": post, "expected": post}),
+            ),
+        ]
+
+    def test_every_cli_subcommand_has_deterministic_success_and_safe_failure(self):
+        sentinel = "ADVERSARIAL_RAW_EVIDENCE_MUST_NOT_APPEAR"
+        for args, document in self.valid_commands():
+            with self.subTest(command=args[0]):
+                first = self.invoke(args, document)
+                second = self.invoke(args, document)
+                self.assertEqual(first, second)
+                self.assertEqual(first[0], 0)
+                self.assertEqual(first[2], "")
+                self.assertNotIn(sentinel, first[1])
+                failed = self.invoke(args, {"unexpected": sentinel})
+                self.assertEqual(failed[0], 2)
+                self.assertEqual(failed[1], "")
+                self.assertNotIn(sentinel, failed[2])
+                self.assertNotIn("Traceback", failed[2])
+
+    def test_build_nonterminal_exit_is_stable(self):
+        args, document = next(
+            item for item in self.valid_commands() if item[0][0] == "build"
+        )
+        document["build"]["status"] = "WORKING"
+        document["build"].pop("finishTime")
+        document["build"].pop("results")
+        result = self.invoke(args, document)
+        self.assertEqual(result, (3, '{"classification":"BUILD_NONTERMINAL"}\n', ""))
+
+    def test_unexpected_exception_is_redacted_without_traceback(self):
+        sentinel = "ADVERSARIAL_EXCEPTION_SECRET"
+        args, document = self.valid_commands()[0]
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(validator, "_read_stdin_document", side_effect=RuntimeError(sentinel)):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                status = validator.main(args)
+        rendered = stdout.getvalue() + stderr.getvalue()
+        self.assertEqual(status, 2)
+        self.assertNotIn(sentinel, rendered)
+        self.assertNotIn("Traceback", rendered)
+        self.assertIn("INTERNAL_VALIDATION_ERROR", rendered)
+
+
+if __name__ == "__main__":
+    unittest.main()

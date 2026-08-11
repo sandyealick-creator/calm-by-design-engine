@@ -69,7 +69,32 @@ image identity, and a candidate revision created with zero traffic. Live
 verification and traffic movement require separate authorizations. Secret
 Manager references may be recorded by name or resource reference only, never as
 plaintext credential values in commands, documentation, terminal output, or the
-release record. The procedure has not been executed or rehearsed.
+release record. The corrected procedure has not been executed against Cloud.
+
+`scripts/validate_deployment_state.py` and
+`tests/test_deployment_state.py` provide local, fixture-based validation for
+strict revision, traffic, zero-traffic transition, `SESSION_SECRET` reference,
+and secret-version metadata evidence. They also validate authorized evidence
+scope, exact candidate-tag and revision nonexistence, terminal build/source/image
+binding, Artifact Registry DockerImage resolution, safe runtime hashes, and
+complete authorized traffic or rollback maps. A completed Build must declare the
+exact candidate tag in `images[]` and report exactly one matching
+`results.images[]` BuiltImage with a canonical digest, exact Artifact Registry
+Package resource, and a structurally valid optional `pushTiming`/OCI media type.
+Build and push chronologies are compared at full nanosecond precision with
+timezone-offset normalization. Its digest must equal the independently resolved
+DockerImage URI digest before the validator derives a deployable immutable
+reference. This is Cloud Build artifact-output binding, not a SLSA attestation.
+Secret references require an exact numeric version;
+aliases and plaintext-like selectors fail before every HTTP classification. A floating `LATEST` allocation is a
+deployment and rollback hazard, not a standalone source-validation or image-build
+blocker. The governed procedure records both the gcloud-emitted map and a resolved effective
+serving map: an authorized digest-based `--no-traffic` deployment may convert
+floating `LATEST` to its currently bound fixed revision, but it must leave the
+effective serving allocation unchanged and the candidate at zero. Build,
+candidate deployment, smoke/integration testing, each fixed-revision traffic
+movement, rollback, and participant enrollment remain separate authorization
+boundaries.
 
 The participant enrollment, recovery, token-redemption, and check-in routes are
 intentionally public at the Cloud Run layer and enforce their own cookie, CSRF,

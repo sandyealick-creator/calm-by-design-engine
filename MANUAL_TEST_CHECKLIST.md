@@ -2,7 +2,7 @@
 
 Everything not marked "done locally" below needs a live Cloud Run deployment (or `python main.py` locally against real Airtable/Gemini) with real `GEMINI_API_KEY` / `AIRTABLE_API_KEY` / `WEBHOOK_SECRET` / `SESSION_SECRET` set, and must be run against **test data only**. Before starting: enroll every test participant with **Test Record** checked on the Clients table, and use email addresses you control — never a real participant's contact info. **Never trigger the safety route or medical-emergency route against a real phone number or email you don't own.**
 
-The historical baseline before Phase 2A added its dependency-compatibility test was 265 mocked tests. The recorded current Phase 2A result is 266 collected and 266 passed, with zero skipped or missing tests and zero guarded outbound attempts. Exactly one dependency-compatibility test explains the increase from 265 to 266. The guard covers only the patched Python APIs documented in README and HANDOFF; it is not a universal network guarantee or operating-system sandbox. This is mocked local evidence only and claims no live Gemini, Airtable, GHL, delivery, browser, container, Cloud Run, or deployment validation.
+The historical baseline before Phase 2A added its dependency-compatibility test was 265 mocked tests. Phase 2A recorded 266 passing tests. Phase 2F recorded 311 collected and 311 passed in an isolated temporary environment: the 266-test application baseline plus 45 deployment-state validator tests, with zero skipped or missing tests and zero guarded outbound attempts. The guard covers only the patched Python APIs documented in README and HANDOFF; it is not a universal network guarantee or operating-system sandbox. This is mocked local evidence only and claims no live Gemini, Airtable, GHL, delivery, browser, container, Cloud Run, or deployment validation.
 
 ## Status legend
 
@@ -19,6 +19,21 @@ The historical baseline before Phase 2A added its dependency-compatibility test 
 - [ ] 🔲 Needs GHL workflow (not yet created). Create the new GHL workflow **"Send Check-in Link"**: Trigger = Airtable "New Record Created" on the `Recovery Requests` table, filtered to records where `Recovery Link` is not empty → Find Contact by email → Send Email containing the `Recovery Link` field value directly. That field holds the full, single-use, 30-minute fragment link (`/recover-access#rt=...`); the browser removes the fragment before same-origin POST redemption, and the Airtable field is cleared once used.
 - [ ] 🔲 Needs live Airtable/Cloud Run. The existing "Daily Check-In - Assessment" GHL workflow still targets `/assess`, which continues to call the shared `process_checkin()` core. Verify the real payload stays within the journal limit and either omits `submission_id` or supplies a canonical UUIDv4; malformed IDs now fail closed.
 - [ ] 🔲 Needs live Airtable/Cloud Run. The existing "Crisis Alert Notification" and "Safety Buffer Routing" GHL workflows are still active and untouched.
+
+## Controlled candidate-release gates
+
+Every item in this section requires its own reviewed Cloud authorization. The
+local deployment-state fixtures do not satisfy these live gates.
+
+- [ ] 🔲 Needs Cloud Build/Artifact Registry. Confirm one successful Build resource declares the exact candidate tag in `images[]`, has exact nanosecond-aware create/start/finish chronology, and reports exactly one matching `results.images[]` BuiltImage with a canonical digest, exact Package resource, valid optional OCI media type, and valid chronological `pushTiming` when present. Its digest must exactly equal the independently queried DockerImage URI digest before deriving the deployment image.
+- [ ] 🔲 Needs Cloud Run. Confirm the exact candidate revision name, exactly one `Ready=True` condition, and the approved immutable image digest.
+- [ ] 🔲 Needs Cloud Run. Prove the candidate is absent from production traffic or explicitly receives zero, is untagged, and the approved baseline fixed revision still receives 100%.
+- [ ] 🔲 Needs Cloud Run. Record the complete gcloud-emitted pre/post traffic maps and prove that any floating-`LATEST` to fixed-baseline change is the only map transformation while the resolved effective serving allocation remains identical. Treat these as projected CLI output, not transport-level HTTP bytes.
+- [ ] 🔲 Needs Cloud Run. Compare approved safe runtime metadata before and after deployment: environment names and secret references (never plaintext values), service account, CPU/memory, concurrency/timeout, scaling, ingress/authentication, execution environment, networking, probes, and volumes.
+- [ ] 🔲 Needs Cloud Run/Secret Manager metadata. Establish exactly one `SESSION_SECRET` Secret Manager reference with an exact positive numeric version, reject aliases such as `latest` before any HTTP-status classification, and prove that version exists and is enabled without accessing its payload.
+- [ ] 🔲 Needs Cloud Run. Before traffic movement, require a complete fixed-revision percentage map totaling 100, preserve the complete tag map, and reject any reliance on floating `LATEST`.
+- [ ] 🔲 Needs Cloud Run. Predetermine the observation duration and measurable failure thresholds before each separately authorized traffic movement.
+- [ ] 🔲 Needs Cloud Run. Validate an executable rollback plan targeting the exact known-good fixed revision and digest, complete percentages and tags, exact precondition map, and exact post-rollback verification before moving any traffic.
 
 ## A. Enrollment and identity
 
