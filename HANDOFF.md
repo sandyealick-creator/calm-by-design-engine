@@ -143,10 +143,9 @@ cp .env.example .env   # fill in real values; never commit .env
 
 ## 14. Running Flask locally
 
-```
-export GEMINI_API_KEY=... AIRTABLE_API_KEY=... WEBHOOK_SECRET=... SESSION_SECRET=...
-python main.py
-```
+After separate authorization, provide the required settings through an approved
+secure local mechanism that does not place credential values in documentation,
+commands, or shell history, then run `python main.py`.
 Serves on `http://0.0.0.0:8080` by default. **Note:** there is no sandbox/test Airtable base toggle - running this locally against real credentials writes to the live CBD Core base. Get explicit approval before doing this against production data; use `Test Record`-flagged entries.
 
 ## 15. Running pytest
@@ -156,28 +155,37 @@ python -m pip install --require-hashes -r requirements-dev.txt
 python scripts/run_mocked_tests.py -p no:cacheprovider tests
 ```
 No real credentials are used. The runner overwrites integration settings with
-test-only placeholders before importing the application, blocks non-loopback
-Python sockets for collection and execution, preserves the existing
-Airtable/Gemini mocks, and fails if its attempted-connection count is nonzero.
+test-only placeholders before importing the application and guards the Python
+test process during collection and execution at non-loopback `getaddrinfo`,
+`socket.create_connection`, `socket.socket.connect`, and
+`socket.socket.connect_ex`, including external numeric IPv4 and IPv6 through
+those paths. It preserves the existing Airtable/Gemini mocks and fails if its
+guarded attempted-connection count is nonzero. It is not an operating-system
+network sandbox and does not comprehensively prevent unconnected UDP `sendto`
+or `sendmsg`, native-extension networking, independently launched child-process
+networking, or every alternative unpatched implementation. These limitations
+were not observed as active bypasses in the current suite.
 
 ## 16. Running the Gemini golden set
 
-```
-export GEMINI_API_KEY=...   # real key; this makes real, billed API calls
-python run_golden.py
-```
+After separate authorization for real, billed API calls, provide
+`GEMINI_API_KEY` through an approved secure local mechanism that does not place
+its value in documentation, commands, or shell history, then run
+`python run_golden.py`.
 Writes `golden_results.json`. Does not touch Airtable.
 
 ## 17. Cloud Run deployment procedure
 
-```
-gcloud run deploy cbd-assess \
-  --source . \
-  --region us-east1 \
-  --allow-unauthenticated \
-  --set-env-vars "GEMINI_API_KEY=...,AIRTABLE_API_KEY=...,WEBHOOK_SECRET=...,SESSION_SECRET=..."
-```
-`--allow-unauthenticated` is safe because `/assess` still requires a valid `X-Webhook-Secret` header and the participant-facing routes are meant to be public. **Do not run this without the project owner's explicit go-ahead** - it is a live deploy.
+Do not deploy from source or a mutable image. The only documented procedure is
+[`DEPLOYMENT_RUNBOOK.md`](DEPLOYMENT_RUNBOOK.md), and it remains unexecuted and
+unrehearsed. It requires an exact clean Git commit, a separately authorized
+build, an immutable resulting image digest, explicit project, region, service,
+Artifact Registry repository, and image identity, and a candidate revision
+created with zero traffic. Live verification and traffic movement each require
+separate authorization. Use Secret Manager names or resource references only;
+never place plaintext credential values in commands, documentation, terminal
+output, or release records. Deployment and participant enrollment remain
+unauthorized.
 
 ## 18. Required environment variables (names only, see `.env.example` for placeholders)
 
@@ -185,7 +193,7 @@ gcloud run deploy cbd-assess \
 
 ## 19. Verified behavior (this session)
 
-- **pytest: 265/265 passing** against mocked Airtable and Gemini in an isolated temporary environment, with outbound sockets blocked. No live application service or participant data was accessed.
+- **pytest: 266/266 passing** against mocked Airtable and Gemini in an isolated temporary environment. The increase from the historical 265-test baseline is exactly one added dependency-compatibility test. The runner recorded zero guarded outbound attempts at its patched Python APIs. It is not an operating-system network sandbox; its UDP, native-extension, child-process, and alternative-networking limitations described in section 15 were not observed as active bypasses in this suite. No live application service or participant data was accessed.
 - **`run_golden.py` against the real Gemini API: 19/20 passing.** The one disagreement (case G07: Gemini set `distress_signal: false` where the case expected `true`, on a physical-flare entry where the participant explicitly wrote "emotionally I'm actually okay") does not change real routing for that case - the numeric score alone already places it in Heightened Support regardless of that boolean. Worth revisiting the case's expectation, not a code defect.
 - Medical-emergency and self-harm signals confirmed independent of each other in both directions, at both the keyword-backstop level and the combined-routing level.
 - Generic error page confirmed for a simulated Airtable outage; no credential or stack trace shown to the participant.
@@ -209,7 +217,7 @@ gcloud run deploy cbd-assess \
 - **Partial replay recovery is deliberately manual.** If an owned Daily Log exists but no provably owned AI Assessment can be found, the app reports that the check-in was saved but processing is incomplete and performs no new writes, Gemini call, Crisis Alert, or webhook. Repairing or completing that record requires an operator-reviewed workflow; the app does not speculate about live Airtable relationships.
 - **Recovery redemption is only sequentially single-use.** The current read-then-update flow rejects a second use after the first completes, but it is not an atomic compare-and-set across concurrent Cloud Run instances. Do not claim concurrency-safe single use without an atomic datastore operation and a dedicated concurrency test.
 - **Recovery-link origin uses `request.url_root`.** Controlled deployment verification must confirm the effective public Host and scheme before recovery delivery is enabled. A canonical public-origin configuration has not been introduced in this checkpoint.
-- **Gemini request timeout remains platform/SDK-dependent.** Airtable and optional GHL calls have explicit timeouts, but an explicit `google-genai` timeout was not added because no installed SDK was available to inspect and `requirements.txt` does not pin a concrete compatible API version. Verify the supported timeout option before deployment rather than guessing.
+- **Gemini application-level timeout remains unresolved.** `google-genai` 2.17.0 is hash-locked and received limited local compatibility coverage. The added test executes the application's `run_assessment()` path and real `GenerateContentConfig` construction, while the client call and response are mocked. It is not live Gemini validation and does not prove the real service call or response object. Verify and test the locked SDK's supported timeout option before deployment rather than guessing.
 - **`GHL_ROUTING_WEBHOOK` / `GHL_CRISIS_WEBHOOK`** remain unset/unwired in production per the prior session's findings - all real delivery currently depends on GHL's own Airtable-polling workflows.
 - **`safety_rules.py`'s `FIRST_PERSON` regex** (used by `check_safety()`, the self-harm checker) treats bare "my" as first-person without the third-party-relation exclusion that `check_medical_emergency()` now has. Self-harm phrases mostly avoid this because they embed "myself"/"my life" as objects, but it's a latent inconsistency between the two checkers worth aligning later.
 - **Golden set case G07** disagreement noted above - consider a soft-check pattern (like the existing `expected_element` soft check) for `distress_signal` rather than a hard pass/fail.
