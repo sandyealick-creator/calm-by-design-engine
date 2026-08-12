@@ -345,6 +345,74 @@ class TrafficTests(ValidatorTestCase):
             [{"percent": 100, "revision": BASELINE, "tag": None}],
         )
 
+    def test_captured_resolved_floating_latest_status_target(self):
+        document = {
+            "status": {
+                "latestReadyRevisionName": "cbd-assess-00009-mkz",
+                "traffic": [
+                    {
+                        "latestRevision": True,
+                        "revisionName": "cbd-assess-00009-mkz",
+                        "percent": 100,
+                    }
+                ],
+            }
+        }
+        state = validator.parse_traffic_document(document)
+        self.assertEqual(state.targets[0].target_type, "LATEST")
+        self.assertIsNone(state.targets[0].revision)
+        self.assertEqual(
+            json.loads(state.effective_canonical("cbd-assess-00009-mkz")),
+            [
+                {
+                    "percent": 100,
+                    "revision": "cbd-assess-00009-mkz",
+                    "tag": None,
+                }
+            ],
+        )
+
+    def test_resolved_floating_latest_must_match_latest_ready(self):
+        self.assert_validation_code(
+            "TRAFFIC_LATEST_RESOLUTION_MISMATCH",
+            validator.parse_traffic_document,
+            traffic_document(
+                {
+                    "latestRevision": True,
+                    "revisionName": CANDIDATE,
+                    "percent": 100,
+                }
+            ),
+        )
+
+    def test_resolved_floating_latest_requires_valid_revision_identities(self):
+        resolved = {
+            "latestRevision": True,
+            "revisionName": BASELINE,
+            "percent": 100,
+        }
+        self.assert_validation_code(
+            "UNEXPECTED_STRUCTURE",
+            validator.parse_traffic_document,
+            {"status": {"traffic": [resolved]}},
+        )
+        for latest_ready in (None, "", "invalid_revision"):
+            with self.subTest(latest_ready=latest_ready):
+                self.assert_validation_code(
+                    "LATEST_READY_REVISION",
+                    validator.parse_traffic_document,
+                    traffic_document(resolved, latest_ready=latest_ready),
+                )
+        for resolved_revision in (None, "", "invalid_revision"):
+            with self.subTest(resolved_revision=resolved_revision):
+                malformed = dict(resolved)
+                malformed["revisionName"] = resolved_revision
+                self.assert_validation_code(
+                    "TRAFFIC_LATEST_RESOLUTION",
+                    validator.parse_traffic_document,
+                    traffic_document(malformed),
+                )
+
     def test_one_fixed_revision_and_absent_tag(self):
         state = validator.parse_traffic_document(
             traffic_document(fixed(BASELINE, 100))
@@ -399,16 +467,7 @@ class TrafficTests(ValidatorTestCase):
             ([fixed(BASELINE, 99)], "TRAFFIC_TOTAL"),
             ([fixed(BASELINE, 100), fixed(CANDIDATE, 1)], "TRAFFIC_TOTAL"),
             ([{"latestRevision": None, "percent": 100}], "TRAFFIC_TARGET_TYPE"),
-            (
-                [
-                    {
-                        "latestRevision": True,
-                        "revisionName": BASELINE,
-                        "percent": 100,
-                    }
-                ],
-                "TRAFFIC_TARGET_TYPE",
-            ),
+            ([{"latestRevision": False, "percent": 100}], "TRAFFIC_TARGET_TYPE"),
         ]
         for targets, code in cases:
             with self.subTest(code=code):
