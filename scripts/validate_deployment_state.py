@@ -231,6 +231,25 @@ def _image_identity(value: Any, scope: Scope) -> ImageIdentity:
     return identity
 
 
+def _canonical_image_uri(value: Any, scope: Scope, code: str) -> str:
+    """Validate one canonical Artifact Registry image identity without tag/digest."""
+
+    if not isinstance(value, str) or value != value.strip() or "@" in value:
+        fail(code, "Revision image identity is malformed")
+    pattern = re.compile(
+        rf"(?P<region>{REGION_RE.pattern})-docker\.pkg\.dev/"
+        rf"(?P<project>{PROJECT_RE.pattern})/"
+        rf"(?P<repository>{AR_COMPONENT_RE.pattern})/"
+        rf"(?P<image>{AR_COMPONENT_RE.pattern})"
+    )
+    match = pattern.fullmatch(value)
+    if match is None:
+        fail(code, "Revision image identity is malformed")
+    if match.group("project") != scope.project or match.group("region") != scope.region:
+        fail(code, "Revision image identity differs from the authorized scope")
+    return value
+
+
 def _parse_build_timestamp(value: Any, field: str) -> ExactTimestamp:
     if not isinstance(value, str):
         fail("BUILD_TIME", f"Successful build {field} is missing or malformed")
@@ -318,12 +337,18 @@ def validate_evidence_file_path(root: str, value: Any, *, must_exist: bool) -> s
 
 
 def validate_revision_document(
-    document: Any, expected_revision: str, expected_digest: str
+    document: Any,
+    expected_revision: str,
+    expected_digest: str,
+    *,
+    expected_image: str,
+    scope: Scope,
 ) -> dict[str, str]:
-    """Validate exact revision identity, digest, and one Ready=True condition."""
+    """Validate exact revision, digest-qualified image, and Ready=True condition."""
 
     expected_revision = _require_revision_name(expected_revision, "EXPECTED_REVISION")
     expected_digest = _canonical_digest(expected_digest, "EXPECTED_DIGEST")
+    expected_image = _canonical_image_uri(expected_image, scope, "EXPECTED_IMAGE")
     root = _require_object(
         document, "REVISION_DOCUMENT", "Revision evidence must be a JSON object"
     )
@@ -340,7 +365,21 @@ def validate_revision_document(
         root["status"], "REVISION_STATUS", "Revision status is missing or null"
     )
     _require_exact_keys(status, required={"conditions", "imageDigest"})
-    actual_digest = _canonical_digest(status["imageDigest"], "REVISION_DIGEST")
+    observed_image = status["imageDigest"]
+    if not isinstance(observed_image, str) or observed_image.count("@") != 1:
+        fail("REVISION_IMAGE", "Revision image evidence is not one digest reference")
+    actual_image, raw_digest = observed_image.split("@", 1)
+    actual_image = _canonical_image_uri(
+        actual_image, scope, "REVISION_IMAGE_IDENTITY"
+    )
+    if actual_image != expected_image:
+        fail(
+            "REVISION_IMAGE_IDENTITY_MISMATCH",
+            "Revision image identity differs from expectation",
+        )
+    actual_digest = _canonical_digest(raw_digest, "REVISION_DIGEST")
+    if observed_image != f"{expected_image}@{actual_digest}":
+        fail("REVISION_IMAGE", "Revision image evidence is not canonical")
     if actual_digest != expected_digest:
         fail("REVISION_DIGEST_MISMATCH", "Revision digest differs from expectation")
 
@@ -1395,8 +1434,10 @@ def _validate_runtime_resources(value: Any) -> None:
             _runtime_bool(resources[key], "RUNTIME_RESOURCES")
 
 
-def _validate_runtime_probe(value: Any) -> None:
+def _validate_runtime_probe(value: Any, *, kind: str) -> None:
     probe = _require_object(value, "RUNTIME_PROBE", "Runtime probe is malformed")
+    if kind not in {"startupProbe", "livenessProbe", "readinessProbe"}:
+        fail("RUNTIME_PROBE", "Runtime probe kind is unsupported")
     actions = {"httpGet", "tcpSocket", "grpc"}
     timers = {
         "initialDelaySeconds",
@@ -1409,10 +1450,22 @@ def _validate_runtime_probe(value: Any) -> None:
     )
     if len(actions & set(probe)) != 1:
         fail("RUNTIME_PROBE", "Runtime probe must contain exactly one action")
-    for key in timers:
+    probe_window_maximum = {
+        "startupProbe": 240,
+        "livenessProbe": 3600,
+        "readinessProbe": 2_147_483_647,
+    }[kind]
+    timer_bounds = {
+        "initialDelaySeconds": (0, probe_window_maximum),
+        "periodSeconds": (1, probe_window_maximum),
+        "timeoutSeconds": (1, 3600),
+        "failureThreshold": (1, 2_147_483_647),
+    }
+    for key, (minimum, maximum) in timer_bounds.items():
         if key in probe:
-            minimum = 0 if key == "initialDelaySeconds" else 1
-            _runtime_int(probe[key], "RUNTIME_PROBE", minimum=minimum, maximum=3600)
+            _runtime_int(
+                probe[key], "RUNTIME_PROBE", minimum=minimum, maximum=maximum
+            )
     if (
         "timeoutSeconds" in probe
         and "periodSeconds" in probe
@@ -1499,6 +1552,7 @@ def _validate_runtime_container(value: Any) -> None:
         "ports",
         "startupProbe",
         "livenessProbe",
+        "readinessProbe",
         "volumeMounts",
     }
     _require_exact_keys(
@@ -1511,7 +1565,7 @@ def _validate_runtime_container(value: Any) -> None:
         _validate_runtime_resources(container["resources"])
     if "ports" in container:
         ports = container["ports"]
-        if not isinstance(ports, list) or not ports:
+        if not isinstance(ports, list) or len(ports) != 1:
             fail("RUNTIME_PORT", "Runtime ports are malformed")
         for raw_port in ports:
             port = _require_object(
@@ -1528,14 +1582,14 @@ def _validate_runtime_container(value: Any) -> None:
             )
             if "name" in port and port["name"] not in {"http1", "h2c"}:
                 fail("RUNTIME_PORT", "Runtime port protocol is malformed")
-    for key in ("startupProbe", "livenessProbe"):
+    for key in ("startupProbe", "livenessProbe", "readinessProbe"):
         if key in container:
-            _validate_runtime_probe(container[key])
+            _validate_runtime_probe(container[key], kind=key)
     if "volumeMounts" in container:
         _validate_runtime_volume_mounts(container["volumeMounts"])
 
 
-def _validate_runtime_scaling(value: Any) -> None:
+def _validate_runtime_revision_scaling(value: Any) -> None:
     scaling = _require_object(
         value, "RUNTIME_SCALING", "Runtime scaling is malformed"
     )
@@ -1553,7 +1607,7 @@ def _validate_runtime_scaling(value: Any) -> None:
     for key in ("minInstanceCount", "maxInstanceCount"):
         if key in scaling:
             _runtime_int(
-                scaling[key], "RUNTIME_SCALING", minimum=0, maximum=1_000_000
+                scaling[key], "RUNTIME_SCALING", minimum=0, maximum=2_147_483_647
             )
     if (
         "minInstanceCount" in scaling
@@ -1561,15 +1615,64 @@ def _validate_runtime_scaling(value: Any) -> None:
         and scaling["minInstanceCount"] > scaling["maxInstanceCount"]
     ):
         fail("RUNTIME_SCALING", "Runtime scaling bounds are contradictory")
-    for key in ("cpuUtilization", "concurrencyUtilization"):
+    utilization_maximum = {
+        "cpuUtilization": 0.90,
+        "concurrencyUtilization": 0.95,
+    }
+    for key, maximum in utilization_maximum.items():
         if key in scaling:
             item = scaling[key]
             if (
                 isinstance(item, bool)
                 or not isinstance(item, (int, float))
-                or not 0 <= item <= 1
+                or (item != 0 and not 0.1 <= item <= maximum)
             ):
                 fail("RUNTIME_SCALING", "Runtime utilization is malformed")
+    if (
+        scaling.get("cpuUtilization") == 0
+        and scaling.get("concurrencyUtilization") == 0
+        and {"cpuUtilization", "concurrencyUtilization"}.issubset(scaling)
+    ):
+        fail("RUNTIME_SCALING", "Runtime utilization thresholds are both disabled")
+
+
+def _validate_runtime_service_scaling(value: Any) -> None:
+    scaling = _require_object(
+        value, "RUNTIME_SERVICE_SCALING", "Runtime service scaling is malformed"
+    )
+    _require_exact_keys(
+        scaling,
+        required=set(),
+        optional={
+            "manualInstanceCount",
+            "maxInstanceCount",
+            "minInstanceCount",
+            "scalingMode",
+        },
+        code="RUNTIME_SERVICE_SCALING",
+    )
+    if not scaling:
+        fail("RUNTIME_SERVICE_SCALING", "Runtime service scaling is empty")
+    for key in ("manualInstanceCount", "maxInstanceCount", "minInstanceCount"):
+        if key in scaling:
+            _runtime_int(
+                scaling[key],
+                "RUNTIME_SERVICE_SCALING",
+                minimum=0,
+                maximum=2_147_483_647,
+            )
+    if (
+        "minInstanceCount" in scaling
+        and "maxInstanceCount" in scaling
+        and scaling["minInstanceCount"] > scaling["maxInstanceCount"]
+    ):
+        fail("RUNTIME_SERVICE_SCALING", "Runtime service scaling bounds contradict")
+    if "scalingMode" in scaling and scaling["scalingMode"] not in {
+        "SCALING_MODE_UNSPECIFIED",
+        "AUTOMATIC",
+        "MANUAL",
+    }:
+        fail("RUNTIME_SERVICE_SCALING", "Runtime service scaling mode is malformed")
 
 
 def _validate_runtime_vpc(value: Any) -> None:
@@ -1594,7 +1697,7 @@ def _validate_runtime_vpc(value: Any) -> None:
         fail("RUNTIME_VPC", "Runtime VPC egress is malformed")
     if "networkInterfaces" in vpc:
         interfaces = vpc["networkInterfaces"]
-        if not isinstance(interfaces, list) or not interfaces:
+        if not isinstance(interfaces, list) or len(interfaces) != 1:
             fail("RUNTIME_VPC", "Runtime network interfaces are malformed")
         for raw_interface in interfaces:
             interface = _require_object(
@@ -1723,7 +1826,7 @@ def validate_runtime_service_document(document: Any, scope: Scope) -> dict[str, 
     _require_exact_keys(
         root,
         required={"name", "template"},
-        optional={"ingress", "invokerIamDisabled", "iapEnabled"},
+        optional={"ingress", "invokerIamDisabled", "iapEnabled", "scaling"},
         code="RUNTIME_SERVICE",
     )
     if root["name"] != scope.service_resource:
@@ -1733,11 +1836,14 @@ def validate_runtime_service_document(document: Any, scope: Scope) -> dict[str, 
         "INGRESS_TRAFFIC_ALL",
         "INGRESS_TRAFFIC_INTERNAL_ONLY",
         "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER",
+        "INGRESS_TRAFFIC_NONE",
     }:
         fail("RUNTIME_SERVICE", "Runtime ingress is malformed")
     for key in ("invokerIamDisabled", "iapEnabled"):
         if key in root:
             _runtime_bool(root[key], "RUNTIME_SERVICE")
+    if "scaling" in root:
+        _validate_runtime_service_scaling(root["scaling"])
     template = _require_object(
         root["template"], "RUNTIME_TEMPLATE", "Runtime template is malformed"
     )
@@ -1785,7 +1891,7 @@ def validate_runtime_service_document(document: Any, scope: Scope) -> dict[str, 
     }:
         fail("RUNTIME_EXECUTION_ENVIRONMENT", "Runtime execution environment is malformed")
     if "scaling" in template:
-        _validate_runtime_scaling(template["scaling"])
+        _validate_runtime_revision_scaling(template["scaling"])
     if "vpcAccess" in template:
         _validate_runtime_vpc(template["vpcAccess"])
     if "volumes" in template:
@@ -1813,17 +1919,18 @@ def validate_runtime_service_document(document: Any, scope: Scope) -> dict[str, 
     }
 
 
-def validate_runtime_comparison(document: Any) -> dict[str, str]:
+def validate_runtime_comparison(
+    document: Any, scope: Scope
+) -> dict[str, str]:
     root = _require_object(
         document, "RUNTIME_COMPARISON", "Runtime comparison evidence is malformed"
     )
-    _require_exact_keys(root, required={"preSha256", "postSha256"})
-    for key in ("preSha256", "postSha256"):
-        if not isinstance(root[key], str) or not re.fullmatch(r"[0-9a-f]{64}", root[key]):
-            fail("RUNTIME_HASH", "Runtime snapshot hash is malformed")
-    if root["preSha256"] != root["postSha256"]:
+    _require_exact_keys(root, required={"pre", "post"})
+    pre = validate_runtime_service_document(root["pre"], scope)
+    post = validate_runtime_service_document(root["post"], scope)
+    if pre["sha256"] != post["sha256"]:
         fail("RUNTIME_DRIFT", "Runtime configuration changed")
-    return {"classification": "RUNTIME_UNCHANGED", "sha256": root["preSha256"]}
+    return {"classification": "RUNTIME_UNCHANGED", "sha256": pre["sha256"]}
 
 
 def validate_traffic_map_comparison(
@@ -1908,6 +2015,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_scope(revision_parser)
     revision_parser.add_argument("--expected-revision", required=True)
     revision_parser.add_argument("--expected-digest", required=True)
+    revision_parser.add_argument("--expected-image", required=True)
 
     traffic_parser = subparsers.add_parser("traffic")
     add_scope(traffic_parser)
@@ -2179,10 +2287,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             post_path = validate_evidence_file_path(
                 args.evidence_root, args.post_evidence_file, must_exist=True
             )
-            pre = validate_runtime_service_document(_strict_load_path(pre_path), scope)
-            post = validate_runtime_service_document(_strict_load_path(post_path), scope)
             result = validate_runtime_comparison(
-                {"preSha256": pre["sha256"], "postSha256": post["sha256"]}
+                {
+                    "pre": _strict_load_path(pre_path),
+                    "post": _strict_load_path(post_path),
+                },
+                scope,
             )
             result["scope"] = scope.output()
             _emit(result)
@@ -2220,7 +2330,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 service=args.service,
             )
             result = validate_revision_document(
-                evidence, args.expected_revision, args.expected_digest
+                evidence,
+                args.expected_revision,
+                args.expected_digest,
+                expected_image=args.expected_image,
+                scope=scope,
             )
             result["scope"] = scope.output()
         elif args.command == "traffic":
@@ -2385,7 +2499,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 region=args.region,
                 service=args.service,
             )
-            result = validate_runtime_comparison(evidence)
+            result = validate_runtime_comparison(evidence, scope)
             result["scope"] = scope.output()
         else:
             scope, evidence = scoped_payload(

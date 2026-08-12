@@ -202,8 +202,11 @@ tag resolution with Build-result digest equality, safe runtime comparison,
 scope-bound numeric `SESSION_SECRET` references revalidated before metadata URL
 construction and every HTTP classification, and complete expected
 traffic/rollback maps. Runtime comparison requires a schema-valid Cloud Run v2
-safe projection with nonempty named containers; plaintext environment and
-probe-header values are excluded and unselected fields are not claimed equal.
+safe projection with nonempty named containers; service-level and revision-level
+scaling are distinct, readiness probes are included with startup and liveness
+probes, and impossible port, utilization, and network-interface structures stop
+before comparison. Plaintext environment and probe-header values are excluded
+and unselected fields are not claimed equal.
 Traffic evidence records both the complete gcloud-emitted map and a resolved
 effective serving map. The historical Phase 2B observation was one untagged
 floating `LATEST` target at 100%, bound at that time to
@@ -220,9 +223,10 @@ The real `SESSION_SECRET` reference and enabled exact numeric version remain unr
 future corrected partial-response query must request only environment names and
 Secret Manager reference fields, never plaintext `value`, and requires separate
 authorization. Runtime service account, CPU/memory, concurrency/timeout,
-scaling, ingress/authentication, execution environment, networking, probes,
-volumes, and other material settings must be safely captured and compared before
-and after candidate deployment. Live verification and every traffic movement
+service-level and revision-level scaling, ingress/authentication, execution
+environment, networking, startup/liveness/readiness probes, volumes, and other
+selected material settings must be safely captured and compared before and after
+candidate deployment. Live verification and every traffic movement
 require separate authorization. Use Secret Manager names or resource references
 only; never place plaintext credential values in commands, documentation,
 terminal output, or release records. Deployment and participant enrollment

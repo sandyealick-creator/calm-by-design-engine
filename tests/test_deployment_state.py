@@ -20,6 +20,8 @@ SOURCE_SHA = "a" * 40
 SOURCE_TREE = "b" * 40
 BUILD_ID = "12345678-1234-1234-1234-123456789abc"
 IMAGE_TAG = f"{REGION}-docker.pkg.dev/{PROJECT}/cbd/cbd-assess:{SOURCE_SHA}"
+IMAGE_URI = IMAGE_TAG.rsplit(":", 1)[0]
+REVISION_IMAGE = f"{IMAGE_URI}@{DIGEST}"
 TAG_RESOURCE = (
     f"projects/{PROJECT}/locations/{REGION}/repositories/cbd/"
     f"packages/cbd-assess/tags/{SOURCE_SHA}"
@@ -41,13 +43,28 @@ def scoped(key, evidence, **scope_overrides):
     return {"scope": scope(**scope_overrides), key: evidence}
 
 
-def revision_document(*, name=BASELINE, digest=DIGEST, conditions=None):
+def revision_document(*, name=BASELINE, digest=REVISION_IMAGE, conditions=None):
     if conditions is None:
         conditions = [{"type": "Ready", "status": "True"}]
     return {
         "metadata": {"name": name},
         "status": {"conditions": conditions, "imageDigest": digest},
     }
+
+
+def validate_revision(
+    document,
+    expected_revision=BASELINE,
+    expected_digest=DIGEST,
+    expected_image=IMAGE_URI,
+):
+    return validator.validate_revision_document(
+        document,
+        expected_revision,
+        expected_digest,
+        expected_image=expected_image,
+        scope=validator.require_scope(PROJECT, REGION, SERVICE),
+    )
 
 
 def traffic_document(*targets, latest_ready=BASELINE):
@@ -112,6 +129,11 @@ def populated_runtime_service():
             "ingress": "INGRESS_TRAFFIC_ALL",
             "invokerIamDisabled": True,
             "iapEnabled": False,
+            "scaling": {
+                "scalingMode": "AUTOMATIC",
+                "minInstanceCount": 0,
+                "maxInstanceCount": 20,
+            },
         }
     )
     document["template"] = {
@@ -119,7 +141,12 @@ def populated_runtime_service():
         "maxInstanceRequestConcurrency": 80,
         "timeout": "300s",
         "executionEnvironment": "EXECUTION_ENVIRONMENT_GEN2",
-        "scaling": {"minInstanceCount": 0, "maxInstanceCount": 10},
+        "scaling": {
+            "minInstanceCount": 0,
+            "maxInstanceCount": 10,
+            "cpuUtilization": 0.90,
+            "concurrencyUtilization": 0.95,
+        },
         "vpcAccess": {
             "egress": "PRIVATE_RANGES_ONLY",
             "networkInterfaces": [
@@ -156,6 +183,12 @@ def populated_runtime_service():
                     "failureThreshold": 3,
                 },
                 "livenessProbe": {"tcpSocket": {"port": 8080}},
+                "readinessProbe": {
+                    "httpGet": {"path": "/ready", "port": 8080},
+                    "periodSeconds": 10,
+                    "timeoutSeconds": 1,
+                    "failureThreshold": 3,
+                },
                 "volumeMounts": [{"name": "cache", "mountPath": "/cache"}],
             }
         ],
@@ -217,26 +250,24 @@ class JsonSafetyTests(ValidatorTestCase):
             with self.subTest(raw=raw):
                 value = validator.strict_loads(raw)
                 with self.assertRaises(validator.ValidationError):
-                    validator.validate_revision_document(value, BASELINE, DIGEST)
+                    validate_revision(value)
 
     def test_structurally_unexpected_documents(self):
         for document in (None, [], "text", {"unexpected": {}}):
             with self.subTest(document=document):
                 with self.assertRaises(validator.ValidationError):
-                    validator.validate_revision_document(document, BASELINE, DIGEST)
+                    validate_revision(document)
 
 
 class RevisionTests(ValidatorTestCase):
     def test_exact_identity_digest_and_one_ready_true(self):
-        result = validator.validate_revision_document(
+        result = validate_revision(
             revision_document(
                 conditions=[
                     {"type": "ContainerHealthy", "status": "True"},
                     {"type": "Ready", "status": "True", "reason": "Ready"},
                 ]
             ),
-            BASELINE,
-            DIGEST,
         )
         self.assertEqual(
             result,
@@ -273,28 +304,22 @@ class RevisionTests(ValidatorTestCase):
             with self.subTest(code=code):
                 self.assert_validation_code(
                     code,
-                    validator.validate_revision_document,
+                    validate_revision,
                     revision_document(conditions=conditions),
-                    BASELINE,
-                    DIGEST,
                 )
 
     def test_wrong_revision_identity(self):
         self.assert_validation_code(
             "REVISION_IDENTITY_MISMATCH",
-            validator.validate_revision_document,
+            validate_revision,
             revision_document(name=CANDIDATE),
-            BASELINE,
-            DIGEST,
         )
 
     def test_wrong_digest(self):
         self.assert_validation_code(
             "REVISION_DIGEST_MISMATCH",
-            validator.validate_revision_document,
-            revision_document(digest=OTHER_DIGEST),
-            BASELINE,
-            DIGEST,
+            validate_revision,
+            revision_document(digest=f"{IMAGE_URI}@{OTHER_DIGEST}"),
         )
 
     def test_null_required_revision_structure(self):
@@ -308,7 +333,7 @@ class RevisionTests(ValidatorTestCase):
         ):
             with self.subTest(document=document):
                 with self.assertRaises(validator.ValidationError):
-                    validator.validate_revision_document(document, BASELINE, DIGEST)
+                    validate_revision(document)
 
 
 class TrafficTests(ValidatorTestCase):
@@ -966,7 +991,7 @@ class Phase2FGateTests(ValidatorTestCase):
         self.assertEqual(first, second)
         self.assertEqual(
             validator.validate_runtime_comparison(
-                {"preSha256": first["sha256"], "postSha256": second["sha256"]}
+                {"pre": runtime, "post": runtime}, authorized_scope
             )["classification"],
             "RUNTIME_UNCHANGED",
         )
@@ -978,7 +1003,8 @@ class Phase2FGateTests(ValidatorTestCase):
         self.assert_validation_code(
             "RUNTIME_DRIFT",
             validator.validate_runtime_comparison,
-            {"preSha256": first["sha256"], "postSha256": changed_hash},
+            {"pre": runtime, "post": changed},
+            authorized_scope,
         )
         for unsafe in (
             {**runtime, "name": "projects/wrong12/locations/us-east1/services/other"},
@@ -1729,14 +1755,16 @@ class Phase2QRegressionTests(ValidatorTestCase):
         self.assertEqual(populated["classification"], "RUNTIME_CANONICAL")
         self.assertEqual(
             validator.validate_runtime_comparison(
-                {"preSha256": populated["sha256"], "postSha256": populated["sha256"]}
+                {"pre": populated_runtime_service(), "post": populated_runtime_service()},
+                self.authorized_scope,
             )["classification"],
             "RUNTIME_UNCHANGED",
         )
         self.assert_validation_code(
             "RUNTIME_DRIFT",
             validator.validate_runtime_comparison,
-            {"preSha256": minimal["sha256"], "postSha256": populated["sha256"]},
+            {"pre": minimal_runtime_service(), "post": populated_runtime_service()},
+            self.authorized_scope,
         )
 
     def test_runtime_rejects_empty_missing_and_type_confused_containers(self):
@@ -1807,6 +1835,469 @@ class Phase2QRegressionTests(ValidatorTestCase):
             self.assertEqual(status, 2)
             self.assertEqual(stdout.getvalue(), "")
             self.assertIn("RUNTIME_TEMPLATE", stderr.getvalue())
+
+    def test_service_scaling_is_typed_optional_and_drift_sensitive(self):
+        absent = minimal_runtime_service()
+        automatic = minimal_runtime_service()
+        automatic["scaling"] = {
+            "scalingMode": "AUTOMATIC",
+            "minInstanceCount": 0,
+            "maxInstanceCount": 20,
+        }
+        manual = minimal_runtime_service()
+        manual["scaling"] = {
+            "scalingMode": "MANUAL",
+            "manualInstanceCount": 2,
+        }
+        self.assertEqual(
+            validator.validate_runtime_service_document(
+                absent, self.authorized_scope
+            )["classification"],
+            "RUNTIME_CANONICAL",
+        )
+        for label, document in (("automatic", automatic), ("manual", manual)):
+            with self.subTest(valid_scaling=label):
+                self.assertEqual(
+                    validator.validate_runtime_service_document(
+                        document, self.authorized_scope
+                    )["classification"],
+                    "RUNTIME_CANONICAL",
+                )
+
+        # GoogleCloudRunV2ServiceScaling.ScalingModeValueValuesEnum in the
+        # locally generated Run v2 messages, enumerated independently here.
+        for scaling_mode in (
+            "SCALING_MODE_UNSPECIFIED",
+            "AUTOMATIC",
+            "MANUAL",
+        ):
+            document = minimal_runtime_service()
+            document["scaling"] = {"scalingMode": scaling_mode}
+            with self.subTest(valid_scaling_mode=scaling_mode):
+                self.assertEqual(
+                    validator.validate_runtime_service_document(
+                        document, self.authorized_scope
+                    )["classification"],
+                    "RUNTIME_CANONICAL",
+                )
+
+        self.assert_validation_code(
+            "RUNTIME_DRIFT",
+            validator.validate_runtime_comparison,
+            {"pre": absent, "post": automatic},
+            self.authorized_scope,
+        )
+
+        for field, old, new in (
+            ("minInstanceCount", 0, 1),
+            ("maxInstanceCount", 20, 21),
+            ("scalingMode", "AUTOMATIC", "MANUAL"),
+        ):
+            pre = minimal_runtime_service()
+            pre["scaling"] = {
+                "scalingMode": "AUTOMATIC",
+                "minInstanceCount": 0,
+                "maxInstanceCount": 20,
+            }
+            post = json.loads(json.dumps(pre))
+            post["scaling"][field] = new
+            self.assertEqual(pre["scaling"][field], old)
+            with self.subTest(service_scaling_drift=field):
+                self.assert_validation_code(
+                    "RUNTIME_DRIFT",
+                    validator.validate_runtime_comparison,
+                    {"pre": pre, "post": post},
+                    self.authorized_scope,
+                )
+
+        malformed = (
+            ("null scaling", None),
+            ("array scaling", []),
+            ("empty scaling", {}),
+            ("negative count", {"minInstanceCount": -1}),
+            ("int32 overflow", {"maxInstanceCount": 2_147_483_648}),
+            ("contradictory bounds", {"minInstanceCount": 2, "maxInstanceCount": 1}),
+            ("boolean count", {"manualInstanceCount": True}),
+            ("float count", {"manualInstanceCount": 1.0}),
+            ("numeric string count", {"manualInstanceCount": "1"}),
+            ("null count", {"manualInstanceCount": None}),
+            ("object count", {"manualInstanceCount": {}}),
+            ("array count", {"manualInstanceCount": []}),
+            ("unknown key", {"unexpected": 1}),
+        )
+        for label, scaling in malformed:
+            document = minimal_runtime_service()
+            document["scaling"] = scaling
+            with self.subTest(invalid_service_scaling=label):
+                self.assert_validation_code(
+                    "RUNTIME_SERVICE_SCALING",
+                    validator.validate_runtime_service_document,
+                    document,
+                    self.authorized_scope,
+                )
+
+        for scaling_mode in (
+            "automatic",
+            " AUTOMATIC",
+            "AUTOMATIC ",
+            "X_AUTOMATIC",
+            "AUTOMATIC_X",
+            "AUTO",
+            "UNKNOWN",
+            "",
+        ):
+            document = minimal_runtime_service()
+            document["scaling"] = {"scalingMode": scaling_mode}
+            with self.subTest(invalid_scaling_mode=repr(scaling_mode)):
+                self.assert_validation_code(
+                    "RUNTIME_SERVICE_SCALING",
+                    validator.validate_runtime_service_document,
+                    document,
+                    self.authorized_scope,
+                )
+
+    def test_readiness_probe_valid_actions_empty_actions_and_presence(self):
+        absent = minimal_runtime_service()
+        valid_actions = (
+            ("http populated", {"httpGet": {"path": "/ready", "port": 8080}}),
+            ("tcp populated", {"tcpSocket": {"port": 8080}}),
+            ("grpc populated", {"grpc": {"port": 8080, "service": "ready"}}),
+            ("http header name", {"httpGet": {"httpHeaders": [{"name": "X-Probe"}]}}),
+            ("http empty action", {"httpGet": {}}),
+            ("tcp empty action", {"tcpSocket": {}}),
+            ("grpc empty action", {"grpc": {}}),
+        )
+        for label, probe in valid_actions:
+            document = minimal_runtime_service()
+            document["template"]["containers"][0]["readinessProbe"] = probe
+            with self.subTest(valid_readiness=label):
+                self.assertEqual(
+                    validator.validate_runtime_service_document(
+                        document, self.authorized_scope
+                    )["classification"],
+                    "RUNTIME_CANONICAL",
+                )
+
+        present = minimal_runtime_service()
+        present["template"]["containers"][0]["readinessProbe"] = {"httpGet": {}}
+        self.assert_validation_code(
+            "RUNTIME_DRIFT",
+            validator.validate_runtime_comparison,
+            {"pre": absent, "post": present},
+            self.authorized_scope,
+        )
+
+    def test_http_readiness_probe_header_name_change_creates_drift(self):
+        pre = minimal_runtime_service()
+        pre["template"]["containers"][0]["readinessProbe"] = {
+            "httpGet": {"httpHeaders": [{"name": "X-Probe-A"}]}
+        }
+        post = json.loads(json.dumps(pre))
+        post["template"]["containers"][0]["readinessProbe"]["httpGet"][
+            "httpHeaders"
+        ][0]["name"] = "X-Probe-B"
+
+        for document in (pre, post):
+            header = document["template"]["containers"][0]["readinessProbe"][
+                "httpGet"
+            ]["httpHeaders"][0]
+            self.assertEqual(set(header), {"name"})
+            self.assertEqual(
+                validator.validate_runtime_service_document(
+                    document, self.authorized_scope
+                )["classification"],
+                "RUNTIME_CANONICAL",
+            )
+
+        post_with_original_header = json.loads(json.dumps(post))
+        post_with_original_header["template"]["containers"][0]["readinessProbe"][
+            "httpGet"
+        ]["httpHeaders"][0]["name"] = "X-Probe-A"
+        self.assertEqual(pre, post_with_original_header)
+        self.assert_validation_code(
+            "RUNTIME_DRIFT",
+            validator.validate_runtime_comparison,
+            {"pre": pre, "post": post},
+            self.authorized_scope,
+        )
+
+    def test_readiness_probe_action_fields_and_timing_create_drift(self):
+        drift_cases = (
+            ("http path", {"httpGet": {"path": "/a", "port": 8080}}, ("httpGet", "path", "/b")),
+            ("http port", {"httpGet": {"path": "/a", "port": 8080}}, ("httpGet", "port", 8081)),
+            ("tcp port", {"tcpSocket": {"port": 8080}}, ("tcpSocket", "port", 8081)),
+            ("grpc port", {"grpc": {"port": 8080, "service": "a"}}, ("grpc", "port", 8081)),
+            ("grpc service", {"grpc": {"port": 8080, "service": "a"}}, ("grpc", "service", "b")),
+        )
+        for label, probe, (action, field, changed_value) in drift_cases:
+            pre = minimal_runtime_service()
+            pre["template"]["containers"][0]["readinessProbe"] = probe
+            post = json.loads(json.dumps(pre))
+            post["template"]["containers"][0]["readinessProbe"][action][field] = changed_value
+            with self.subTest(readiness_action_drift=label):
+                self.assert_validation_code(
+                    "RUNTIME_DRIFT",
+                    validator.validate_runtime_comparison,
+                    {"pre": pre, "post": post},
+                    self.authorized_scope,
+                )
+
+        pre = minimal_runtime_service()
+        pre["template"]["containers"][0]["readinessProbe"] = {"httpGet": {}}
+        post = json.loads(json.dumps(pre))
+        post["template"]["containers"][0]["readinessProbe"] = {"tcpSocket": {}}
+        self.assert_validation_code(
+            "RUNTIME_DRIFT",
+            validator.validate_runtime_comparison,
+            {"pre": pre, "post": post},
+            self.authorized_scope,
+        )
+
+        for field, old, new in (
+            ("initialDelaySeconds", 0, 1),
+            ("timeoutSeconds", 1, 2),
+            ("periodSeconds", 10, 11),
+            ("failureThreshold", 3, 4),
+        ):
+            pre = minimal_runtime_service()
+            pre["template"]["containers"][0]["readinessProbe"] = {
+                "httpGet": {},
+                "initialDelaySeconds": 0,
+                "timeoutSeconds": 1,
+                "periodSeconds": 10,
+                "failureThreshold": 3,
+            }
+            post = json.loads(json.dumps(pre))
+            post["template"]["containers"][0]["readinessProbe"][field] = new
+            self.assertEqual(pre["template"]["containers"][0]["readinessProbe"][field], old)
+            with self.subTest(readiness_timing_drift=field):
+                self.assert_validation_code(
+                    "RUNTIME_DRIFT",
+                    validator.validate_runtime_comparison,
+                    {"pre": pre, "post": post},
+                    self.authorized_scope,
+                )
+
+    def test_readiness_probe_timing_boundaries_and_invalid_types(self):
+        valid_boundaries = (
+            ("initial minimum", {"initialDelaySeconds": 0}),
+            ("initial int32 maximum", {"initialDelaySeconds": 2_147_483_647}),
+            ("timeout minimum", {"timeoutSeconds": 1}),
+            ("timeout maximum", {"timeoutSeconds": 3600}),
+            ("period minimum", {"periodSeconds": 1}),
+            ("period int32 maximum", {"periodSeconds": 2_147_483_647}),
+            ("failure minimum", {"failureThreshold": 1}),
+            ("failure int32 maximum", {"failureThreshold": 2_147_483_647}),
+            ("timeout equals period", {"timeoutSeconds": 10, "periodSeconds": 10}),
+        )
+        for label, timing in valid_boundaries:
+            document = minimal_runtime_service()
+            document["template"]["containers"][0]["readinessProbe"] = {
+                "httpGet": {},
+                **timing,
+            }
+            with self.subTest(valid_readiness_boundary=label):
+                self.assertEqual(
+                    validator.validate_runtime_service_document(
+                        document, self.authorized_scope
+                    )["classification"],
+                    "RUNTIME_CANONICAL",
+                )
+
+        invalid_timing = []
+        for value in (-1, True, "1", None, {}, []):
+            invalid_timing.append(("initialDelaySeconds", value))
+        for field in ("timeoutSeconds", "periodSeconds", "failureThreshold"):
+            for value in (0, -1, True, "1", None, {}, []):
+                invalid_timing.append((field, value))
+        invalid_timing.extend(
+            (
+                ("initialDelaySeconds", 2_147_483_648),
+                ("periodSeconds", 2_147_483_648),
+                ("timeoutSeconds", 3601),
+                ("failureThreshold", 2_147_483_648),
+            )
+        )
+        for field, value in invalid_timing:
+            document = minimal_runtime_service()
+            document["template"]["containers"][0]["readinessProbe"] = {
+                "httpGet": {},
+                field: value,
+            }
+            with self.subTest(invalid_readiness_timing=field, value=repr(value)):
+                self.assert_validation_code(
+                    "RUNTIME_PROBE",
+                    validator.validate_runtime_service_document,
+                    document,
+                    self.authorized_scope,
+                )
+
+        document = minimal_runtime_service()
+        document["template"]["containers"][0]["readinessProbe"] = {
+            "httpGet": {},
+            "timeoutSeconds": 11,
+            "periodSeconds": 10,
+        }
+        self.assert_validation_code(
+            "RUNTIME_PROBE",
+            validator.validate_runtime_service_document,
+            document,
+            self.authorized_scope,
+        )
+
+    def test_readiness_probe_invalid_structures_fail_for_probe_reason(self):
+        malformed = (
+            ("null probe", None),
+            ("empty probe", {}),
+            ("no action", {"periodSeconds": 10}),
+            ("multiple actions", {"httpGet": {}, "tcpSocket": {}}),
+            ("unsupported action", {"exec": {}}),
+            ("unknown probe field", {"httpGet": {}, "successThreshold": 1}),
+            ("null action", {"httpGet": None}),
+            ("invalid HTTP path", {"httpGet": {"path": True}}),
+            ("invalid HTTP port", {"httpGet": {"port": 0}}),
+            ("invalid TCP port", {"tcpSocket": {"port": 0}}),
+            ("invalid gRPC port", {"grpc": {"port": 65536}}),
+            ("invalid gRPC service", {"grpc": {"service": ""}}),
+            ("invalid HTTP action field", {"httpGet": {"method": "GET"}}),
+            ("invalid TCP action field", {"tcpSocket": {"host": "localhost"}}),
+            ("invalid gRPC action field", {"grpc": {"authority": "localhost"}}),
+            ("header values are excluded", {"httpGet": {"httpHeaders": [{"name": "X-Probe", "value": "secret"}]}}),
+            ("invalid header name", {"httpGet": {"httpHeaders": [{"name": True}]}}),
+        )
+        for label, probe in malformed:
+            document = minimal_runtime_service()
+            document["template"]["containers"][0]["readinessProbe"] = probe
+            with self.subTest(invalid_readiness=label):
+                self.assert_validation_code(
+                    "RUNTIME_PROBE",
+                    validator.validate_runtime_service_document,
+                    document,
+                    self.authorized_scope,
+                )
+
+    def test_impossible_runtime_evidence_is_rejected_before_comparison(self):
+        invalid_documents = []
+
+        two_ports = minimal_runtime_service()
+        two_ports["template"]["containers"][0]["ports"] = [
+            {"name": "http1", "containerPort": 8080},
+            {"name": "h2c", "containerPort": 8081},
+        ]
+        invalid_documents.append(("two ports", two_ports, "RUNTIME_PORT"))
+
+        for scaling in (
+            {"cpuUtilization": 0.05},
+            {"cpuUtilization": 0.9000001},
+            {"concurrencyUtilization": 0.9500001},
+            {"cpuUtilization": 0.0, "concurrencyUtilization": 0.0},
+        ):
+            document = minimal_runtime_service()
+            document["template"]["scaling"] = scaling
+            invalid_documents.append((repr(scaling), document, "RUNTIME_SCALING"))
+
+        for interfaces in (
+            [],
+            "network",
+            [{"network": "default"}, {"subnetwork": "default"}],
+            [{}],
+            [{"network": 1}],
+            [{"network": "default", "tags": "tag"}],
+        ):
+            document = minimal_runtime_service()
+            document["template"]["vpcAccess"] = {
+                "networkInterfaces": interfaces
+            }
+            invalid_documents.append((repr(interfaces), document, "RUNTIME_VPC"))
+
+        for label, document, code in invalid_documents:
+            with self.subTest(invalid_runtime=label):
+                self.assert_validation_code(
+                    code,
+                    validator.validate_runtime_comparison,
+                    {"pre": document, "post": document},
+                    self.authorized_scope,
+                )
+
+    def test_runtime_utilization_boundaries_and_valid_equality(self):
+        for scaling in (
+            {"cpuUtilization": 0.0},
+            {"cpuUtilization": 0.1},
+            {"cpuUtilization": 0.90},
+            {"concurrencyUtilization": 0.0},
+            {"concurrencyUtilization": 0.1},
+            {"concurrencyUtilization": 0.95},
+            {"cpuUtilization": 0.90, "concurrencyUtilization": 0.95},
+        ):
+            document = minimal_runtime_service()
+            document["template"]["scaling"] = scaling
+            with self.subTest(scaling=scaling):
+                self.assertEqual(
+                    validator.validate_runtime_comparison(
+                        {"pre": document, "post": document}, self.authorized_scope
+                    )["classification"],
+                    "RUNTIME_UNCHANGED",
+                )
+
+    def test_ingress_none_is_exact_and_drift_sensitive(self):
+        # GoogleCloudRunV2Service.IngressValueValuesEnum in the locally
+        # generated Run v2 messages, enumerated independently here.
+        ingress_values = (
+            "INGRESS_TRAFFIC_UNSPECIFIED",
+            "INGRESS_TRAFFIC_ALL",
+            "INGRESS_TRAFFIC_INTERNAL_ONLY",
+            "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER",
+            "INGRESS_TRAFFIC_NONE",
+        )
+        for ingress in ingress_values:
+            document = minimal_runtime_service()
+            document["ingress"] = ingress
+            with self.subTest(valid_ingress=ingress):
+                self.assertEqual(
+                    validator.validate_runtime_service_document(
+                        document, self.authorized_scope
+                    )["classification"],
+                    "RUNTIME_CANONICAL",
+                )
+
+        for ingress in (
+            "ingress_traffic_none",
+            " INGRESS_TRAFFIC_NONE",
+            "INGRESS_TRAFFIC_NONE ",
+            "X_INGRESS_TRAFFIC_NONE",
+            "INGRESS_TRAFFIC_NONE_X",
+            "INGRESS_TRAFFIC",
+            "NONE",
+            "INGRESS_TRAFFIC_UNKNOWN",
+            "",
+        ):
+            document = minimal_runtime_service()
+            document["ingress"] = ingress
+            with self.subTest(invalid_ingress=repr(ingress)):
+                self.assert_validation_code(
+                    "RUNTIME_SERVICE",
+                    validator.validate_runtime_service_document,
+                    document,
+                    self.authorized_scope,
+                )
+
+        absent = minimal_runtime_service()
+        none = minimal_runtime_service()
+        none["ingress"] = "INGRESS_TRAFFIC_NONE"
+        all_ingress = minimal_runtime_service()
+        all_ingress["ingress"] = "INGRESS_TRAFFIC_ALL"
+        for label, pre, post in (
+            ("absent to none", absent, none),
+            ("all to none", all_ingress, none),
+            ("none to all", none, all_ingress),
+        ):
+            with self.subTest(ingress_drift=label):
+                self.assert_validation_code(
+                    "RUNTIME_DRIFT",
+                    validator.validate_runtime_comparison,
+                    {"pre": pre, "post": post},
+                    self.authorized_scope,
+                )
 
     def test_exact_artifact_registry_get_contract(self):
         request = validator.validate_artifact_image_request(
@@ -1912,14 +2403,52 @@ class Phase2QRegressionTests(ValidatorTestCase):
                     with_timing(start, end),
                 )
 
-    def test_revision_digest_requires_exact_bare_canonical_form(self):
+    def test_revision_digest_requires_exact_bound_image_reference(self):
         self.assertEqual(
-            validator.validate_revision_document(
-                revision_document(), BASELINE, DIGEST
-            )["digest"],
+            validate_revision(revision_document())["digest"],
             DIGEST,
         )
         invalid = (
+            (DIGEST, "REVISION_IMAGE"),
+            (f"docker.io/example/image@{DIGEST}", "REVISION_IMAGE_IDENTITY"),
+            (
+                f"{REGION}-docker.pkg.dev/other-project/cbd/cbd-assess@{DIGEST}",
+                "REVISION_IMAGE_IDENTITY",
+            ),
+            (
+                f"{REGION}-docker.pkg.dev/{PROJECT}/other/cbd-assess@{DIGEST}",
+                "REVISION_IMAGE_IDENTITY_MISMATCH",
+            ),
+            (
+                f"{REGION}-docker.pkg.dev/{PROJECT}/cbd/other@{DIGEST}",
+                "REVISION_IMAGE_IDENTITY_MISMATCH",
+            ),
+            (IMAGE_TAG, "REVISION_IMAGE"),
+            (IMAGE_URI + DIGEST, "REVISION_IMAGE"),
+            (IMAGE_URI + "@@" + DIGEST, "REVISION_IMAGE"),
+            (IMAGE_URI + "@sha256:" + "a" * 63, "REVISION_DIGEST"),
+            (IMAGE_URI + "@" + DIGEST.upper(), "REVISION_DIGEST"),
+            (None, "REVISION_IMAGE"),
+        )
+        for value, code in invalid:
+            with self.subTest(value=repr(value), code=code):
+                self.assert_validation_code(
+                    code,
+                    validate_revision,
+                    revision_document(digest=value),
+                )
+        self.assert_validation_code(
+            "REVISION_DIGEST_MISMATCH",
+            validate_revision,
+            revision_document(digest=f"{IMAGE_URI}@{OTHER_DIGEST}"),
+        )
+        missing = revision_document()
+        del missing["status"]["imageDigest"]
+        with self.assertRaises(validator.ValidationError):
+            validate_revision(missing)
+
+    def test_revision_expected_digest_and_cli_failure_are_canonical_and_sanitized(self):
+        invalid_expected = (
             "malformed-prefix@" + DIGEST,
             "one@two@" + DIGEST,
             IMAGE_TAG,
@@ -1929,21 +2458,84 @@ class Phase2QRegressionTests(ValidatorTestCase):
             "sha256:" + "a" * 63,
             "sha256:" + "a" * 65,
         )
-        for value in invalid:
+        for value in invalid_expected:
             with self.subTest(value=repr(value)):
                 self.assert_validation_code(
-                    "REVISION_DIGEST",
-                    validator.validate_revision_document,
-                    revision_document(digest=value),
-                    BASELINE,
-                    DIGEST,
-                )
-                self.assert_validation_code(
                     "EXPECTED_DIGEST",
-                    validator.validate_revision_document,
+                    validate_revision,
                     revision_document(),
                     BASELINE,
                     value,
+                )
+        unsafe = "UNSAFE_VALUE_MUST_NOT_BE_ECHOED"
+        status, stdout, stderr = Phase2FCliTests().invoke(
+            [
+                "revision", "--project", PROJECT, "--region", REGION,
+                "--service", SERVICE, "--expected-revision", BASELINE,
+                "--expected-digest", DIGEST, "--expected-image", IMAGE_URI,
+            ],
+            scoped("revision", revision_document(digest=unsafe)),
+        )
+        self.assertEqual(status, 2)
+        self.assertEqual(stdout, "")
+        self.assertNotIn(unsafe, stderr)
+
+    def test_revision_expected_image_is_exact_tagless_digestless_base_uri(self):
+        self.assertEqual(
+            validate_revision(revision_document(), expected_image=IMAGE_URI)["digest"],
+            DIGEST,
+        )
+        invalid_expected_images = (
+            ("tag qualified", IMAGE_URI + ":candidate"),
+            ("digest qualified", IMAGE_URI + "@" + DIGEST),
+            ("leading whitespace", " " + IMAGE_URI),
+            ("trailing whitespace", IMAGE_URI + " "),
+            ("malformed registry", f"{REGION}.docker.pkg.dev/{PROJECT}/cbd/cbd-assess"),
+            ("malformed path", f"{REGION}-docker.pkg.dev/{PROJECT}//cbd-assess"),
+            ("extra path", IMAGE_URI + "/extra"),
+            ("missing project", f"{REGION}-docker.pkg.dev/cbd/cbd-assess"),
+            ("missing repository", f"{REGION}-docker.pkg.dev/{PROJECT}/cbd-assess"),
+            ("missing image", f"{REGION}-docker.pkg.dev/{PROJECT}/cbd"),
+            ("query suffix", IMAGE_URI + "?tag=candidate"),
+            ("fragment suffix", IMAGE_URI + "#candidate"),
+        )
+        for label, expected_image in invalid_expected_images:
+            with self.subTest(invalid_expected_image=label):
+                self.assert_validation_code(
+                    "EXPECTED_IMAGE",
+                    validate_revision,
+                    revision_document(),
+                    BASELINE,
+                    DIGEST,
+                    expected_image,
+                )
+
+        status, stdout, stderr = Phase2FCliTests().invoke(
+            [
+                "revision", "--project", PROJECT, "--region", REGION,
+                "--service", SERVICE, "--expected-revision", BASELINE,
+                "--expected-digest", DIGEST, "--expected-image", IMAGE_TAG,
+            ],
+            scoped("revision", revision_document()),
+        )
+        self.assertEqual(status, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("EXPECTED_IMAGE", stderr)
+
+    def test_revision_evidence_wrong_image_identity_keeps_expected_image_valid(self):
+        wrong_evidence = (
+            ("wrong host", f"docker.io/example/cbd-assess@{DIGEST}", "REVISION_IMAGE_IDENTITY"),
+            ("wrong region", f"us-west1-docker.pkg.dev/{PROJECT}/cbd/cbd-assess@{DIGEST}", "REVISION_IMAGE_IDENTITY"),
+            ("wrong project", f"{REGION}-docker.pkg.dev/other-project/cbd/cbd-assess@{DIGEST}", "REVISION_IMAGE_IDENTITY"),
+            ("wrong repository", f"{REGION}-docker.pkg.dev/{PROJECT}/other/cbd-assess@{DIGEST}", "REVISION_IMAGE_IDENTITY_MISMATCH"),
+            ("wrong image", f"{REGION}-docker.pkg.dev/{PROJECT}/cbd/other@{DIGEST}", "REVISION_IMAGE_IDENTITY_MISMATCH"),
+        )
+        for label, observed_image, code in wrong_evidence:
+            with self.subTest(wrong_revision_image=label):
+                self.assert_validation_code(
+                    code,
+                    validate_revision,
+                    revision_document(digest=observed_image),
                 )
 
     def test_documentation_matches_corrected_contracts(self):
@@ -1957,10 +2549,20 @@ class Phase2QRegressionTests(ValidatorTestCase):
         self.assertIn("secret-reference-result", runbook)
         self.assertIn("pushStart <= pushEnd <= finishTime", runbook)
         self.assertIn("nonempty named container", runbook)
+        self.assertIn("--expected-image=", runbook)
+        self.assertIn("tagless, digestless base", runbook)
+        self.assertIn("Artifact Registry image URI", runbook)
+        self.assertIn("rejected rather than stripped or normalized", runbook)
+        self.assertIn("scaling/manualInstanceCount", runbook)
+        self.assertIn("template/containers/readinessProbe", runbook)
+        self.assertNotIn("template/containers/env/value,", runbook)
         self.assertIn("non-paginated", readme)
         self.assertIn("historical Phase 2B observation", handoff)
         self.assertNotIn("current verified service state", handoff)
+        self.assertIn("service-level and revision-level", handoff)
+        self.assertIn("readiness probes", handoff)
         self.assertIn("schema-validated safe runtime projection", checklist)
+        self.assertIn("INGRESS_TRAFFIC_NONE", checklist)
 
 
 class Phase2FCliTests(unittest.TestCase):
@@ -1977,7 +2579,6 @@ class Phase2FCliTests(unittest.TestCase):
     def valid_commands(self):
         pre = traffic_document(latest(100))
         post = traffic_document(fixed(BASELINE, 100), latest_ready=CANDIDATE)
-        runtime_hash = "d" * 64
         build = Phase2FGateTests().build_document()
         docker_image = {
             "name": DOCKER_IMAGE_RESOURCE,
@@ -1986,7 +2587,10 @@ class Phase2FCliTests(unittest.TestCase):
         }
         return [
             (
-                ["revision", *self.common, "--expected-revision", BASELINE, "--expected-digest", DIGEST],
+                [
+                    "revision", *self.common, "--expected-revision", BASELINE,
+                    "--expected-digest", DIGEST, "--expected-image", IMAGE_URI,
+                ],
                 scoped("revision", revision_document()),
             ),
             (
@@ -2031,7 +2635,10 @@ class Phase2FCliTests(unittest.TestCase):
             ),
             (
                 ["runtime-equal", *self.common],
-                scoped("comparison", {"preSha256": runtime_hash, "postSha256": runtime_hash}),
+                scoped(
+                    "comparison",
+                    {"pre": minimal_runtime_service(), "post": minimal_runtime_service()},
+                ),
             ),
             (
                 ["traffic-map", *self.common, "--purpose", "TRAFFIC"],

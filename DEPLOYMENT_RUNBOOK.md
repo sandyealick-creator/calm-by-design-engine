@@ -245,12 +245,20 @@ gcloud run revisions describe "$BASELINE_REVISION" \
   | python3.12 scripts/validate_deployment_state.py revision \
       --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
       --expected-revision="$BASELINE_REVISION" \
+      --expected-image="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPOSITORY}/${IMAGE_NAME}" \
       --expected-digest="$BASELINE_DIGEST"
 ```
 
-Exactly one `Ready=True` condition, the exact name, and a canonical bare
-lowercase `sha256:` digest are required. Arbitrary prefixes, tags, multiple
-`@` characters, whitespace, uppercase, and malformed digest lengths stop.
+Exactly one `Ready=True` condition and the exact revision name are required.
+The observed `status.imageDigest` must be one canonical digest-qualified image
+reference whose registry host, project, repository, and image equal the
+explicitly approved identity. Only after that full identity passes is its bare
+lowercase `sha256:` digest compared with `BASELINE_DIGEST`. A bare observed
+digest, tag-only image, wrong image identity, multiple `@` characters,
+whitespace, uppercase, or malformed digest stops.
+The `--expected-image` argument accepts only the exact tagless, digestless base
+Artifact Registry image URI. Tag-qualified or digest-qualified arguments are
+rejected rather than stripped or normalized.
 Preserve the validator's command-output and resolved-effective map
 representations in the release record.
 
@@ -393,7 +401,18 @@ capture_runtime_snapshot() {
     --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
     --evidence-root="$EVIDENCE_ROOT" --output-file="$destination" >/dev/null \
     || return 1
-  runtime_fields='name,ingress,invokerIamDisabled,iapEnabled,template/serviceAccount,template/maxInstanceRequestConcurrency,template/timeout,template/executionEnvironment,template/scaling/minInstanceCount,template/scaling/maxInstanceCount,template/scaling/cpuUtilization,template/scaling/concurrencyUtilization,template/vpcAccess/connector,template/vpcAccess/egress,template/vpcAccess/networkInterfaces/network,template/vpcAccess/networkInterfaces/subnetwork,template/vpcAccess/networkInterfaces/tags,template/containers/name,template/containers/env/name,template/containers/env/valueSource/secretKeyRef/secret,template/containers/env/valueSource/secretKeyRef/version,template/containers/resources/limits,template/containers/resources/cpuIdle,template/containers/resources/startupCpuBoost,template/containers/ports/name,template/containers/ports/containerPort,template/containers/startupProbe/initialDelaySeconds,template/containers/startupProbe/timeoutSeconds,template/containers/startupProbe/periodSeconds,template/containers/startupProbe/failureThreshold,template/containers/startupProbe/httpGet/path,template/containers/startupProbe/httpGet/port,template/containers/startupProbe/httpGet/httpHeaders/name,template/containers/startupProbe/tcpSocket/port,template/containers/startupProbe/grpc/port,template/containers/startupProbe/grpc/service,template/containers/livenessProbe/initialDelaySeconds,template/containers/livenessProbe/timeoutSeconds,template/containers/livenessProbe/periodSeconds,template/containers/livenessProbe/failureThreshold,template/containers/livenessProbe/httpGet/path,template/containers/livenessProbe/httpGet/port,template/containers/livenessProbe/httpGet/httpHeaders/name,template/containers/livenessProbe/tcpSocket/port,template/containers/livenessProbe/grpc/port,template/containers/livenessProbe/grpc/service,template/containers/volumeMounts/name,template/containers/volumeMounts/mountPath,template/containers/volumeMounts/subPath,template/volumes/name,template/volumes/cloudSqlInstance/instances,template/volumes/emptyDir/medium,template/volumes/emptyDir/sizeLimit,template/volumes/gcs/bucket,template/volumes/gcs/mountOptions,template/volumes/gcs/readOnly,template/volumes/nfs/server,template/volumes/nfs/path,template/volumes/nfs/readOnly,template/volumes/secret/secret,template/volumes/secret/defaultMode,template/volumes/secret/items/path,template/volumes/secret/items/version,template/volumes/secret/items/mode'
+  runtime_fields='name,ingress,invokerIamDisabled,iapEnabled'
+  runtime_fields+=',scaling/manualInstanceCount,scaling/maxInstanceCount,scaling/minInstanceCount,scaling/scalingMode'
+  runtime_fields+=',template/serviceAccount,template/maxInstanceRequestConcurrency,template/timeout,template/executionEnvironment'
+  runtime_fields+=',template/scaling/minInstanceCount,template/scaling/maxInstanceCount,template/scaling/cpuUtilization,template/scaling/concurrencyUtilization'
+  runtime_fields+=',template/vpcAccess/connector,template/vpcAccess/egress,template/vpcAccess/networkInterfaces/network,template/vpcAccess/networkInterfaces/subnetwork,template/vpcAccess/networkInterfaces/tags'
+  runtime_fields+=',template/containers/name,template/containers/env/name,template/containers/env/valueSource/secretKeyRef/secret,template/containers/env/valueSource/secretKeyRef/version'
+  runtime_fields+=',template/containers/resources/limits,template/containers/resources/cpuIdle,template/containers/resources/startupCpuBoost,template/containers/ports/name,template/containers/ports/containerPort'
+  runtime_fields+=',template/containers/startupProbe/initialDelaySeconds,template/containers/startupProbe/timeoutSeconds,template/containers/startupProbe/periodSeconds,template/containers/startupProbe/failureThreshold,template/containers/startupProbe/httpGet/path,template/containers/startupProbe/httpGet/port,template/containers/startupProbe/httpGet/httpHeaders/name,template/containers/startupProbe/tcpSocket/port,template/containers/startupProbe/grpc/port,template/containers/startupProbe/grpc/service'
+  runtime_fields+=',template/containers/livenessProbe/initialDelaySeconds,template/containers/livenessProbe/timeoutSeconds,template/containers/livenessProbe/periodSeconds,template/containers/livenessProbe/failureThreshold,template/containers/livenessProbe/httpGet/path,template/containers/livenessProbe/httpGet/port,template/containers/livenessProbe/httpGet/httpHeaders/name,template/containers/livenessProbe/tcpSocket/port,template/containers/livenessProbe/grpc/port,template/containers/livenessProbe/grpc/service'
+  runtime_fields+=',template/containers/readinessProbe/initialDelaySeconds,template/containers/readinessProbe/timeoutSeconds,template/containers/readinessProbe/periodSeconds,template/containers/readinessProbe/failureThreshold,template/containers/readinessProbe/httpGet/path,template/containers/readinessProbe/httpGet/port,template/containers/readinessProbe/httpGet/httpHeaders/name,template/containers/readinessProbe/tcpSocket/port,template/containers/readinessProbe/grpc/port,template/containers/readinessProbe/grpc/service'
+  runtime_fields+=',template/containers/volumeMounts/name,template/containers/volumeMounts/mountPath,template/containers/volumeMounts/subPath'
+  runtime_fields+=',template/volumes/name,template/volumes/cloudSqlInstance/instances,template/volumes/emptyDir/medium,template/volumes/emptyDir/sizeLimit,template/volumes/gcs/bucket,template/volumes/gcs/mountOptions,template/volumes/gcs/readOnly,template/volumes/nfs/server,template/volumes/nfs/path,template/volumes/nfs/readOnly,template/volumes/secret/secret,template/volumes/secret/defaultMode,template/volumes/secret/items/path,template/volumes/secret/items/version,template/volumes/secret/items/mode'
   runtime_url="https://run.googleapis.com/v2/projects/${PROJECT_ID}/locations/${REGION}/services/${SERVICE}?fields=${runtime_fields}"
   authorized_curl --fail --url "$runtime_url" \
     > "$destination" || return 1
@@ -410,14 +429,18 @@ after deployment, then passes both strictly parsed HTTP response bodies to `runt
 Require `RUNTIME_UNCHANGED`. The validator requires a nonempty named container
 list and validates every selected service, template, container, environment,
 secret-reference, resource, port, probe, volume, scaling, and networking field
-against its Cloud Run v2 shape. Optional selected fields may be absent, but a
-present field with the wrong type or structure stops. Plaintext environment
+against its Cloud Run v2 shape. This includes distinct service-level scaling,
+revision-level scaling, and startup, liveness, and readiness probes. Optional
+selected fields may be absent, but a present field with the wrong type or
+structure stops. The validator enforces the one-port and one-network-interface
+limits, the documented CPU and concurrency utilization ranges, and the rule that
+both utilization thresholds cannot be disabled together. Plaintext environment
 values and probe-header values are deliberately not requested; only probe-header
 names are compared. The result proves equality of this exact safe projection,
 not of unselected values. Wrong service identity, malformed or truncated
-projection, unknown key, or hash difference stops. Both raw files are
-revalidated; their retention or deletion follows the separately approved
-evidence policy.
+projection, unknown key, or hash difference stops. Both complete raw documents
+are revalidated before equality can be classified; their retention or deletion
+follows the separately approved evidence policy.
 
 ## 5. Separately authorized immutable candidate build
 
@@ -808,6 +831,7 @@ hashes:
     | python3.12 scripts/validate_deployment_state.py revision \
         --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
         --expected-revision="$CANDIDATE_REVISION" \
+        --expected-image="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPOSITORY}/${IMAGE_NAME}" \
         --expected-digest="${CANDIDATE_IMAGE_DIGEST_REF##*@}"
 
   gcloud run services describe "$SERVICE" \
@@ -1001,6 +1025,7 @@ below, execute exactly one rollback command and one post-query:
     | python3.12 scripts/validate_deployment_state.py revision \
         --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
         --expected-revision="$BASELINE_REVISION" \
+        --expected-image="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPOSITORY}/${IMAGE_NAME}" \
         --expected-digest="$BASELINE_DIGEST"
 
   ROLLBACK_PRE="$EVIDENCE_ROOT/rollback-pre.json"
