@@ -177,15 +177,60 @@ Writes `golden_results.json`. Does not touch Airtable.
 ## 17. Cloud Run deployment procedure
 
 Do not deploy from source or a mutable image. The only documented procedure is
-[`DEPLOYMENT_RUNBOOK.md`](DEPLOYMENT_RUNBOOK.md), and it remains unexecuted and
-unrehearsed. It requires an exact clean Git commit, a separately authorized
-build, an immutable resulting image digest, explicit project, region, service,
-Artifact Registry repository, and image identity, and a candidate revision
-created with zero traffic. Live verification and traffic movement each require
-separate authorization. Use Secret Manager names or resource references only;
-never place plaintext credential values in commands, documentation, terminal
-output, or release records. Deployment and participant enrollment remain
-unauthorized.
+[`DEPLOYMENT_RUNBOOK.md`](DEPLOYMENT_RUNBOOK.md), and its corrected procedure
+remains unexecuted against Cloud. It requires an exact clean Git commit, a
+separately authorized build, an immutable resulting image digest, explicit
+project, region, service, Artifact Registry repository, and image identity, and
+a candidate revision created with zero traffic. The completed Build resource
+must bind its exact name, ID, project/location, status, chronological timestamps,
+source SHA/tree substitutions, declared candidate tag, and exactly one matching
+`results.images[]` BuiltImage canonical digest, exact Artifact Registry Package
+resource, and valid optional `pushTiming`/OCI media type. Build and push
+chronologies use exact nanosecond-aware RFC 3339 comparison, including offset
+normalization, and any `pushTiming` must be fully contained within the Build
+execution interval. An exact, non-paginated Artifact Registry
+`DockerImages.Get` is constructed from the validated candidate tag and Build
+digest. Its DockerImage must identify the same repository, package, tag, and
+digest before a deployable digest reference is derived. This is Cloud
+Build artifact-output binding, not a SLSA attestation.
+
+`scripts/validate_deployment_state.py` is the standard-library-only strict local
+evidence validator; `tests/test_deployment_state.py` contains its isolated
+fixtures. Its scoped contracts cover revision and traffic identity, candidate
+tag/revision nonexistence, bounded terminal-build evidence, exact DockerImage
+tag resolution with Build-result digest equality, safe runtime comparison,
+scope-bound numeric `SESSION_SECRET` references revalidated before metadata URL
+construction and every HTTP classification, and complete expected
+traffic/rollback maps. Runtime comparison requires a schema-valid Cloud Run v2
+safe projection with nonempty named containers; service-level and revision-level
+scaling are distinct, readiness probes are included with startup and liveness
+probes, and impossible port, utilization, and network-interface structures stop
+before comparison. Plaintext environment and probe-header values are excluded
+and unselected fields are not claimed equal.
+Traffic evidence records both the complete gcloud-emitted map and a resolved
+effective serving map. The historical Phase 2B observation was one untagged
+floating `LATEST` target at 100%, bound at that time to
+`cbd-assess-00009-mkz` with digest
+`sha256:6fd949d0e3ab3d4780f927088048009521ab8fb82f03253171e971862c31bcc3`.
+It does not establish current live service state; fresh verification remains
+required.
+An eventual authorized `--no-traffic` deployment may convert that floating
+target to the fixed current revision; the raw maps may therefore differ while
+the effective serving allocation must remain identical and the candidate must
+remain at zero.
+
+The real `SESSION_SECRET` reference and enabled exact numeric version remain unresolved. A
+future corrected partial-response query must request only environment names and
+Secret Manager reference fields, never plaintext `value`, and requires separate
+authorization. Runtime service account, CPU/memory, concurrency/timeout,
+service-level and revision-level scaling, ingress/authentication, execution
+environment, networking, startup/liveness/readiness probes, volumes, and other
+selected material settings must be safely captured and compared before and after
+candidate deployment. Live verification and every traffic movement
+require separate authorization. Use Secret Manager names or resource references
+only; never place plaintext credential values in commands, documentation,
+terminal output, or release records. Deployment and participant enrollment
+remain unauthorized.
 
 ## 18. Required environment variables (names only, see `.env.example` for placeholders)
 
@@ -193,7 +238,7 @@ unauthorized.
 
 ## 19. Verified behavior (this session)
 
-- **pytest: 266/266 passing** against mocked Airtable and Gemini in an isolated temporary environment. The increase from the historical 265-test baseline is exactly one added dependency-compatibility test. The runner recorded zero guarded outbound attempts at its patched Python APIs. It is not an operating-system network sandbox; its UDP, native-extension, child-process, and alternative-networking limitations described in section 15 were not observed as active bypasses in this suite. No live application service or participant data was accessed.
+- **pytest: 311/311 passing** against mocked Airtable and Gemini in the Phase 2F isolated temporary environment: the 266-test Phase 2A application baseline plus 45 deployment-state validator tests. The runner recorded zero guarded outbound attempts at its patched Python APIs. It is not an operating-system network sandbox; its UDP, native-extension, child-process, and alternative-networking limitations described in section 15 were not observed as active bypasses in this suite. No live application service or participant data was accessed.
 - **`run_golden.py` against the real Gemini API: 19/20 passing.** The one disagreement (case G07: Gemini set `distress_signal: false` where the case expected `true`, on a physical-flare entry where the participant explicitly wrote "emotionally I'm actually okay") does not change real routing for that case - the numeric score alone already places it in Heightened Support regardless of that boolean. Worth revisiting the case's expectation, not a code defect.
 - Medical-emergency and self-harm signals confirmed independent of each other in both directions, at both the keyword-backstop level and the combined-routing level.
 - Generic error page confirmed for a simulated Airtable outage; no credential or stack trace shown to the participant.
