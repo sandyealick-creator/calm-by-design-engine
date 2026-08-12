@@ -555,18 +555,27 @@ def parse_traffic_document(document: Any) -> TrafficState:
             fail("TRAFFIC_TARGET_TYPE", "latestRevision must be an exact Boolean")
         has_latest = latest_value is True
         has_revision = "revisionName" in target
-        if has_revision == has_latest:
-            fail(
-                "TRAFFIC_TARGET_TYPE",
-                "A traffic target must be exactly fixed or floating LATEST",
-            )
         if has_latest:
+            if has_revision:
+                resolved_revision = _require_revision_name(
+                    target["revisionName"], "TRAFFIC_LATEST_RESOLUTION"
+                )
+                if resolved_revision != latest_ready:
+                    fail(
+                        "TRAFFIC_LATEST_RESOLUTION_MISMATCH",
+                        "Resolved floating LATEST differs from latest-ready revision",
+                    )
             if seen_latest:
                 fail("TRAFFIC_DUPLICATE", "Traffic contains repeated LATEST targets")
             seen_latest = True
             target_type = "LATEST"
             revision = None
         else:
+            if not has_revision:
+                fail(
+                    "TRAFFIC_TARGET_TYPE",
+                    "A traffic target must identify a fixed revision or floating LATEST",
+                )
             target_type = "FIXED"
             revision = _require_revision_name(
                 target.get("revisionName"), "TRAFFIC_REVISION"
