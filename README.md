@@ -69,7 +69,8 @@ image identity, and a candidate revision created with zero traffic. Live
 verification and traffic movement require separate authorizations. Secret
 Manager references may be recorded by name or resource reference only, never as
 plaintext credential values in commands, documentation, terminal output, or the
-release record. The procedure has not completed a Cloud Build or deployment.
+release record. One successful Build is preserved as regression evidence, but
+the procedure has not completed a Cloud Run deployment.
 
 `scripts/validate_deployment_state.py` and
 `tests/test_deployment_state.py` provide local, fixture-based validation for
@@ -83,14 +84,20 @@ source context. Its exact bytes and SHA-256 are captured before submission; its
 single Docker step consumes `_SOURCE_SHA`, `_SOURCE_TREE`, and
 `_CANDIDATE_IMAGE` under explicit `MUST_MATCH`, and `ALLOW_LOOSE` is prohibited.
 The config is evidence rather than application source, so the independently
-validated source archive identity remains unchanged. A completed Build must
-preserve that exact template and report exactly one matching
-`results.images[]` BuiltImage with a canonical digest, exact Artifact Registry
-Package resource, and a structurally valid optional `pushTiming`/OCI media type.
+validated source archive identity remains unchanged. A completed Build is a
+separate returned-evidence layer: raw REST bytes must show one resolved Docker
+step, the resolved image/SHA/tree arguments, authorized service account, exact
+matching source provenance, and one resolved top-level image. Returned omission
+of `substitutionOption` is accepted only as Cloud Build's default-zero
+`MUST_MATCH` after the hash-bound submitted config proves explicit `MUST_MATCH`.
+One matching `results.images[]` BuiltImage must contain a canonical digest, exact
+Artifact Registry Package-version resource ending in that digest, and a
+structurally valid optional `pushTiming`/OCI media type.
 When present, `pushTiming` must be fully contained within the Build execution
 interval at nanosecond precision with timezone-offset normalization. The exact,
 non-paginated Artifact Registry `DockerImages.Get` resource is constructed from
-the validated candidate tag and Build digest; its DockerImage URI digest and tag
+the validated candidate tag and Build digest; its verified project alias,
+DockerImage URI digest, and exact bare source-SHA tag component
 must agree before the validator derives a deployable immutable reference. This is
 Cloud Build artifact-output binding, not a SLSA attestation. Saved
 `SESSION_SECRET` results are strictly rebound to the current project, region,

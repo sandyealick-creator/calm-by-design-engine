@@ -177,15 +177,19 @@ Writes `golden_results.json`. Does not touch Airtable.
 ## 17. Cloud Run deployment procedure
 
 Do not deploy from source or a mutable image. The only documented procedure is
-[`DEPLOYMENT_RUNBOOK.md`](DEPLOYMENT_RUNBOOK.md), and the procedure has not
-completed a Cloud Build or deployment. It requires an exact clean Git commit, a
+[`DEPLOYMENT_RUNBOOK.md`](DEPLOYMENT_RUNBOOK.md). One successful Build is
+preserved as regression evidence, but no Cloud Run deployment occurred. It
+requires an exact clean Git commit, a
 separately authorized build, an immutable resulting image digest, explicit
 project, region, service, Artifact Registry repository, and image identity, and
-a candidate revision created with zero traffic. The completed Build resource
-must bind its exact name, ID, project/location, status, chronological timestamps,
-source SHA/tree substitutions, declared candidate tag, and exactly one matching
-`results.images[]` BuiltImage canonical digest, exact Artifact Registry Package
-resource, and valid optional `pushTiming`/OCI media type. Build and push
+a candidate revision created with zero traffic. The completed Build resource is
+preserved as raw REST evidence and must bind its exact name, ID, verified
+project-ID/project-number alias, location, status, authorized service account,
+chronological timestamps, resolved Docker arguments, matching source provenance,
+source SHA/tree substitutions, resolved candidate tag, and exactly one matching
+`results.images[]` BuiltImage canonical digest, exact Artifact Registry
+Package-version resource ending in that digest, and valid optional
+`pushTiming`/OCI media type. Build and push
 chronologies use exact nanosecond-aware RFC 3339 comparison, including offset
 normalization, and any `pushTiming` must be fully contained within the Build
 execution interval. The build template is one deterministic explicit JSON
@@ -193,10 +197,15 @@ configuration generated outside the submitted source context and retained as
 evidence with its exact SHA-256. Its one Docker step consumes `_SOURCE_SHA`,
 `_SOURCE_TREE`, and `_CANDIDATE_IMAGE` under explicit `MUST_MATCH`;
 `ALLOW_LOOSE` and simultaneous `--tag`/`--config` submission are prohibited.
+Returned evidence may omit `substitutionOption` only as Cloud Build's default-zero
+`MUST_MATCH`, and only after the separately hash-bound submitted config proves
+explicit `MUST_MATCH`. Nested repeated Build fields use the REST nested
+partial-response selector, never a dotted CLI projection.
 The config is evidence, not application source, and does not replace the
 independent source-archive identity. An exact, non-paginated Artifact Registry
 `DockerImages.Get` is constructed from the validated candidate tag and Build
-digest. Its DockerImage must identify the same repository, package, tag, and
+digest. Its DockerImage must identify the same verified project alias, repository,
+package, exact bare source-SHA tag component, and
 digest before a deployable digest reference is derived. This is Cloud
 Build artifact-output binding, not a SLSA attestation.
 
