@@ -48,6 +48,19 @@ RFC3339_TIMESTAMP_RE = re.compile(
 )
 DURATION_RE = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]{1,9})?s")
 ARTIFACT_REGISTRY_API_ORIGIN = "https://artifactregistry.googleapis.com/v1"
+EXPLICIT_BUILD_STEP_NAME = "gcr.io/cloud-builders/docker"
+EXPLICIT_BUILD_ARGS = [
+    "build",
+    "--tag",
+    "${_CANDIDATE_IMAGE}",
+    "--label",
+    "org.opencontainers.image.revision=${_SOURCE_SHA}",
+    "--label",
+    "com.calmbydesign.source-tree=${_SOURCE_TREE}",
+    ".",
+]
+EXPLICIT_BUILD_IMAGES = ["${_CANDIDATE_IMAGE}"]
+EXPLICIT_BUILD_OPTIONS = {"substitutionOption": "MUST_MATCH"}
 
 
 class ValidationError(ValueError):
@@ -1216,6 +1229,56 @@ def validate_build_submission_document(document: Any) -> dict[str, str]:
     return {"buildId": build_id, "classification": "BUILD_SUBMITTED"}
 
 
+def validate_build_config_document(
+    document: Any,
+    *,
+    expected_source_sha: str,
+    expected_source_tree: str,
+    expected_image_tag: str,
+    scope: Scope | None = None,
+) -> dict[str, str]:
+    """Validate the one exact explicit Cloud Build template."""
+
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_source_sha):
+        fail("SOURCE_SHA", "Expected source SHA is malformed")
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_source_tree):
+        fail("SOURCE_TREE", "Expected source tree is malformed")
+    if scope is None:
+        fail("SCOPE", "Build configuration validation requires an authorized scope")
+    _image_identity(expected_image_tag, scope)
+    root = _require_object(
+        document, "BUILD_CONFIG", "Explicit build configuration is malformed"
+    )
+    _require_exact_keys(
+        root,
+        required={"steps", "images", "options"},
+        code="BUILD_CONFIG_STRUCTURE",
+    )
+    steps = root["steps"]
+    if not isinstance(steps, list) or len(steps) != 1:
+        fail("BUILD_CONFIG_STEPS", "Build configuration must contain one step")
+    step = _require_object(
+        steps[0], "BUILD_CONFIG_STEP", "Build step is malformed"
+    )
+    _require_exact_keys(
+        step, required={"name", "args"}, code="BUILD_CONFIG_STEP"
+    )
+    if step["name"] != EXPLICIT_BUILD_STEP_NAME:
+        fail("BUILD_CONFIG_BUILDER", "Build step uses an unexpected builder")
+    if step["args"] != EXPLICIT_BUILD_ARGS:
+        fail("BUILD_CONFIG_ARGS", "Docker arguments or provenance labels differ")
+    if root["images"] != EXPLICIT_BUILD_IMAGES:
+        fail("BUILD_CONFIG_IMAGES", "Build image declaration differs")
+    if root["options"] != EXPLICIT_BUILD_OPTIONS:
+        fail("BUILD_CONFIG_OPTIONS", "Build substitution policy differs")
+    return {
+        "classification": "EXPLICIT_BUILD_CONFIG_VALID",
+        "imageTag": expected_image_tag,
+        "sourceSha": expected_source_sha,
+        "sourceTree": expected_source_tree,
+    }
+
+
 NONTERMINAL_BUILD_STATES = {"PENDING", "QUEUED", "WORKING"}
 FAILED_BUILD_STATES = {
     "FAILURE",
@@ -1249,7 +1312,16 @@ def validate_build_document(
     root = _require_object(document, "BUILD_EVIDENCE", "Build evidence is malformed")
     _require_exact_keys(
         root,
-        required={"name", "id", "projectId", "status", "images", "substitutions"},
+        required={
+            "name",
+            "id",
+            "projectId",
+            "status",
+            "steps",
+            "images",
+            "options",
+            "substitutions",
+        },
         optional={"createTime", "startTime", "finishTime", "results"},
     )
     expected_name = (
@@ -1262,9 +1334,13 @@ def validate_build_document(
     status = root["status"]
     if not isinstance(status, str):
         fail("BUILD_STATUS", "Build status is malformed")
-    images = root["images"]
-    if images != [expected_image_tag]:
-        fail("BUILD_IMAGE_MISMATCH", "Build image differs from the candidate tag")
+    validate_build_config_document(
+        {key: root[key] for key in ("steps", "images", "options")},
+        expected_source_sha=expected_source_sha,
+        expected_source_tree=expected_source_tree,
+        expected_image_tag=expected_image_tag,
+        scope=scope,
+    )
     substitutions = _require_object(
         root["substitutions"], "BUILD_SUBSTITUTIONS", "Build source binding is malformed"
     )
@@ -2250,6 +2326,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--output", choices=("json", "digest", "image-ref"), default="json"
     )
 
+    config_parser = subparsers.add_parser("build-config")
+    add_scope(config_parser)
+    config_parser.add_argument("--expected-source-sha", required=True)
+    config_parser.add_argument("--expected-source-tree", required=True)
+    config_parser.add_argument("--expected-image-tag", required=True)
+    config_parser.add_argument(
+        "--output", choices=("json", "sha256"), default="json"
+    )
+
     submission_parser = subparsers.add_parser("build-submission")
     add_scope(submission_parser)
     submission_parser.add_argument(
@@ -2315,6 +2400,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         scope = require_scope(args.project, args.region, args.service)
+        if args.command == "build-config":
+            raw = sys.stdin.buffer.read()
+            try:
+                text = raw.decode("utf-8", "strict")
+            except UnicodeDecodeError:
+                fail("MALFORMED_JSON", "JSON evidence is malformed or truncated")
+            result = validate_build_config_document(
+                strict_loads(text),
+                expected_source_sha=args.expected_source_sha,
+                expected_source_tree=args.expected_source_tree,
+                expected_image_tag=args.expected_image_tag,
+                scope=scope,
+            )
+            result["sha256"] = hashlib.sha256(raw).hexdigest()
+            result["scope"] = scope.output()
+            if args.output == "sha256":
+                print(result["sha256"])
+            else:
+                _emit(result)
+            return 0
         if args.command == "artifact-image-request":
             result = validate_artifact_image_request(
                 expected_image_tag=args.expected_image_tag,

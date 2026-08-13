@@ -641,6 +641,58 @@ with tarfile.open(archive_path, "r:") as archive:
 print(f"validated_tree_files={len(tracked)}")
 PY
 
+  BUILD_CONFIG="$EVIDENCE_ROOT/${SOURCE_SHA}-cloudbuild.json"
+  BUILD_CONFIG_DIGEST_FILE="$EVIDENCE_ROOT/${SOURCE_SHA}-cloudbuild.sha256"
+  BUILD_CONFIG_RESULT_FILE="$EVIDENCE_ROOT/${SOURCE_SHA}-cloudbuild.validated.json"
+  python3.12 scripts/validate_deployment_state.py evidence-path \
+    --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    --evidence-root="$EVIDENCE_ROOT" --output-file="$BUILD_CONFIG" \
+    --output-file="$BUILD_CONFIG_DIGEST_FILE" \
+    --output-file="$BUILD_CONFIG_RESULT_FILE" \
+    --expected-image-tag="$CANDIDATE_IMAGE_TAG" >/dev/null \
+    || fail 'unsafe or preexisting build-config evidence path'
+  python3.12 - "$BUILD_CONFIG" <<'PY' \
+    || fail 'deterministic build-config construction'
+import json, sys
+from pathlib import Path
+
+config = {
+    "steps": [{
+        "name": "gcr.io/cloud-builders/docker",
+        "args": [
+            "build",
+            "--tag",
+            "${_CANDIDATE_IMAGE}",
+            "--label",
+            "org.opencontainers.image.revision=${_SOURCE_SHA}",
+            "--label",
+            "com.calmbydesign.source-tree=${_SOURCE_TREE}",
+            ".",
+        ],
+    }],
+    "images": ["${_CANDIDATE_IMAGE}"],
+    "options": {"substitutionOption": "MUST_MATCH"},
+}
+with Path(sys.argv[1]).open("x", encoding="utf-8", newline="\n") as output:
+    output.write(json.dumps(config, sort_keys=True, separators=(",", ":")) + "\n")
+PY
+  BUILD_CONFIG_SHA256="$(
+    python3.12 scripts/validate_deployment_state.py build-config \
+      --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+      --expected-source-sha="$SOURCE_SHA" \
+      --expected-source-tree="$SOURCE_TREE" \
+      --expected-image-tag="$CANDIDATE_IMAGE_TAG" --output=sha256 \
+      < "$BUILD_CONFIG"
+  )" || fail 'strict explicit build-config validation'
+  printf '%s\n' "$BUILD_CONFIG_SHA256" > "$BUILD_CONFIG_DIGEST_FILE"
+  python3.12 scripts/validate_deployment_state.py build-config \
+    --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    --expected-source-sha="$SOURCE_SHA" \
+    --expected-source-tree="$SOURCE_TREE" \
+    --expected-image-tag="$CANDIDATE_IMAGE_TAG" \
+    < "$BUILD_CONFIG" > "$BUILD_CONFIG_RESULT_FILE" \
+    || fail 'build-config evidence capture'
+
   BUILD_SUBMISSION_RAW="$EVIDENCE_ROOT/${SOURCE_SHA}-build-submission.raw.json"
   python3.12 scripts/validate_deployment_state.py evidence-path \
     --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
@@ -651,7 +703,7 @@ PY
     --account="$ACCOUNT" \
     --project="$PROJECT_ID" \
     --region="$REGION" \
-    --tag="$CANDIDATE_IMAGE_TAG" \
+    --config="$BUILD_CONFIG" \
     --substitutions="_SOURCE_SHA=${SOURCE_SHA},_SOURCE_TREE=${SOURCE_TREE},_CANDIDATE_IMAGE=${CANDIDATE_IMAGE_TAG}" \
     --async \
     --format='json(id)' > "$BUILD_SUBMISSION_RAW" || fail 'build submission'
@@ -672,7 +724,7 @@ PY
     set +e
     gcloud builds describe "$BUILD_ID" \
       --account="$ACCOUNT" --project="$PROJECT_ID" --region="$REGION" \
-      --format='json(name,id,projectId,status,images,substitutions,createTime,startTime,finishTime,results.images)' \
+      --format='json(name,id,projectId,status,steps.name,steps.args,images,options.substitutionOption,substitutions,createTime,startTime,finishTime,results.images)' \
       > "$BUILD_POLL_RAW"
     describe_rc=$?
     if [[ "$describe_rc" == 0 ]]; then
@@ -737,10 +789,19 @@ PY
 )
 ```
 
+The deterministic explicit JSON build configuration is created in the evidence
+directory, outside the submitted source context. Its exact bytes and SHA-256 are
+captured before submission. It is evidence, not application source. The one
+Docker step consumes `_SOURCE_SHA`, `_SOURCE_TREE`, and `_CANDIDATE_IMAGE` under
+explicit `MUST_MATCH`; `ALLOW_LOOSE` is prohibited. `--config` and `--tag` must
+never be combined. The independently validated Git archive remains the source
+identity and is not altered by the evidence-only build configuration.
+
 Exit 0 requires the exact tag to have been absent, a byte-exact safe Git context,
-one valid build ID, `SUCCESS` within the bounded polling window, exact Build
-resource name/project/SHA/tree/image substitutions, exactly one declared
-`images[]` tag, and exactly one matching `results.images[]` BuiltImage with its
+one exact validated build configuration, one valid build ID, `SUCCESS` within
+the bounded polling window, exact Build resource name/project/template/options/
+SHA/tree/image substitutions, exactly one declared `images[]` template, and
+exactly one matching `results.images[]` BuiltImage with its
 canonical digest, exact Artifact Registry Package resource, valid optional OCI
 media type, and—when present—a `pushTiming` TimeSpan fully bounded by the Build
 execution interval at nanosecond precision:

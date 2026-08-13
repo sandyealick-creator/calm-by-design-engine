@@ -177,8 +177,8 @@ Writes `golden_results.json`. Does not touch Airtable.
 ## 17. Cloud Run deployment procedure
 
 Do not deploy from source or a mutable image. The only documented procedure is
-[`DEPLOYMENT_RUNBOOK.md`](DEPLOYMENT_RUNBOOK.md), and its corrected procedure
-remains unexecuted against Cloud. It requires an exact clean Git commit, a
+[`DEPLOYMENT_RUNBOOK.md`](DEPLOYMENT_RUNBOOK.md), and the procedure has not
+completed a Cloud Build or deployment. It requires an exact clean Git commit, a
 separately authorized build, an immutable resulting image digest, explicit
 project, region, service, Artifact Registry repository, and image identity, and
 a candidate revision created with zero traffic. The completed Build resource
@@ -188,7 +188,13 @@ source SHA/tree substitutions, declared candidate tag, and exactly one matching
 resource, and valid optional `pushTiming`/OCI media type. Build and push
 chronologies use exact nanosecond-aware RFC 3339 comparison, including offset
 normalization, and any `pushTiming` must be fully contained within the Build
-execution interval. An exact, non-paginated Artifact Registry
+execution interval. The build template is one deterministic explicit JSON
+configuration generated outside the submitted source context and retained as
+evidence with its exact SHA-256. Its one Docker step consumes `_SOURCE_SHA`,
+`_SOURCE_TREE`, and `_CANDIDATE_IMAGE` under explicit `MUST_MATCH`;
+`ALLOW_LOOSE` and simultaneous `--tag`/`--config` submission are prohibited.
+The config is evidence, not application source, and does not replace the
+independent source-archive identity. An exact, non-paginated Artifact Registry
 `DockerImages.Get` is constructed from the validated candidate tag and Build
 digest. Its DockerImage must identify the same repository, package, tag, and
 digest before a deployable digest reference is derived. This is Cloud

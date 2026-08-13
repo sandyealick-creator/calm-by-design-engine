@@ -931,7 +931,23 @@ class Phase2FGateTests(ValidatorTestCase):
             "id": BUILD_ID,
             "projectId": PROJECT,
             "status": status,
-            "images": [IMAGE_TAG],
+            "steps": [
+                {
+                    "name": "gcr.io/cloud-builders/docker",
+                    "args": [
+                        "build",
+                        "--tag",
+                        "${_CANDIDATE_IMAGE}",
+                        "--label",
+                        "org.opencontainers.image.revision=${_SOURCE_SHA}",
+                        "--label",
+                        "com.calmbydesign.source-tree=${_SOURCE_TREE}",
+                        ".",
+                    ],
+                }
+            ],
+            "images": ["${_CANDIDATE_IMAGE}"],
+            "options": {"substitutionOption": "MUST_MATCH"},
             "createTime": "2026-08-11T12:00:00Z",
             "startTime": "2026-08-11T12:00:01Z",
             "finishTime": "2026-08-11T12:01:00Z",
@@ -1142,6 +1158,145 @@ class Phase2FGateTests(ValidatorTestCase):
                         {"observed": observed, "expected": traffic_document(latest(100))},
                         purpose=purpose,
                     )
+
+
+class ExplicitBuildConfigContractTests(ValidatorTestCase):
+    def setUp(self):
+        self.scope = validator.require_scope(PROJECT, REGION, SERVICE)
+
+    def config(self):
+        return {
+            "steps": [
+                {
+                    "name": "gcr.io/cloud-builders/docker",
+                    "args": [
+                        "build",
+                        "--tag",
+                        "${_CANDIDATE_IMAGE}",
+                        "--label",
+                        "org.opencontainers.image.revision=${_SOURCE_SHA}",
+                        "--label",
+                        "com.calmbydesign.source-tree=${_SOURCE_TREE}",
+                        ".",
+                    ],
+                }
+            ],
+            "images": ["${_CANDIDATE_IMAGE}"],
+            "options": {"substitutionOption": "MUST_MATCH"},
+        }
+
+    def validate(self, document):
+        return validator.validate_build_config_document(
+            document,
+            expected_source_sha=SOURCE_SHA,
+            expected_source_tree=SOURCE_TREE,
+            expected_image_tag=IMAGE_TAG,
+            scope=self.scope,
+        )
+
+    def test_exact_explicit_build_configuration_passes(self):
+        self.assertEqual(
+            self.validate(self.config())["classification"],
+            "EXPLICIT_BUILD_CONFIG_VALID",
+        )
+
+    def test_all_three_governed_substitution_references_are_exact(self):
+        config = self.config()
+        rendered = json.dumps(config, sort_keys=True)
+        for name in ("_SOURCE_SHA", "_SOURCE_TREE", "_CANDIDATE_IMAGE"):
+            with self.subTest(name=name):
+                self.assertIn("${" + name + "}", rendered)
+        self.assertEqual(rendered.count("${_CANDIDATE_IMAGE}"), 2)
+
+    def test_missing_source_sha_reference_fails(self):
+        config = self.config()
+        config["steps"][0]["args"].remove(
+            "org.opencontainers.image.revision=${_SOURCE_SHA}"
+        )
+        self.assert_validation_code("BUILD_CONFIG_ARGS", self.validate, config)
+
+    def test_unused_source_tree_substitution_mutation_fails(self):
+        config = self.config()
+        config["steps"][0]["args"][-2] = "com.calmbydesign.source-tree=unused"
+        self.assert_validation_code("BUILD_CONFIG_ARGS", self.validate, config)
+
+    def test_missing_or_altered_candidate_image_reference_fails(self):
+        for mutate in (
+            lambda item: item["steps"][0]["args"].remove("${_CANDIDATE_IMAGE}"),
+            lambda item: item["steps"][0]["args"].__setitem__(
+                2, "${_CANDIDATE_IMAGE}:mutable"
+            ),
+        ):
+            with self.subTest(mutate=mutate):
+                config = self.config()
+                mutate(config)
+                self.assert_validation_code("BUILD_CONFIG_ARGS", self.validate, config)
+
+    def test_allow_loose_fails(self):
+        config = self.config()
+        config["options"]["substitutionOption"] = "ALLOW_LOOSE"
+        self.assert_validation_code("BUILD_CONFIG_OPTIONS", self.validate, config)
+
+    def test_missing_or_non_must_match_policy_fails(self):
+        for options in ({}, {"substitutionOption": "SUBSTITUTION_OPTION_UNSPECIFIED"}):
+            with self.subTest(options=options):
+                config = self.config()
+                config["options"] = options
+                self.assert_validation_code(
+                    "BUILD_CONFIG_OPTIONS", self.validate, config
+                )
+
+    def test_unexpected_build_step_fails(self):
+        config = self.config()
+        config["steps"].append(
+            {"name": "gcr.io/cloud-builders/docker", "args": ["push"]}
+        )
+        self.assert_validation_code("BUILD_CONFIG_STEPS", self.validate, config)
+
+    def test_unexpected_image_fails(self):
+        config = self.config()
+        config["images"].append("${_CANDIDATE_IMAGE}:unexpected")
+        self.assert_validation_code("BUILD_CONFIG_IMAGES", self.validate, config)
+
+    def test_docker_tag_and_top_level_image_mismatch_fails(self):
+        config = self.config()
+        config["images"] = [IMAGE_TAG]
+        self.assert_validation_code("BUILD_CONFIG_IMAGES", self.validate, config)
+
+    def test_altered_provenance_label_key_or_value_fails(self):
+        for index, value in (
+            (4, "org.opencontainers.image.ref=${_SOURCE_SHA}"),
+            (6, "com.calmbydesign.source-tree=${_SOURCE_SHA}"),
+        ):
+            with self.subTest(index=index):
+                config = self.config()
+                config["steps"][0]["args"][index] = value
+                self.assert_validation_code("BUILD_CONFIG_ARGS", self.validate, config)
+
+    def test_implicit_tag_style_template_does_not_satisfy_contract(self):
+        implicit = {
+            "steps": [
+                {
+                    "name": "gcr.io/cloud-builders/docker",
+                    "args": ["build", "--tag", IMAGE_TAG, "."],
+                }
+            ],
+            "images": [IMAGE_TAG],
+            "options": {"substitutionOption": "MUST_MATCH"},
+        }
+        self.assert_validation_code("BUILD_CONFIG_ARGS", self.validate, implicit)
+
+    def test_unexpected_config_key_or_substitution_map_fails(self):
+        for key, value in (
+            ("timeout", "600s"),
+            ("substitutions", {"_SOURCE_SHA": SOURCE_SHA}),
+        ):
+            with self.subTest(key=key):
+                config = self.config()
+                config[key] = value
+                self.assert_validation_code(
+                    "BUILD_CONFIG_STRUCTURE", self.validate, config
+                )
 
 
 class Phase2HRegressionTests(ValidatorTestCase):
@@ -1479,6 +1634,10 @@ class Phase2HRegressionTests(ValidatorTestCase):
         runbook = Path("DEPLOYMENT_RUNBOOK.md").read_text(encoding="utf-8")
         self.assertIn("results.images", runbook)
         self.assertIn("authorize-image", runbook)
+        self.assertIn("build-config", runbook)
+        self.assertIn('"substitutionOption": "MUST_MATCH"', runbook)
+        self.assertNotIn("--tag=\"$CANDIDATE_IMAGE_TAG\"", runbook)
+        self.assertIn("`ALLOW_LOOSE` is prohibited", runbook)
         self.assertNotIn('tag.update({"buildId"', runbook)
 
     def test_documented_curl_authentication_fails_before_request(self):
