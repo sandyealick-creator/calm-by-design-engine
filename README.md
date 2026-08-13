@@ -69,7 +69,7 @@ image identity, and a candidate revision created with zero traffic. Live
 verification and traffic movement require separate authorizations. Secret
 Manager references may be recorded by name or resource reference only, never as
 plaintext credential values in commands, documentation, terminal output, or the
-release record. The corrected procedure has not been executed against Cloud.
+release record. The procedure has not completed a Cloud Build or deployment.
 
 `scripts/validate_deployment_state.py` and
 `tests/test_deployment_state.py` provide local, fixture-based validation for
@@ -77,8 +77,14 @@ strict revision, traffic, zero-traffic transition, `SESSION_SECRET` reference,
 and secret-version metadata evidence. They also validate authorized evidence
 scope, exact candidate-tag and revision nonexistence, terminal build/source/image
 binding, Artifact Registry DockerImage resolution, safe runtime hashes, and
-complete authorized traffic or rollback maps. A completed Build must declare the
-exact candidate tag in `images[]` and report exactly one matching
+complete authorized traffic or rollback maps. The build uses one deterministic
+explicit JSON config generated and retained as evidence outside the submitted
+source context. Its exact bytes and SHA-256 are captured before submission; its
+single Docker step consumes `_SOURCE_SHA`, `_SOURCE_TREE`, and
+`_CANDIDATE_IMAGE` under explicit `MUST_MATCH`, and `ALLOW_LOOSE` is prohibited.
+The config is evidence rather than application source, so the independently
+validated source archive identity remains unchanged. A completed Build must
+preserve that exact template and report exactly one matching
 `results.images[]` BuiltImage with a canonical digest, exact Artifact Registry
 Package resource, and a structurally valid optional `pushTiming`/OCI media type.
 When present, `pushTiming` must be fully contained within the Build execution
