@@ -533,6 +533,7 @@ class TrafficTarget:
 class TrafficState:
     latest_ready_revision: str
     targets: tuple[TrafficTarget, ...]
+    latest_created_revision: str | None = None
 
     def raw_canonical(self) -> str:
         records = sorted(
@@ -590,11 +591,18 @@ def parse_traffic_document(document: Any) -> TrafficState:
         root["status"], "TRAFFIC_STATUS", "Traffic status is missing or null"
     )
     _require_exact_keys(
-        status, required={"latestReadyRevisionName", "traffic"}
+        status,
+        required={"latestReadyRevisionName", "traffic"},
+        optional={"latestCreatedRevisionName"},
     )
     latest_ready = _require_revision_name(
         status["latestReadyRevisionName"], "LATEST_READY_REVISION"
     )
+    latest_created = None
+    if "latestCreatedRevisionName" in status:
+        latest_created = _require_revision_name(
+            status["latestCreatedRevisionName"], "LATEST_CREATED_REVISION"
+        )
     traffic = status["traffic"]
     if not isinstance(traffic, list) or not traffic:
         fail("TRAFFIC_MISSING", "Traffic targets are missing or malformed")
@@ -664,7 +672,7 @@ def parse_traffic_document(document: Any) -> TrafficState:
 
     if total != 100:
         fail("TRAFFIC_TOTAL", "Traffic percentages do not total exactly 100")
-    return TrafficState(latest_ready, tuple(targets))
+    return TrafficState(latest_ready, tuple(targets), latest_created)
 
 
 def validate_zero_traffic_transition(
@@ -674,9 +682,8 @@ def validate_zero_traffic_transition(
     candidate_revision: str,
     baseline_revision: str,
     pre_latest_ready_revision: str,
-    post_latest_ready_revision: str | None = None,
 ) -> dict[str, Any]:
-    """Prove zero candidate traffic and unchanged effective serving allocation."""
+    """Prove a ready candidate has no production traffic after --no-traffic."""
 
     candidate = _require_revision_name(candidate_revision, "CANDIDATE_REVISION")
     baseline = _require_revision_name(baseline_revision, "BASELINE_REVISION")
@@ -684,23 +691,25 @@ def validate_zero_traffic_transition(
         fail("REVISION_COLLISION", "Candidate and baseline revisions are identical")
     pre = parse_traffic_document(pre_document)
     post = parse_traffic_document(post_document)
-    if post_latest_ready_revision is None:
+    if post.latest_created_revision != candidate:
         fail(
-            "POST_LATEST_REQUIRED",
-            "Post-deployment latest-ready revision binding is required",
-        )
-    post_latest = _require_revision_name(
-        post_latest_ready_revision, "POST_LATEST_REVISION"
-    )
-    if post_latest != candidate or post.latest_ready_revision != candidate:
-        fail(
-            "POST_LATEST_MISMATCH",
-            "Post-deployment latest-ready revision differs from the candidate",
+            "POST_LATEST_CREATED_MISMATCH",
+            "Post-deployment latest-created revision differs from the candidate",
         )
     if pre.latest_ready_revision != pre_latest_ready_revision:
         fail("BASELINE_MISMATCH", "Pre-deployment latest-ready revision is unexpected")
     if pre_latest_ready_revision != baseline:
         fail("BASELINE_MISMATCH", "Approved baseline does not resolve floating LATEST")
+    if post.latest_ready_revision != baseline:
+        fail(
+            "POST_LATEST_READY_MISMATCH",
+            "Post-deployment latest-ready revision differs from the traffic-serving baseline",
+        )
+    if any(target.target_type == "LATEST" for target in post.targets):
+        fail(
+            "POST_FLOATING_LATEST",
+            "Post-deployment traffic must not retain a floating LATEST target",
+        )
 
     candidate_post_targets = [
         target
@@ -716,7 +725,7 @@ def validate_zero_traffic_transition(
         fail("CANDIDATE_HAS_TRAFFIC", "Candidate receives traffic or has a tag")
 
     pre_effective = pre.effective_canonical(pre_latest_ready_revision)
-    post_effective = post.effective_canonical(post_latest)
+    post_effective = post.effective_canonical(baseline)
     if pre_effective != post_effective:
         fail("EFFECTIVE_TRAFFIC_DRIFT", "Effective serving allocation changed")
 
@@ -749,7 +758,7 @@ def validate_zero_traffic_transition(
 
     baseline_percent = sum(
         item["percent"]
-        for item in post.effective_records(post_latest)
+        for item in post.effective_records(baseline)
         if item["revision"] == baseline
     )
     if baseline_percent != 100:
@@ -758,6 +767,8 @@ def validate_zero_traffic_transition(
         "baselinePercent": baseline_percent,
         "candidateTraffic": "ABSENT" if candidate_zero_count == 0 else "EXPLICIT_ZERO",
         "effectiveAllocationPreserved": True,
+        "latestCreatedRevision": post.latest_created_revision,
+        "latestReadyRevision": post.latest_ready_revision,
         "postRaw": post.raw_canonical(),
         "preRaw": pre.raw_canonical(),
     }
@@ -2368,7 +2379,6 @@ def build_parser() -> argparse.ArgumentParser:
     transition_parser.add_argument("--candidate-revision", required=True)
     transition_parser.add_argument("--baseline-revision", required=True)
     transition_parser.add_argument("--pre-latest-ready-revision", required=True)
-    transition_parser.add_argument("--post-latest-ready-revision", required=True)
     transition_parser.add_argument("--evidence-root")
     transition_parser.add_argument("--pre-evidence-file")
     transition_parser.add_argument("--post-evidence-file")
@@ -2779,7 +2789,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 candidate_revision=args.candidate_revision,
                 baseline_revision=args.baseline_revision,
                 pre_latest_ready_revision=args.pre_latest_ready_revision,
-                post_latest_ready_revision=args.post_latest_ready_revision,
             )
             result["scope"] = scope.output()
         elif args.command == "session-secret":

@@ -93,13 +93,14 @@ def validate_revision(
     )
 
 
-def traffic_document(*targets, latest_ready=BASELINE):
-    return {
-        "status": {
-            "latestReadyRevisionName": latest_ready,
-            "traffic": list(targets),
-        }
+def traffic_document(*targets, latest_ready=BASELINE, latest_created=None):
+    status = {
+        "latestReadyRevisionName": latest_ready,
+        "traffic": list(targets),
     }
+    if latest_created is not None:
+        status["latestCreatedRevisionName"] = latest_created
+    return {"status": status}
 
 
 def fixed(revision, percent, *, tag=None):
@@ -564,11 +565,12 @@ class TrafficTests(ValidatorTestCase):
     def test_raw_latest_to_fixed_transition_with_candidate_absent(self):
         result = validator.validate_zero_traffic_transition(
             traffic_document(latest(100)),
-            traffic_document(fixed(BASELINE, 100), latest_ready=CANDIDATE),
+            traffic_document(
+                fixed(BASELINE, 100), latest_created=CANDIDATE
+            ),
             candidate_revision=CANDIDATE,
             baseline_revision=BASELINE,
             pre_latest_ready_revision=BASELINE,
-            post_latest_ready_revision=CANDIDATE,
         )
         self.assertEqual(result["candidateTraffic"], "ABSENT")
         self.assertEqual(result["baselinePercent"], 100)
@@ -578,14 +580,38 @@ class TrafficTests(ValidatorTestCase):
         result = validator.validate_zero_traffic_transition(
             traffic_document(latest(100)),
             traffic_document(
-                fixed(BASELINE, 100), fixed(CANDIDATE, 0), latest_ready=CANDIDATE
+                fixed(BASELINE, 100), fixed(CANDIDATE, 0), latest_created=CANDIDATE
             ),
             candidate_revision=CANDIDATE,
             baseline_revision=BASELINE,
             pre_latest_ready_revision=BASELINE,
-            post_latest_ready_revision=CANDIDATE,
         )
         self.assertEqual(result["candidateTraffic"], "EXPLICIT_ZERO")
+
+    def test_captured_zero_traffic_service_shape_passes(self):
+        candidate = "cbd-assess-17237de"
+        baseline = "cbd-assess-00009-mkz"
+        result = validator.validate_zero_traffic_transition(
+            {
+                "status": {
+                    "latestReadyRevisionName": baseline,
+                    "traffic": [{"revisionName": baseline, "percent": 100}],
+                }
+            },
+            {
+                "status": {
+                    "latestCreatedRevisionName": candidate,
+                    "latestReadyRevisionName": baseline,
+                    "traffic": [{"revisionName": baseline, "percent": 100}],
+                }
+            },
+            candidate_revision=candidate,
+            baseline_revision=baseline,
+            pre_latest_ready_revision=baseline,
+        )
+        self.assertEqual(result["latestCreatedRevision"], candidate)
+        self.assertEqual(result["latestReadyRevision"], baseline)
+        self.assertEqual(result["candidateTraffic"], "ABSENT")
 
     def test_unexpected_effective_map_drift(self):
         self.assert_validation_code(
@@ -595,12 +621,11 @@ class TrafficTests(ValidatorTestCase):
             traffic_document(
                 fixed(BASELINE, 90),
                 fixed("cbd-assess-unexpected", 10),
-                latest_ready=CANDIDATE,
+                latest_created=CANDIDATE,
             ),
             candidate_revision=CANDIDATE,
             baseline_revision=BASELINE,
             pre_latest_ready_revision=BASELINE,
-            post_latest_ready_revision=CANDIDATE,
         )
 
     def test_candidate_nonzero_or_tagged_is_rejected(self):
@@ -613,11 +638,10 @@ class TrafficTests(ValidatorTestCase):
                 with self.assertRaises(validator.ValidationError) as caught:
                     validator.validate_zero_traffic_transition(
                         traffic_document(latest(100)),
-                        traffic_document(*targets, latest_ready=CANDIDATE),
+                        traffic_document(*targets, latest_created=CANDIDATE),
                         candidate_revision=CANDIDATE,
                         baseline_revision=BASELINE,
                         pre_latest_ready_revision=BASELINE,
-                        post_latest_ready_revision=CANDIDATE,
                     )
                 self.assertEqual(caught.exception.code, "CANDIDATE_HAS_TRAFFIC")
 
@@ -626,11 +650,10 @@ class TrafficTests(ValidatorTestCase):
             "EFFECTIVE_TRAFFIC_DRIFT",
             validator.validate_zero_traffic_transition,
             traffic_document(latest(100, tag="stable")),
-            traffic_document(fixed(BASELINE, 100), latest_ready=CANDIDATE),
+            traffic_document(fixed(BASELINE, 100), latest_created=CANDIDATE),
             candidate_revision=CANDIDATE,
             baseline_revision=BASELINE,
             pre_latest_ready_revision=BASELINE,
-            post_latest_ready_revision=CANDIDATE,
         )
 
     def test_raw_change_beyond_documented_transformation_is_rejected(self):
@@ -638,7 +661,7 @@ class TrafficTests(ValidatorTestCase):
         post = traffic_document(
             fixed(BASELINE, 100),
             fixed("cbd-assess-unexpected", 0),
-            latest_ready=CANDIDATE,
+            latest_created=CANDIDATE,
         )
         self.assert_validation_code(
             "RAW_TRAFFIC_TRANSFORMATION",
@@ -648,7 +671,6 @@ class TrafficTests(ValidatorTestCase):
             candidate_revision=CANDIDATE,
             baseline_revision=BASELINE,
             pre_latest_ready_revision=BASELINE,
-            post_latest_ready_revision=CANDIDATE,
         )
 
 
@@ -920,33 +942,40 @@ class Phase2FScopeAndTransitionTests(ValidatorTestCase):
                     service=SERVICE,
                 )
 
-    def test_post_latest_ready_binding_is_mandatory_and_must_be_candidate(self):
+    def test_post_service_bindings_require_created_candidate_and_ready_baseline(self):
         pre = traffic_document(latest(100))
-        post = traffic_document(fixed(BASELINE, 100), latest_ready=CANDIDATE)
+        post = traffic_document(fixed(BASELINE, 100), latest_created=CANDIDATE)
         self.assert_validation_code(
-            "POST_LATEST_REQUIRED",
+            "POST_LATEST_CREATED_MISMATCH",
             validator.validate_zero_traffic_transition,
             pre,
-            post,
+            traffic_document(fixed(BASELINE, 100)),
             candidate_revision=CANDIDATE,
             baseline_revision=BASELINE,
             pre_latest_ready_revision=BASELINE,
         )
-        for supplied, observed in (
-            (BASELINE, CANDIDATE),
-            (CANDIDATE, BASELINE),
-        ):
-            with self.subTest(supplied=supplied, observed=observed):
-                self.assert_validation_code(
-                    "POST_LATEST_MISMATCH",
-                    validator.validate_zero_traffic_transition,
-                    pre,
-                    traffic_document(fixed(BASELINE, 100), latest_ready=observed),
-                    candidate_revision=CANDIDATE,
-                    baseline_revision=BASELINE,
-                    pre_latest_ready_revision=BASELINE,
-                    post_latest_ready_revision=supplied,
-                )
+        self.assert_validation_code(
+            "POST_LATEST_READY_MISMATCH",
+            validator.validate_zero_traffic_transition,
+            pre,
+            traffic_document(
+                fixed(BASELINE, 100),
+                latest_ready=CANDIDATE,
+                latest_created=CANDIDATE,
+            ),
+            candidate_revision=CANDIDATE,
+            baseline_revision=BASELINE,
+            pre_latest_ready_revision=BASELINE,
+        )
+        self.assert_validation_code(
+            "POST_FLOATING_LATEST",
+            validator.validate_zero_traffic_transition,
+            pre,
+            traffic_document(latest(100), latest_created=CANDIDATE),
+            candidate_revision=CANDIDATE,
+            baseline_revision=BASELINE,
+            pre_latest_ready_revision=BASELINE,
+        )
 
 
 class Phase2FGateTests(ValidatorTestCase):
@@ -3321,7 +3350,7 @@ class Phase2FCliTests(unittest.TestCase):
 
     def valid_commands(self):
         pre = traffic_document(latest(100))
-        post = traffic_document(fixed(BASELINE, 100), latest_ready=CANDIDATE)
+        post = traffic_document(fixed(BASELINE, 100), latest_created=CANDIDATE)
         build = Phase2FGateTests().build_document()
         docker_image = {
             "name": DOCKER_IMAGE_RESOURCE,
@@ -3363,8 +3392,6 @@ class Phase2FCliTests(unittest.TestCase):
                     BASELINE,
                     "--pre-latest-ready-revision",
                     BASELINE,
-                    "--post-latest-ready-revision",
-                    CANDIDATE,
                 ],
                 scoped("transition", {"pre": pre, "post": post}),
             ),
