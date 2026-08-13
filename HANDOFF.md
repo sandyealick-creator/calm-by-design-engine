@@ -177,9 +177,11 @@ Writes `golden_results.json`. Does not touch Airtable.
 ## 17. Cloud Run deployment procedure
 
 Do not deploy from source or a mutable image. The only documented procedure is
-[`DEPLOYMENT_RUNBOOK.md`](DEPLOYMENT_RUNBOOK.md). One successful Build is
-preserved as regression evidence, but no Cloud Run deployment occurred. It
-requires an exact clean Git commit, a
+[`DEPLOYMENT_RUNBOOK.md`](DEPLOYMENT_RUNBOOK.md). The earlier baseline record
+preserved one successful Build but no Cloud Run deployment. A later separately
+authorized `--no-traffic` deployment created a candidate revision while
+production traffic remained 100% on the fixed baseline. The procedure requires
+an exact clean Git commit, a
 separately authorized build, an immutable resulting image digest, explicit
 project, region, service, Artifact Registry repository, and image identity, and
 a candidate revision created with zero traffic. The completed Build resource is
@@ -237,10 +239,15 @@ floating `LATEST` target at 100%, bound at that time to
 `sha256:6fd949d0e3ab3d4780f927088048009521ab8fb82f03253171e971862c31bcc3`.
 It does not establish current live service state; fresh verification remains
 required.
-An eventual authorized `--no-traffic` deployment may convert that floating
-target to the fixed current revision; the raw maps may therefore differ while
-the effective serving allocation must remain identical and the candidate must
-remain at zero.
+The authorized `--no-traffic` deployment converted the floating target to the
+fixed baseline revision; the raw maps therefore differ while the effective
+serving allocation remains identical and the candidate remains at zero. The
+post-deployment service evidence separately shows the candidate as
+`latestCreatedRevisionName`, the candidate revision itself as `Ready=True`, and
+the fixed baseline as `latestReadyRevisionName`; this avoids mistaking the
+newest created zero-traffic revision for the latest revision serving traffic.
+No traffic movement occurred during the correction or review phase, and
+participant enrollment and live participant use remain separately unauthorized.
 
 The real `SESSION_SECRET` reference and enabled exact numeric version remain unresolved. A
 future corrected partial-response query must request only environment names and
@@ -272,7 +279,8 @@ remain unauthorized.
 - Real GHL email delivery for check-in links and recovery links (the new workflow doesn't exist yet).
 - Mobile/browser rendering (no browser was driven this session).
 - Cross-device recovery.
-- Cloud Run deployment of this version (not deployed this session).
+- Production-traffic movement for the zero-traffic candidate (not authorized in
+  this session).
 - Deployed Python runtime and compatibility of every dependency declared in `requirements.txt`; rerun the mocked suite and `pip check` in that runtime before live verification.
 - Cloud Run request-log verification for the fragment-to-POST bearer redemption flow and direct remote-address rate-limit behavior.
 - The `Recovery Link` field being cleared via an empty-string PATCH against the real Airtable API (only verified against the test fake).

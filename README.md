@@ -65,12 +65,21 @@ Do not deploy directly from source or a mutable image. Follow
 [`DEPLOYMENT_RUNBOOK.md`](DEPLOYMENT_RUNBOOK.md) only after separate explicit
 authorization. It requires an exact clean Git commit, an authorized build, an
 immutable resulting image digest, explicit project/region/service/repository/
-image identity, and a candidate revision created with zero traffic. Live
-verification and traffic movement require separate authorizations. Secret
+image identity, and a candidate revision created with zero traffic. For that
+candidate, the release evidence distinguishes newest-created, independently
+ready, and traffic-serving revisions: `latestCreatedRevisionName` is the
+candidate, its revision reports `Ready=True`, `latestReadyRevisionName` remains
+the fixed baseline, baseline traffic is 100%, and candidate traffic is 0%.
+Live verification and traffic movement require separate authorizations. Secret
 Manager references may be recorded by name or resource reference only, never as
 plaintext credential values in commands, documentation, terminal output, or the
-release record. One successful Build is preserved as regression evidence, but
-the procedure has not completed a Cloud Run deployment.
+release record. The earlier baseline record contained one successful Build and
+no Cloud Run deployment. A later separately authorized `--no-traffic`
+deployment created the candidate revision while production traffic remained
+100% on the fixed baseline; the candidate is latest-created and receives 0%
+traffic. No traffic movement occurred during the correction or review phase,
+and participant enrollment and live participant use remain separately
+unauthorized.
 
 `scripts/validate_deployment_state.py` and
 `tests/test_deployment_state.py` provide local, fixture-based validation for

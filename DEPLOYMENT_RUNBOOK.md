@@ -895,9 +895,9 @@ identity, an unexpected status, or command failure stops.
 After separate zero-traffic deployment authorization, run this block. It
 requires the exact successful REST Build and DockerImage evidence, revalidates
 their complete current envelope and digest equality, captures pre-state before
-mutation, validates the exact candidate revision afterward, makes post-candidate
-latest-ready binding mandatory, validates zero traffic, and compares runtime
-hashes:
+mutation, validates the exact candidate revision afterward, proves the candidate
+is the latest created revision while the baseline remains the latest
+traffic-serving revision, validates zero traffic, and compares runtime hashes:
 
 ```bash
 (
@@ -979,19 +979,18 @@ hashes:
 
   gcloud run services describe "$SERVICE" \
     --account="$ACCOUNT" --project="$PROJECT_ID" --region="$REGION" \
-    --format='json(status.latestReadyRevisionName,status.traffic)' \
+    --format='json(status.latestCreatedRevisionName,status.latestReadyRevisionName,status.traffic)' \
     > "$POST_SERVICE_RAW"
   bind_scope serviceState < "$POST_SERVICE_RAW" \
     | python3.12 scripts/validate_deployment_state.py traffic \
         --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
-        --latest-ready-revision="$CANDIDATE_REVISION" >/dev/null
+        --latest-ready-revision="$BASELINE_REVISION" >/dev/null
 
   python3.12 scripts/validate_deployment_state.py zero-traffic \
       --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
       --candidate-revision="$CANDIDATE_REVISION" \
       --baseline-revision="$BASELINE_REVISION" \
       --pre-latest-ready-revision="$BASELINE_REVISION" \
-      --post-latest-ready-revision="$CANDIDATE_REVISION" \
       --evidence-root="$EVIDENCE_ROOT" --pre-evidence-file="$PRE_SERVICE_RAW" \
       --post-evidence-file="$POST_SERVICE_RAW"
 
@@ -1011,10 +1010,13 @@ or volume flags unless a new review explicitly authorizes a complete restatement
 of configuration.
 
 Exit 0 requires exact candidate name, digest, and `Ready=True`; observed
-post-deployment latest-ready revision equal to the candidate; unchanged
-effective allocation; baseline at 100%; candidate absent or untagged at zero;
-only the documented floating-to-fixed raw transformation; and identical safe
-runtime hashes.
+post-deployment `latestCreatedRevisionName` equal to the candidate;
+`latestReadyRevisionName` equal to the traffic-serving baseline; a fixed,
+untagged baseline target at 100%; candidate absent or untagged at zero; only the
+documented floating-to-fixed raw transformation; and identical safe runtime
+hashes. A correct `--no-traffic` deployment therefore has newest-created
+candidate, independently ready candidate, latest-ready baseline, baseline
+traffic at 100%, and candidate traffic at 0%.
 
 Do not require byte-for-byte equality between a floating raw pre-map and the
 documented fixed post-map. Any effective drift, candidate traffic, candidate
