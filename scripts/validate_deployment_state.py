@@ -1279,6 +1279,28 @@ def validate_build_config_document(
     }
 
 
+def load_build_config_evidence(
+    evidence_root: str,
+    config_file: str,
+    expected_sha256: str,
+) -> Any:
+    """Load one preserved explicit config and bind its exact bytes to approval."""
+
+    path = validate_evidence_file_path(evidence_root, config_file, must_exist=True)
+    if not isinstance(expected_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", expected_sha256
+    ):
+        fail("BUILD_CONFIG_DIGEST", "Expected build-config digest is malformed")
+    try:
+        raw = Path(path).read_bytes()
+        text = raw.decode("utf-8", "strict")
+    except (OSError, UnicodeError):
+        fail("BUILD_CONFIG_FILE", "Build-config evidence could not be read safely")
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        fail("BUILD_CONFIG_DIGEST", "Build-config bytes differ from authorization")
+    return strict_loads(text)
+
+
 NONTERMINAL_BUILD_STATES = {"PENDING", "QUEUED", "WORKING"}
 FAILED_BUILD_STATES = {
     "FAILURE",
@@ -1296,6 +1318,9 @@ def validate_build_document(
     expected_source_sha: str,
     expected_source_tree: str,
     expected_image_tag: str,
+    expected_project_number: str,
+    expected_service_account: str,
+    submitted_config: Any,
     scope: Scope | None = None,
 ) -> dict[str, str]:
     """Validate one Build resource and its completed BuiltImage output."""
@@ -1308,7 +1333,15 @@ def validate_build_document(
         fail("SOURCE_TREE", "Expected source tree is malformed")
     if scope is None:
         fail("SCOPE", "Build validation requires an authorized scope")
+    project_identity = require_project_identity(scope.project, expected_project_number)
     identity = _image_identity(expected_image_tag, scope)
+    validate_build_config_document(
+        submitted_config,
+        expected_source_sha=expected_source_sha,
+        expected_source_tree=expected_source_tree,
+        expected_image_tag=expected_image_tag,
+        scope=scope,
+    )
     root = _require_object(document, "BUILD_EVIDENCE", "Build evidence is malformed")
     _require_exact_keys(
         root,
@@ -1317,30 +1350,75 @@ def validate_build_document(
             "id",
             "projectId",
             "status",
+            "serviceAccount",
             "steps",
             "images",
             "options",
             "substitutions",
+            "source",
+            "sourceProvenance",
         },
         optional={"createTime", "startTime", "finishTime", "results"},
     )
-    expected_name = (
-        f"projects/{scope.project}/locations/{scope.region}/builds/{expected_build_id}"
-    )
-    if root["name"] != expected_name or root["projectId"] != scope.project:
+    expected_names = {
+        f"projects/{project}/locations/{scope.region}/builds/{expected_build_id}"
+        for project in project_identity.aliases
+    }
+    if root["name"] not in expected_names or root["projectId"] != scope.project:
         fail("BUILD_RESOURCE_MISMATCH", "Build resource identifies another scope")
     if root["id"] != expected_build_id:
         fail("BUILD_ID_MISMATCH", "Build identifier differs from expectation")
     status = root["status"]
     if not isinstance(status, str):
         fail("BUILD_STATUS", "Build status is malformed")
-    validate_build_config_document(
-        {key: root[key] for key in ("steps", "images", "options")},
-        expected_source_sha=expected_source_sha,
-        expected_source_tree=expected_source_tree,
-        expected_image_tag=expected_image_tag,
-        scope=scope,
+    expected_service_account_resource = (
+        f"projects/{scope.project}/serviceAccounts/{expected_service_account}"
     )
+    if root["serviceAccount"] != expected_service_account_resource:
+        fail("BUILD_SERVICE_ACCOUNT", "Build service account differs from authorization")
+    expected_args = [
+        "build", "--tag", expected_image_tag,
+        "--label", f"org.opencontainers.image.revision={expected_source_sha}",
+        "--label", f"com.calmbydesign.source-tree={expected_source_tree}", ".",
+    ]
+    steps = root["steps"]
+    if steps != [{"name": EXPLICIT_BUILD_STEP_NAME, "args": expected_args}]:
+        fail("BUILD_RETURNED_STEPS", "Returned Build step differs from authorization")
+    if root["images"] != [expected_image_tag]:
+        fail("BUILD_RETURNED_IMAGES", "Returned Build image differs from authorization")
+    options = _require_object(
+        root["options"], "BUILD_RETURNED_OPTIONS", "Returned Build options are malformed"
+    )
+    _require_exact_keys(
+        options, required=set(), optional={"substitutionOption"},
+        code="BUILD_RETURNED_OPTIONS",
+    )
+    if options.get("substitutionOption", "MUST_MATCH") != "MUST_MATCH":
+        fail("BUILD_RETURNED_OPTIONS", "Returned Build permits loose substitutions")
+    source = _require_object(root["source"], "BUILD_SOURCE", "Build source is malformed")
+    provenance = _require_object(
+        root["sourceProvenance"], "BUILD_SOURCE", "Build source provenance is malformed"
+    )
+    _require_exact_keys(source, required={"storageSource"}, code="BUILD_SOURCE")
+    _require_exact_keys(
+        provenance, required={"resolvedStorageSource"}, code="BUILD_SOURCE"
+    )
+    storage = _require_object(source["storageSource"], "BUILD_SOURCE", "Build source is malformed")
+    resolved = _require_object(
+        provenance["resolvedStorageSource"], "BUILD_SOURCE", "Resolved source is malformed"
+    )
+    for item in (storage, resolved):
+        _require_exact_keys(item, required={"bucket", "object", "generation"}, code="BUILD_SOURCE")
+        if (
+            item["bucket"] != f"{scope.project}_cloudbuild"
+            or not isinstance(item["object"], str)
+            or not re.fullmatch(r"source/[A-Za-z0-9._-]+\.tgz", item["object"])
+            or not isinstance(item["generation"], str)
+            or not re.fullmatch(r"[1-9][0-9]*", item["generation"])
+        ):
+            fail("BUILD_SOURCE", "Build source identity is malformed")
+    if storage != resolved:
+        fail("BUILD_SOURCE_MISMATCH", "Resolved Build source differs from submission")
     substitutions = _require_object(
         root["substitutions"], "BUILD_SUBSTITUTIONS", "Build source binding is malformed"
     )
@@ -1392,7 +1470,13 @@ def validate_build_document(
         fail("BUILT_IMAGE_NAME", "BuiltImage name differs from the authorized tag")
     digest = _canonical_digest(built_image["digest"], "BUILT_IMAGE_DIGEST")
     artifact_package = built_image["artifactRegistryPackage"]
-    if artifact_package != identity.package_resource:
+    expected_package_versions = {
+        identity.package_resource.replace(
+            f"projects/{scope.project}/", f"projects/{project}/", 1
+        ) + f"/versions/{digest}"
+        for project in project_identity.aliases
+    }
+    if artifact_package not in expected_package_versions:
         fail(
             "BUILT_IMAGE_PACKAGE",
             "BuiltImage Artifact Registry package differs from authorization",
@@ -1428,7 +1512,7 @@ def validate_build_document(
             fail("BUILT_IMAGE_OCI_MEDIA_TYPE", "BuiltImage OCI media type is malformed")
     return {
         "buildId": expected_build_id,
-        "buildResource": expected_name,
+        "buildResource": root["name"],
         "classification": "BUILD_SUCCESS",
         "createTime": root["createTime"],
         "finishTime": root["finishTime"],
@@ -1436,6 +1520,7 @@ def validate_build_document(
         "imageDigestRef": identity.digest_uri(digest),
         "imageTag": expected_image_tag,
         "packageResource": identity.package_resource,
+        "packageVersionResource": artifact_package,
         "sourceSha": expected_source_sha,
         "sourceTree": expected_source_tree,
         "startTime": root["startTime"],
@@ -1446,12 +1531,14 @@ def validate_tag_resolution_document(
     document: Any,
     *,
     expected_image_tag: str,
+    expected_project_number: str,
     scope: Scope | None = None,
 ) -> dict[str, str]:
     """Validate one exact Artifact Registry DockerImage resolved by candidate tag."""
 
     if scope is None:
         fail("SCOPE", "Tag resolution requires an authorized scope")
+    project_identity = require_project_identity(scope.project, expected_project_number)
     identity = _image_identity(expected_image_tag, scope)
     root = _require_object(document, "TAG_EVIDENCE", "Tag evidence is malformed")
     _require_exact_keys(root, required={"name", "uri", "tags"})
@@ -1466,22 +1553,21 @@ def validate_tag_resolution_document(
     digest = _canonical_digest(uri[len(prefix):], "TAG_DIGEST")
     if uri != identity.digest_uri(digest):
         fail("TAG_URI", "DockerImage URI is not canonical")
-    if root["name"] != identity.docker_image_resource(digest):
+    expected_resources = {
+        identity.docker_image_resource(digest).replace(
+            f"projects/{scope.project}/", f"projects/{project}/", 1
+        )
+        for project in project_identity.aliases
+    }
+    if root["name"] not in expected_resources:
         fail("TAG_IDENTITY_MISMATCH", "DockerImage resource differs from authorization")
     tags = root["tags"]
     if not isinstance(tags, list) or not tags or any(
         not isinstance(tag, str) for tag in tags
     ):
         fail("TAG_LIST", "DockerImage tags are malformed")
-    if len(tags) != len(set(tags)) or identity.tagged_uri not in tags:
-        fail("TAG_LIST", "Exact candidate tag is missing or duplicated")
-    for tag in tags:
-        parsed = _image_identity(tag, scope)
-        if (
-            parsed.repository != identity.repository
-            or parsed.image != identity.image
-        ):
-            fail("TAG_SCOPE_MISMATCH", "DockerImage contains a cross-package tag")
+    if tags != [identity.tag]:
+        fail("TAG_LIST", "Exact bare candidate tag is missing or ambiguous")
     return {
         "classification": "TAG_RESOLVED",
         "digest": digest,
@@ -1519,6 +1605,9 @@ def validate_deployment_image_authorization(
     expected_source_sha: str,
     expected_source_tree: str,
     expected_image_tag: str,
+    expected_project_number: str,
+    expected_service_account: str,
+    submitted_config: Any,
     scope: Scope,
 ) -> dict[str, str]:
     build = validate_build_document(
@@ -1527,11 +1616,15 @@ def validate_deployment_image_authorization(
         expected_source_sha=expected_source_sha,
         expected_source_tree=expected_source_tree,
         expected_image_tag=expected_image_tag,
+        expected_project_number=expected_project_number,
+        expected_service_account=expected_service_account,
+        submitted_config=submitted_config,
         scope=scope,
     )
     tag = validate_tag_resolution_document(
         tag_document,
         expected_image_tag=expected_image_tag,
+        expected_project_number=expected_project_number,
         scope=scope,
     )
     if build["imageDigest"] != tag["digest"]:
@@ -2321,6 +2414,11 @@ def build_parser() -> argparse.ArgumentParser:
     build_parser.add_argument("--expected-source-sha", required=True)
     build_parser.add_argument("--expected-source-tree", required=True)
     build_parser.add_argument("--expected-image-tag", required=True)
+    build_parser.add_argument("--project-number", required=True)
+    build_parser.add_argument("--expected-service-account", required=True)
+    build_parser.add_argument("--evidence-root", required=True)
+    build_parser.add_argument("--build-config-file", required=True)
+    build_parser.add_argument("--expected-build-config-sha256", required=True)
     build_parser.add_argument("--raw", action="store_true")
     build_parser.add_argument(
         "--output", choices=("json", "digest", "image-ref"), default="json"
@@ -2343,6 +2441,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     tag_parser = subparsers.add_parser("tag-resolution")
     add_scope(tag_parser)
+    tag_parser.add_argument("--project-number", required=True)
     tag_parser.add_argument("--expected-image-tag", required=True)
     tag_parser.add_argument("--raw", action="store_true")
 
@@ -2363,6 +2462,10 @@ def build_parser() -> argparse.ArgumentParser:
     authorization_parser.add_argument("--expected-source-sha", required=True)
     authorization_parser.add_argument("--expected-source-tree", required=True)
     authorization_parser.add_argument("--expected-image-tag", required=True)
+    authorization_parser.add_argument("--project-number", required=True)
+    authorization_parser.add_argument("--expected-service-account", required=True)
+    authorization_parser.add_argument("--build-config-file", required=True)
+    authorization_parser.add_argument("--expected-build-config-sha256", required=True)
     authorization_parser.add_argument(
         "--output", choices=("json", "image-ref"), default="json"
     )
@@ -2458,6 +2561,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             tag_path = validate_evidence_file_path(
                 args.evidence_root, args.tag_evidence_file, must_exist=True
             )
+            submitted_config = load_build_config_evidence(
+                args.evidence_root,
+                args.build_config_file,
+                args.expected_build_config_sha256,
+            )
             result = validate_deployment_image_authorization(
                 _strict_load_path(build_path),
                 _strict_load_path(tag_path),
@@ -2465,6 +2573,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 expected_source_sha=args.expected_source_sha,
                 expected_source_tree=args.expected_source_tree,
                 expected_image_tag=args.expected_image_tag,
+                expected_project_number=args.project_number,
+                expected_service_account=args.expected_service_account,
+                submitted_config=submitted_config,
                 scope=scope,
             )
             result["scope"] = scope.output()
@@ -2722,6 +2833,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             result["scope"] = scope.output()
         elif args.command == "build":
+            submitted_config = load_build_config_evidence(
+                args.evidence_root,
+                args.build_config_file,
+                args.expected_build_config_sha256,
+            )
             if args.raw:
                 evidence = document
             else:
@@ -2738,6 +2854,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 expected_source_sha=args.expected_source_sha,
                 expected_source_tree=args.expected_source_tree,
                 expected_image_tag=args.expected_image_tag,
+                expected_project_number=args.project_number,
+                expected_service_account=args.expected_service_account,
+                submitted_config=submitted_config,
                 scope=scope,
             )
             result["scope"] = scope.output()
@@ -2776,6 +2895,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = validate_tag_resolution_document(
                 evidence,
                 expected_image_tag=args.expected_image_tag,
+                expected_project_number=args.project_number,
                 scope=scope,
             )
             result["scope"] = scope.output()

@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -20,6 +21,7 @@ SERVICE = "cbd-assess"
 SOURCE_SHA = "a" * 40
 SOURCE_TREE = "b" * 40
 BUILD_ID = "12345678-1234-1234-1234-123456789abc"
+BUILD_SERVICE_ACCOUNT = "185495765507-compute@developer.gserviceaccount.com"
 IMAGE_TAG = f"{REGION}-docker.pkg.dev/{PROJECT}/cbd/cbd-assess:{SOURCE_SHA}"
 IMAGE_URI = IMAGE_TAG.rsplit(":", 1)[0]
 REVISION_IMAGE = f"{IMAGE_URI}@{DIGEST}"
@@ -34,6 +36,29 @@ DOCKER_IMAGE_RESOURCE = (
     f"projects/{PROJECT}/locations/{REGION}/repositories/cbd/"
     f"dockerImages/cbd-assess@{DIGEST}"
 )
+
+
+def explicit_build_config():
+    return {
+        "steps": [{
+            "name": "gcr.io/cloud-builders/docker",
+            "args": [
+                "build", "--tag", "${_CANDIDATE_IMAGE}",
+                "--label", "org.opencontainers.image.revision=${_SOURCE_SHA}",
+                "--label", "com.calmbydesign.source-tree=${_SOURCE_TREE}", ".",
+            ],
+        }],
+        "images": ["${_CANDIDATE_IMAGE}"],
+        "options": {"substitutionOption": "MUST_MATCH"},
+    }
+
+
+def build_validation_kwargs():
+    return {
+        "expected_project_number": PROJECT_NUMBER,
+        "expected_service_account": BUILD_SERVICE_ACCOUNT,
+        "submitted_config": explicit_build_config(),
+    }
 
 
 def scope(project=PROJECT, region=REGION, service=SERVICE):
@@ -931,22 +956,25 @@ class Phase2FGateTests(ValidatorTestCase):
             "id": BUILD_ID,
             "projectId": PROJECT,
             "status": status,
+            "serviceAccount": (
+                f"projects/{PROJECT}/serviceAccounts/{BUILD_SERVICE_ACCOUNT}"
+            ),
             "steps": [
                 {
                     "name": "gcr.io/cloud-builders/docker",
                     "args": [
                         "build",
                         "--tag",
-                        "${_CANDIDATE_IMAGE}",
+                        IMAGE_TAG,
                         "--label",
-                        "org.opencontainers.image.revision=${_SOURCE_SHA}",
+                        f"org.opencontainers.image.revision={SOURCE_SHA}",
                         "--label",
-                        "com.calmbydesign.source-tree=${_SOURCE_TREE}",
+                        f"com.calmbydesign.source-tree={SOURCE_TREE}",
                         ".",
                     ],
                 }
             ],
-            "images": ["${_CANDIDATE_IMAGE}"],
+            "images": [IMAGE_TAG],
             "options": {"substitutionOption": "MUST_MATCH"},
             "createTime": "2026-08-11T12:00:00Z",
             "startTime": "2026-08-11T12:00:01Z",
@@ -956,12 +984,26 @@ class Phase2FGateTests(ValidatorTestCase):
                 "_SOURCE_TREE": SOURCE_TREE,
                 "_CANDIDATE_IMAGE": IMAGE_TAG,
             },
+            "source": {
+                "storageSource": {
+                    "bucket": f"{PROJECT}_cloudbuild",
+                    "object": "source/authorized.tgz",
+                    "generation": "123456789",
+                }
+            },
+            "sourceProvenance": {
+                "resolvedStorageSource": {
+                    "bucket": f"{PROJECT}_cloudbuild",
+                    "object": "source/authorized.tgz",
+                    "generation": "123456789",
+                }
+            },
             "results": {
                 "images": [
                     {
                         "name": IMAGE_TAG,
                         "digest": DIGEST,
-                        "artifactRegistryPackage": PACKAGE_RESOURCE,
+                        "artifactRegistryPackage": f"{PACKAGE_RESOURCE}/versions/{DIGEST}",
                     }
                 ]
             },
@@ -1016,6 +1058,7 @@ class Phase2FGateTests(ValidatorTestCase):
             expected_source_sha=SOURCE_SHA,
             expected_source_tree=SOURCE_TREE,
             expected_image_tag=IMAGE_TAG,
+            **build_validation_kwargs(),
             scope=validator.require_scope(PROJECT, REGION, SERVICE),
         )
         self.assertEqual(result["classification"], "BUILD_SUCCESS")
@@ -1028,6 +1071,7 @@ class Phase2FGateTests(ValidatorTestCase):
                         expected_source_sha=SOURCE_SHA,
                         expected_source_tree=SOURCE_TREE,
                         expected_image_tag=IMAGE_TAG,
+                        **build_validation_kwargs(),
                         scope=validator.require_scope(PROJECT, REGION, SERVICE),
                     )
         for state in validator.NONTERMINAL_BUILD_STATES:
@@ -1042,6 +1086,7 @@ class Phase2FGateTests(ValidatorTestCase):
                         expected_source_sha=SOURCE_SHA,
                         expected_source_tree=SOURCE_TREE,
                         expected_image_tag=IMAGE_TAG,
+                        **build_validation_kwargs(),
                         scope=validator.require_scope(PROJECT, REGION, SERVICE),
                     )
         for state in validator.FAILED_BUILD_STATES | {"UNKNOWN", ""}:
@@ -1053,6 +1098,7 @@ class Phase2FGateTests(ValidatorTestCase):
                         expected_source_sha=SOURCE_SHA,
                         expected_source_tree=SOURCE_TREE,
                         expected_image_tag=IMAGE_TAG,
+                        **build_validation_kwargs(),
                         scope=validator.require_scope(PROJECT, REGION, SERVICE),
                     )
         for override in (
@@ -1074,6 +1120,7 @@ class Phase2FGateTests(ValidatorTestCase):
                         expected_source_sha=SOURCE_SHA,
                         expected_source_tree=SOURCE_TREE,
                         expected_image_tag=IMAGE_TAG,
+                        **build_validation_kwargs(),
                         scope=validator.require_scope(PROJECT, REGION, SERVICE),
                     )
 
@@ -1081,11 +1128,12 @@ class Phase2FGateTests(ValidatorTestCase):
         evidence = {
             "name": DOCKER_IMAGE_RESOURCE,
             "uri": IMAGE_TAG.rsplit(":", 1)[0] + "@" + DIGEST,
-            "tags": [IMAGE_TAG],
+            "tags": [SOURCE_SHA],
         }
         result = validator.validate_tag_resolution_document(
             evidence,
             expected_image_tag=IMAGE_TAG,
+            expected_project_number=PROJECT_NUMBER,
             scope=validator.require_scope(PROJECT, REGION, SERVICE),
         )
         self.assertEqual(result["imageDigestRef"], IMAGE_TAG.rsplit(":", 1)[0] + "@" + DIGEST)
@@ -1100,6 +1148,7 @@ class Phase2FGateTests(ValidatorTestCase):
                     validator.validate_tag_resolution_document(
                         changed,
                         expected_image_tag=IMAGE_TAG,
+                        expected_project_number=PROJECT_NUMBER,
                         scope=validator.require_scope(PROJECT, REGION, SERVICE),
                     )
 
@@ -1306,7 +1355,7 @@ class Phase2HRegressionTests(ValidatorTestCase):
         self.docker_image = {
             "name": DOCKER_IMAGE_RESOURCE,
             "uri": IMAGE_TAG.rsplit(":", 1)[0] + "@" + DIGEST,
-            "tags": [IMAGE_TAG],
+            "tags": [SOURCE_SHA],
         }
 
     def validate_build(self, document):
@@ -1316,6 +1365,7 @@ class Phase2HRegressionTests(ValidatorTestCase):
             expected_source_sha=SOURCE_SHA,
             expected_source_tree=SOURCE_TREE,
             expected_image_tag=IMAGE_TAG,
+            **build_validation_kwargs(),
             scope=self.authorized_scope,
         )
 
@@ -1327,6 +1377,7 @@ class Phase2HRegressionTests(ValidatorTestCase):
             expected_source_sha=SOURCE_SHA,
             expected_source_tree=SOURCE_TREE,
             expected_image_tag=IMAGE_TAG,
+            **build_validation_kwargs(),
             scope=self.authorized_scope,
         )
 
@@ -1427,7 +1478,8 @@ class Phase2HRegressionTests(ValidatorTestCase):
         changed["name"] = changed["name"].replace("/repositories/cbd/", "/repositories/other/")
         with self.assertRaises(validator.ValidationError):
             validator.validate_tag_resolution_document(
-                changed, expected_image_tag=IMAGE_TAG, scope=self.authorized_scope
+                changed, expected_image_tag=IMAGE_TAG,
+                expected_project_number=PROJECT_NUMBER, scope=self.authorized_scope
             )
 
     def test_build_and_tag_digest_mismatch_is_rejected(self):
@@ -1462,6 +1514,7 @@ class Phase2HRegressionTests(ValidatorTestCase):
                 expected_source_sha="c" * 40,
                 expected_source_tree=SOURCE_TREE,
                 expected_image_tag=IMAGE_TAG,
+                **build_validation_kwargs(),
                 scope=self.authorized_scope,
             )
 
@@ -1577,8 +1630,11 @@ class Phase2HRegressionTests(ValidatorTestCase):
             root = __import__("os").path.realpath(created_root)
             build_file = Path(root) / "build.json"
             tag_file = Path(root) / "tag.json"
+            config_file = Path(root) / "cloudbuild.json"
             build_file.write_text(json.dumps(self.build), encoding="utf-8")
             tag_file.write_text(json.dumps(self.docker_image), encoding="utf-8")
+            config_bytes = json.dumps(explicit_build_config()).encode("utf-8")
+            config_file.write_bytes(config_bytes)
             args = [
                 "authorize-image", "--project", PROJECT, "--region", REGION,
                 "--service", SERVICE, "--evidence-root", root,
@@ -1588,6 +1644,10 @@ class Phase2HRegressionTests(ValidatorTestCase):
                 "--expected-source-sha", SOURCE_SHA,
                 "--expected-source-tree", SOURCE_TREE,
                 "--expected-image-tag", IMAGE_TAG,
+                "--project-number", PROJECT_NUMBER,
+                "--expected-service-account", BUILD_SERVICE_ACCOUNT,
+                "--build-config-file", str(config_file),
+                "--expected-build-config-sha256", hashlib.sha256(config_bytes).hexdigest(),
                 "--output", "image-ref",
             ]
             stdout = io.StringIO()
@@ -1646,7 +1706,7 @@ class Phase2HRegressionTests(ValidatorTestCase):
         self.assertIn('curl_config="$(emit_bearer_config)" || return 1', runbook)
         self.assertIn("curl --config <(printf '%s\\n' \"$curl_config\") \"$@\"", runbook)
         self.assertNotIn("emit_bearer_config | curl", runbook)
-        self.assertEqual(runbook.count("authorized_curl --"), 7)
+        self.assertEqual(runbook.count("authorized_curl --"), 8)
 
 
 class Phase2JRegressionTests(ValidatorTestCase):
@@ -1661,23 +1721,33 @@ class Phase2JRegressionTests(ValidatorTestCase):
             expected_source_sha=SOURCE_SHA,
             expected_source_tree=SOURCE_TREE,
             expected_image_tag=IMAGE_TAG,
+            **build_validation_kwargs(),
             scope=self.authorized_scope,
         )
 
     def invoke_build_raw(self, raw):
-        args = [
-            "build", "--project", PROJECT, "--region", REGION,
-            "--service", SERVICE, "--expected-build-id", BUILD_ID,
-            "--expected-source-sha", SOURCE_SHA,
-            "--expected-source-tree", SOURCE_TREE,
-            "--expected-image-tag", IMAGE_TAG, "--raw",
-        ]
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        with mock.patch.object(validator.sys, "stdin", io.StringIO(raw)):
-            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                status = validator.main(args)
-        return status, stdout.getvalue(), stderr.getvalue()
+        with tempfile.TemporaryDirectory(prefix="phase2j-config-test.") as created_root:
+            root = __import__("os").path.realpath(created_root)
+            config_file = Path(root) / "cloudbuild.json"
+            config_bytes = json.dumps(explicit_build_config()).encode("utf-8")
+            config_file.write_bytes(config_bytes)
+            args = [
+                "build", "--project", PROJECT, "--region", REGION,
+                "--service", SERVICE, "--expected-build-id", BUILD_ID,
+                "--expected-source-sha", SOURCE_SHA,
+                "--expected-source-tree", SOURCE_TREE,
+                "--expected-image-tag", IMAGE_TAG, "--project-number", PROJECT_NUMBER,
+                "--expected-service-account", BUILD_SERVICE_ACCOUNT,
+                "--evidence-root", root, "--build-config-file", str(config_file),
+                "--expected-build-config-sha256", hashlib.sha256(config_bytes).hexdigest(),
+                "--raw",
+            ]
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch.object(validator.sys, "stdin", io.StringIO(raw)):
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    status = validator.main(args)
+            return status, stdout.getvalue(), stderr.getvalue()
 
     def test_nanosecond_reversals_at_seventh_eighth_and_ninth_digits_fail(self):
         for create_time, start_time in (
@@ -1809,9 +1879,11 @@ class Phase2JRegressionTests(ValidatorTestCase):
         self.assertIn("DUPLICATE_JSON_KEY", stderr)
 
     def test_built_image_package_and_oci_media_type_are_exact(self):
-        self.assertEqual(self.validate_build(self.build)["packageResource"], PACKAGE_RESOURCE)
+        expected_version = PACKAGE_RESOURCE + "/versions/" + DIGEST
+        self.assertEqual(self.validate_build(self.build)["packageVersionResource"], expected_version)
         for package in (
-            PACKAGE_RESOURCE + "/versions/" + DIGEST,
+            PACKAGE_RESOURCE,
+            PACKAGE_RESOURCE + "/versions/" + OTHER_DIGEST,
             PACKAGE_RESOURCE.replace(f"projects/{PROJECT}/", "projects/other-project/") ,
         ):
             document = json.loads(json.dumps(self.build))
@@ -1894,6 +1966,7 @@ class Phase2QRegressionTests(ValidatorTestCase):
             expected_source_sha=SOURCE_SHA,
             expected_source_tree=SOURCE_TREE,
             expected_image_tag=IMAGE_TAG,
+            **build_validation_kwargs(),
             scope=self.authorized_scope,
         )
 
@@ -2817,12 +2890,13 @@ class Phase2QRegressionTests(ValidatorTestCase):
         response = {
             "name": DOCKER_IMAGE_RESOURCE,
             "uri": IMAGE_TAG.rsplit(":", 1)[0] + "@" + DIGEST,
-            "tags": [IMAGE_TAG],
+            "tags": [SOURCE_SHA],
         }
         self.assertEqual(
             validator.validate_tag_resolution_document(
                 response,
                 expected_image_tag=IMAGE_TAG,
+                expected_project_number=PROJECT_NUMBER,
                 scope=self.authorized_scope,
             )["digest"],
             DIGEST,
@@ -2847,6 +2921,7 @@ class Phase2QRegressionTests(ValidatorTestCase):
                     validator.validate_tag_resolution_document(
                         invalid,
                         expected_image_tag=IMAGE_TAG,
+                        expected_project_number=PROJECT_NUMBER,
                         scope=self.authorized_scope,
                     )
 
@@ -3082,16 +3157,167 @@ class Phase2QRegressionTests(ValidatorTestCase):
         self.assertIn("INGRESS_TRAFFIC_NONE", checklist)
 
 
+class AuthoritativeBuildEvidenceTests(ValidatorTestCase):
+    def setUp(self):
+        self.scope = validator.require_scope(PROJECT, REGION, SERVICE)
+        self.build = Phase2FGateTests().build_document()
+        self.config = explicit_build_config()
+
+    def validate(self, document=None, **overrides):
+        kwargs = build_validation_kwargs()
+        kwargs.update(overrides)
+        return validator.validate_build_document(
+            self.build if document is None else document,
+            expected_build_id=BUILD_ID,
+            expected_source_sha=SOURCE_SHA,
+            expected_source_tree=SOURCE_TREE,
+            expected_image_tag=IMAGE_TAG,
+            scope=self.scope,
+            **kwargs,
+        )
+
+    def test_authoritative_resolved_build_envelope_passes(self):
+        result = self.validate()
+        self.assertEqual(result["classification"], "BUILD_SUCCESS")
+        self.assertEqual(result["imageDigest"], DIGEST)
+
+    def test_verified_numeric_build_project_alias_passes(self):
+        document = json.loads(json.dumps(self.build))
+        document["name"] = document["name"].replace(
+            f"projects/{PROJECT}/", f"projects/{PROJECT_NUMBER}/"
+        )
+        self.assertEqual(self.validate(document)["buildResource"], document["name"])
+
+    def test_wrong_textual_or_numeric_build_project_fails(self):
+        for project in ("other-project", "999999999999"):
+            document = json.loads(json.dumps(self.build))
+            document["name"] = document["name"].replace(
+                f"projects/{PROJECT}/", f"projects/{project}/"
+            )
+            with self.subTest(project=project), self.assertRaises(validator.ValidationError):
+                self.validate(document)
+
+    def test_returned_placeholders_and_wrong_resolved_arguments_fail(self):
+        replacements = ("${_CANDIDATE_IMAGE}", "c" * 40, "d" * 40, IMAGE_TAG + "-other")
+        indexes = (2, 4, 6, 2)
+        for replacement, index in zip(replacements, indexes):
+            document = json.loads(json.dumps(self.build))
+            document["steps"][0]["args"][index] = replacement
+            with self.subTest(value=replacement), self.assertRaises(validator.ValidationError):
+                self.validate(document)
+
+    def test_returned_image_inventory_is_exact(self):
+        for images in ([IMAGE_TAG + "-other"], [IMAGE_TAG, IMAGE_TAG + "-other"], []):
+            document = json.loads(json.dumps(self.build))
+            document["images"] = images
+            with self.subTest(images=images), self.assertRaises(validator.ValidationError):
+                self.validate(document)
+
+    def test_returned_must_match_explicit_or_default_omission(self):
+        self.assertEqual(self.validate()["classification"], "BUILD_SUCCESS")
+        document = json.loads(json.dumps(self.build))
+        document["options"] = {}
+        self.assertEqual(self.validate(document)["classification"], "BUILD_SUCCESS")
+        with self.assertRaises(validator.ValidationError):
+            self.validate(document, submitted_config=None)
+
+    def test_returned_allow_loose_and_unexpected_option_fail(self):
+        for options in ({"substitutionOption": "ALLOW_LOOSE"}, {"machineType": "E2_HIGHCPU_8"}):
+            document = json.loads(json.dumps(self.build))
+            document["options"] = options
+            with self.subTest(options=options), self.assertRaises(validator.ValidationError):
+                self.validate(document)
+
+    def test_source_and_resolved_source_must_match_exactly(self):
+        document = json.loads(json.dumps(self.build))
+        document["sourceProvenance"]["resolvedStorageSource"]["generation"] = "2"
+        with self.assertRaises(validator.ValidationError):
+            self.validate(document)
+
+    def test_exact_package_version_and_digest_binding(self):
+        expected = PACKAGE_RESOURCE + "/versions/" + DIGEST
+        self.assertEqual(self.validate()["packageVersionResource"], expected)
+        for package in (PACKAGE_RESOURCE, PACKAGE_RESOURCE + "/versions/" + OTHER_DIGEST):
+            document = json.loads(json.dumps(self.build))
+            document["results"]["images"][0]["artifactRegistryPackage"] = package
+            with self.subTest(package=package), self.assertRaises(validator.ValidationError):
+                self.validate(document)
+
+    def test_bare_artifact_registry_tag_is_exact_and_unambiguous(self):
+        evidence = {
+            "name": DOCKER_IMAGE_RESOURCE,
+            "uri": IMAGE_TAG.rsplit(":", 1)[0] + "@" + DIGEST,
+            "tags": [SOURCE_SHA],
+        }
+        result = validator.validate_tag_resolution_document(
+            evidence, expected_image_tag=IMAGE_TAG,
+            expected_project_number=PROJECT_NUMBER, scope=self.scope,
+        )
+        self.assertEqual(result["classification"], "TAG_RESOLVED")
+        for tags in (["c" * 40], [SOURCE_SHA, "c" * 40], [IMAGE_TAG]):
+            with self.subTest(tags=tags), self.assertRaises(validator.ValidationError):
+                validator.validate_tag_resolution_document(
+                    {**evidence, "tags": tags}, expected_image_tag=IMAGE_TAG,
+                    expected_project_number=PROJECT_NUMBER, scope=self.scope,
+                )
+
+    def test_numeric_docker_image_project_alias_is_verified(self):
+        evidence = {
+            "name": DOCKER_IMAGE_RESOURCE.replace(
+                f"projects/{PROJECT}/", f"projects/{PROJECT_NUMBER}/"
+            ),
+            "uri": IMAGE_TAG.rsplit(":", 1)[0] + "@" + DIGEST,
+            "tags": [SOURCE_SHA],
+        }
+        self.assertEqual(
+            validator.validate_tag_resolution_document(
+                evidence, expected_image_tag=IMAGE_TAG,
+                expected_project_number=PROJECT_NUMBER, scope=self.scope,
+            )["digest"], DIGEST,
+        )
+
+    def test_unexpected_returned_step_substitution_and_field_fail(self):
+        mutations = []
+        extra_step = json.loads(json.dumps(self.build))
+        extra_step["steps"].append(extra_step["steps"][0])
+        mutations.append(extra_step)
+        extra_substitution = json.loads(json.dumps(self.build))
+        extra_substitution["substitutions"]["_EXTRA"] = "value"
+        mutations.append(extra_substitution)
+        extra_field = json.loads(json.dumps(self.build))
+        extra_field["unexpected"] = True
+        mutations.append(extra_field)
+        for document in mutations:
+            with self.subTest(keys=sorted(document)), self.assertRaises(validator.ValidationError):
+                self.validate(document)
+
+
 class Phase2FCliTests(unittest.TestCase):
     common = ["--project", PROJECT, "--region", REGION, "--service", SERVICE]
 
     def invoke(self, args, document):
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        with mock.patch.object(validator.sys, "stdin", io.StringIO(json.dumps(document))):
-            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                status = validator.main(args)
-        return status, stdout.getvalue(), stderr.getvalue()
+        with tempfile.TemporaryDirectory(prefix="phase2f-cli-config.") as created_root:
+            effective_args = list(args)
+            if effective_args[0] == "build":
+                root = __import__("os").path.realpath(created_root)
+                config_file = Path(root) / "cloudbuild.json"
+                config_bytes = json.dumps(explicit_build_config()).encode("utf-8")
+                config_file.write_bytes(config_bytes)
+                effective_args.extend([
+                    "--project-number", PROJECT_NUMBER,
+                    "--expected-service-account", BUILD_SERVICE_ACCOUNT,
+                    "--evidence-root", root,
+                    "--build-config-file", str(config_file),
+                    "--expected-build-config-sha256", hashlib.sha256(config_bytes).hexdigest(),
+                ])
+            elif effective_args[0] == "tag-resolution":
+                effective_args.extend(["--project-number", PROJECT_NUMBER])
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch.object(validator.sys, "stdin", io.StringIO(json.dumps(document))):
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    status = validator.main(effective_args)
+            return status, stdout.getvalue(), stderr.getvalue()
 
     def valid_commands(self):
         pre = traffic_document(latest(100))
@@ -3100,7 +3326,7 @@ class Phase2FCliTests(unittest.TestCase):
         docker_image = {
             "name": DOCKER_IMAGE_RESOURCE,
             "uri": IMAGE_TAG.rsplit(":", 1)[0] + "@" + DIGEST,
-            "tags": [IMAGE_TAG],
+            "tags": [SOURCE_SHA],
         }
         return [
             (

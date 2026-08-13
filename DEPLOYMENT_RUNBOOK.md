@@ -21,6 +21,7 @@ Record these fields before any separately authorized phase:
 ACCOUNT                 exact authorized user account
 PROJECT_ID              exact project
 PROJECT_NUMBER          exact project number verified with PROJECT_ID
+BUILD_SERVICE_ACCOUNT   exact authorized Cloud Build service-account email
 REGION                  exact Cloud Run and Artifact Registry region
 SERVICE                 exact Cloud Run service
 SOURCE_SHA              approved 40-character commit
@@ -510,6 +511,8 @@ every malformed, empty, plural, or other result stops. It never lists tags.
   SOURCE_TREE='REPLACE_WITH_APPROVED_SOURCE_TREE'
   ACCOUNT='REPLACE_WITH_AUTHORIZED_ACCOUNT'
   PROJECT_ID='REPLACE_WITH_PROJECT_ID'
+  PROJECT_NUMBER='REPLACE_WITH_VERIFIED_PROJECT_NUMBER'
+  BUILD_SERVICE_ACCOUNT='REPLACE_WITH_AUTHORIZED_BUILD_SERVICE_ACCOUNT_EMAIL'
   REGION='REPLACE_WITH_REGION'
   SERVICE='REPLACE_WITH_SERVICE'
   AR_REPOSITORY='REPLACE_WITH_REPOSITORY'
@@ -722,10 +725,10 @@ PY
       --expected-image-tag="$CANDIDATE_IMAGE_TAG" >/dev/null \
       || fail 'unsafe or preexisting build-poll evidence path'
     set +e
-    gcloud builds describe "$BUILD_ID" \
-      --account="$ACCOUNT" --project="$PROJECT_ID" --region="$REGION" \
-      --format='json(name,id,projectId,status,steps.name,steps.args,images,options.substitutionOption,substitutions,createTime,startTime,finishTime,results.images)' \
-      > "$BUILD_POLL_RAW"
+    BUILD_URL="https://cloudbuild.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/builds/${BUILD_ID}"
+    BUILD_FIELDS='name,id,projectId,status,serviceAccount,steps(name,args),images,options(substitutionOption),substitutions,source(storageSource(bucket,object,generation)),sourceProvenance(resolvedStorageSource(bucket,object,generation)),createTime,startTime,finishTime,results(images(name,digest,artifactRegistryPackage,ociMediaType,pushTiming(startTime,endTime)))'
+    authorized_curl --fail --get --url "$BUILD_URL" \
+      --data-urlencode "fields=$BUILD_FIELDS" > "$BUILD_POLL_RAW"
     describe_rc=$?
     if [[ "$describe_rc" == 0 ]]; then
       python3.12 scripts/validate_deployment_state.py build --raw \
@@ -733,6 +736,10 @@ PY
           --expected-build-id="$BUILD_ID" --expected-source-sha="$SOURCE_SHA" \
           --expected-source-tree="$SOURCE_TREE" \
           --expected-image-tag="$CANDIDATE_IMAGE_TAG" \
+          --project-number="$PROJECT_NUMBER" \
+          --expected-service-account="$BUILD_SERVICE_ACCOUNT" \
+          --evidence-root="$EVIDENCE_ROOT" --build-config-file="$BUILD_CONFIG" \
+          --expected-build-config-sha256="$BUILD_CONFIG_SHA256" \
           < "$BUILD_POLL_RAW" >/dev/null
       build_rc=$?
     else
@@ -752,7 +759,11 @@ PY
       --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
       --expected-build-id="$BUILD_ID" --expected-source-sha="$SOURCE_SHA" \
       --expected-source-tree="$SOURCE_TREE" \
-      --expected-image-tag="$CANDIDATE_IMAGE_TAG" --output=digest \
+      --expected-image-tag="$CANDIDATE_IMAGE_TAG" \
+      --project-number="$PROJECT_NUMBER" \
+      --expected-service-account="$BUILD_SERVICE_ACCOUNT" \
+      --evidence-root="$EVIDENCE_ROOT" --build-config-file="$BUILD_CONFIG" \
+      --expected-build-config-sha256="$BUILD_CONFIG_SHA256" --output=digest \
       < "$BUILD_SUCCESS_RAW_FILE"
   )" || fail 'canonical build digest extraction'
 
@@ -774,6 +785,7 @@ PY
     > "$TAG_RESULT_BODY" || fail 'exact candidate DockerImage GET'
   python3.12 scripts/validate_deployment_state.py tag-resolution --raw \
     --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    --project-number="$PROJECT_NUMBER" \
     --expected-image-tag="$CANDIDATE_IMAGE_TAG" < "$TAG_RESULT_BODY" >/dev/null \
     || fail 'candidate DockerImage validation'
   python3.12 scripts/validate_deployment_state.py authorize-image \
@@ -782,7 +794,12 @@ PY
     --build-evidence-file="$BUILD_SUCCESS_RAW_FILE" \
     --tag-evidence-file="$TAG_RESULT_BODY" --expected-build-id="$BUILD_ID" \
     --expected-source-sha="$SOURCE_SHA" --expected-source-tree="$SOURCE_TREE" \
-    --expected-image-tag="$CANDIDATE_IMAGE_TAG" > "$IMAGE_AUTHORIZATION_FILE" \
+    --expected-image-tag="$CANDIDATE_IMAGE_TAG" \
+    --project-number="$PROJECT_NUMBER" \
+    --expected-service-account="$BUILD_SERVICE_ACCOUNT" \
+    --build-config-file="$BUILD_CONFIG" \
+    --expected-build-config-sha256="$BUILD_CONFIG_SHA256" \
+    > "$IMAGE_AUTHORIZATION_FILE" \
     || fail 'three-way image digest authorization'
 
   printf 'validated_build_context=%s\n' "$BUILD_ROOT/context"
@@ -798,11 +815,14 @@ never be combined. The independently validated Git archive remains the source
 identity and is not altered by the evidence-only build configuration.
 
 Exit 0 requires the exact tag to have been absent, a byte-exact safe Git context,
-one exact validated build configuration, one valid build ID, `SUCCESS` within
-the bounded polling window, exact Build resource name/project/template/options/
-SHA/tree/image substitutions, exactly one declared `images[]` template, and
+one exact validated submitted build configuration, one valid build ID, `SUCCESS`
+within the bounded polling window, an exact returned Build resource with the
+verified project-ID/project-number alias pair, authorized service account,
+resolved Docker arguments, exact source/resolved-source identity, substitutions,
+and one resolved `images[]` value, and
 exactly one matching `results.images[]` BuiltImage with its
-canonical digest, exact Artifact Registry Package resource, valid optional OCI
+canonical digest, exact Artifact Registry Package-version resource ending in
+that digest, valid optional OCI
 media type, and—when present—a `pushTiming` TimeSpan fully bounded by the Build
 execution interval at nanosecond precision:
 `createTime <= startTime <= pushStart <= pushEnd <= finishTime`. The exact
@@ -812,7 +832,13 @@ The local gcloud 578.0.0 generated client defines that request as `GET
 v1/{+name}` with no query or pagination parameters and a single `DockerImage`
 response; the generated message defines the requested `name`, `uri`, and `tags`
 fields. The independently queried DockerImage must identify that same project,
-location, repository, image, tag, and digest. `authorize-image` requires equality
+location, repository, image, bare source-SHA tag component, and digest.
+`Build.options.substitutionOption` may be absent only as Cloud Build's default
+zero-value `MUST_MATCH`, and only because the separately hash-bound submitted
+config explicitly requires `MUST_MATCH`; explicit `ALLOW_LOOSE` always fails.
+Raw REST bytes are preserved before strict validation, and nested repeated
+fields use the proven REST selector rather than dotted CLI projection.
+`authorize-image` requires equality
 of the Build-result digest, DockerImage URI digest, and final digest-qualified
 image reference. This is
 Build artifact-output binding, not a SLSA attestation. Every queued or working
@@ -867,7 +893,7 @@ identity, an unexpected status, or command failure stops.
 ## 7. Separately authorized zero-traffic candidate deployment
 
 After separate zero-traffic deployment authorization, run this block. It
-requires the exact successful gcloud-emitted Build and DockerImage evidence, revalidates
+requires the exact successful REST Build and DockerImage evidence, revalidates
 their complete current envelope and digest equality, captures pre-state before
 mutation, validates the exact candidate revision afterward, makes post-candidate
 latest-ready binding mandatory, validates zero traffic, and compares runtime
@@ -885,6 +911,10 @@ hashes:
   : "${SOURCE_SHA:?authorized source SHA is required}"
   : "${SOURCE_TREE:?authorized source tree is required}"
   : "${CANDIDATE_IMAGE_TAG:?authorized candidate image tag is required}"
+  : "${PROJECT_NUMBER:?verified project number is required}"
+  : "${BUILD_SERVICE_ACCOUNT:?authorized Build service account is required}"
+  : "${BUILD_CONFIG:?authorized submitted build config is required}"
+  : "${BUILD_CONFIG_SHA256:?authorized submitted build config digest is required}"
   declare -F bind_scope >/dev/null || fail 'bind_scope is not loaded'
   declare -F capture_runtime_snapshot >/dev/null \
     || fail 'capture_runtime_snapshot is not loaded'
@@ -904,7 +934,11 @@ hashes:
       --tag-evidence-file="$AUTHORIZED_TAG_EVIDENCE_FILE" \
       --expected-build-id="$BUILD_ID" --expected-source-sha="$SOURCE_SHA" \
       --expected-source-tree="$SOURCE_TREE" \
-      --expected-image-tag="$CANDIDATE_IMAGE_TAG" --output=image-ref
+      --expected-image-tag="$CANDIDATE_IMAGE_TAG" \
+      --project-number="$PROJECT_NUMBER" \
+      --expected-service-account="$BUILD_SERVICE_ACCOUNT" \
+      --build-config-file="$BUILD_CONFIG" \
+      --expected-build-config-sha256="$BUILD_CONFIG_SHA256" --output=image-ref
   )" || fail 'current build/tag/digest authorization'
 
   PRE_SERVICE_RAW="$EVIDENCE_ROOT/pre-deploy-traffic.json"
