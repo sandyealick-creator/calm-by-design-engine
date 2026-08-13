@@ -20,6 +20,7 @@ Record these fields before any separately authorized phase:
 ```text
 ACCOUNT                 exact authorized user account
 PROJECT_ID              exact project
+PROJECT_NUMBER          exact project number verified with PROJECT_ID
 REGION                  exact Cloud Run and Artifact Registry region
 SERVICE                 exact Cloud Run service
 SOURCE_SHA              approved 40-character commit
@@ -211,6 +212,44 @@ if data != [{"account": expected, "status": "ACTIVE"}]:
 Any empty, plural, malformed, or different identity stops before a resource
 query. Do not correct account or project selection inside a deployment phase.
 
+The first authorized read-only resource query must bind the exact approved
+project ID and project number from one authoritative metadata response. Neither
+value may be derived from the other or from local configuration, service-account
+names, or Secret Manager output:
+
+```bash
+{
+  set -euo pipefail
+  set -o noclobber
+  fail() { printf 'project identity preflight failed: %s\n' "$1" >&2; exit 1; }
+  : "${EVIDENCE_ROOT:?preapproved evidence directory is required}"
+  AUTHORIZED_PROJECT_NUMBER='REPLACE_WITH_EXACT_AUTHORIZED_PROJECT_NUMBER'
+  PROJECT_METADATA_RAW="$EVIDENCE_ROOT/project-identity.raw.json"
+  python3.12 scripts/validate_deployment_state.py evidence-path \
+    --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+    --evidence-root="$EVIDENCE_ROOT" --output-file="$PROJECT_METADATA_RAW" \
+    >/dev/null || fail 'unsafe or preexisting project evidence path'
+  gcloud projects describe "$PROJECT_ID" \
+    --account="$ACCOUNT" \
+    --format='json(projectId,projectNumber,lifecycleState)' \
+    > "$PROJECT_METADATA_RAW" || fail 'project metadata query'
+  PROJECT_NUMBER="$(
+    python3.12 scripts/validate_deployment_state.py project-identity \
+      --project="$PROJECT_ID" --project-number="$AUTHORIZED_PROJECT_NUMBER" \
+      --region="$REGION" --service="$SERVICE" --output=project-number \
+      < "$PROJECT_METADATA_RAW"
+  )" || fail 'project ID/number binding'
+  [[ "$PROJECT_NUMBER" == "$AUTHORIZED_PROJECT_NUMBER" ]] \
+    || fail 'project number differs from authorization'
+}
+```
+
+Every Secret Manager validator command below requires that exact
+`PROJECT_NUMBER`. A numeric resource segment is accepted only when it equals the
+verified member of this pair; every other textual or numeric project is rejected.
+Successful secret/version validation retains the observed resource identity and
+matched project segment while emitting a consistent authorized canonical resource.
+
 ## 3. Strict traffic and baseline evidence
 
 A separately authorized read-only preflight must capture the complete traffic
@@ -286,6 +325,7 @@ validation. The token itself is never written:
   fail() { printf 'session reference gate failed: %s\n' "$1" >&2; exit 1; }
   : "${EVIDENCE_ROOT:?preapproved evidence directory is required}"
   : "${SOURCE_SHA:?approved source SHA is required}"
+  : "${PROJECT_NUMBER:?verified project number is required}"
   SESSION_RAW="$EVIDENCE_ROOT/${SOURCE_SHA}-session-reference.raw.json"
   SESSION_REFERENCE_RESULT_FILE="$EVIDENCE_ROOT/${SOURCE_SHA}-session-reference.result.json"
   python3.12 scripts/validate_deployment_state.py evidence-path \
@@ -298,7 +338,8 @@ validation. The token itself is never written:
     > "$SESSION_RAW" || fail 'exact session reference request'
   bind_scope serviceConfig < "$SESSION_RAW" \
     | python3.12 scripts/validate_deployment_state.py session-secret \
-        --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+        --project="$PROJECT_ID" --project-number="$PROJECT_NUMBER" \
+        --region="$REGION" --service="$SERVICE" \
     > "$SESSION_REFERENCE_RESULT_FILE" || fail 'session reference validation'
 )
 ```
@@ -325,9 +366,11 @@ numeric version validation before either request URL is constructed:
   fail() { printf 'secret metadata gate failed: %s\n' "$1" >&2; exit 1; }
   : "${EVIDENCE_ROOT:?preapproved evidence directory is required}"
   : "${SESSION_REFERENCE_RESULT_FILE:?validated reference result is required}"
+  : "${PROJECT_NUMBER:?verified project number is required}"
   read -r SECRET_RESOURCE SECRET_VERSION < <(
     python3.12 scripts/validate_deployment_state.py secret-reference-result \
-      --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+      --project="$PROJECT_ID" --project-number="$PROJECT_NUMBER" \
+      --region="$REGION" --service="$SERVICE" \
       --evidence-root="$EVIDENCE_ROOT" \
       --input-file="$SESSION_REFERENCE_RESULT_FILE" \
       --output=resource-version
@@ -358,7 +401,8 @@ numeric version validation before either request URL is constructed:
   fi
 
   SECRET_ARGS=(
-    secret-version --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE"
+    secret-version --project="$PROJECT_ID" --project-number="$PROJECT_NUMBER"
+    --region="$REGION" --service="$SERVICE"
     --expected-secret="$SECRET_RESOURCE" --expected-version="$SECRET_VERSION"
     --evidence-root="$EVIDENCE_ROOT" --secret-status="$SECRET_STATUS"
     --version-status="$VERSION_STATUS" --secret-evidence-file="$SECRET_BODY"

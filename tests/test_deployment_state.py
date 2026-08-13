@@ -14,6 +14,7 @@ OTHER_DIGEST = "sha256:" + "b" * 64
 BASELINE = "cbd-assess-00009-mkz"
 CANDIDATE = "cbd-assess-phase2d"
 PROJECT = "eng-drake-502618-h6"
+PROJECT_NUMBER = "185495765507"
 REGION = "us-east1"
 SERVICE = "cbd-assess"
 SOURCE_SHA = "a" * 40
@@ -233,15 +234,21 @@ def populated_runtime_service():
     return document
 
 
-def secret_metadata(*, secret_result="FOUND", version_result="FOUND", state="ENABLED"):
+def secret_metadata(
+    *,
+    secret_result="FOUND",
+    version_result="FOUND",
+    state="ENABLED",
+    project_segment=PROJECT,
+):
     secret = {"result": secret_result}
     version = {"result": version_result}
     if secret_result == "FOUND":
-        secret["name"] = f"projects/{PROJECT}/secrets/session-secret"
+        secret["name"] = f"projects/{project_segment}/secrets/session-secret"
     if version_result == "FOUND":
         version.update(
             {
-                "name": f"projects/{PROJECT}/secrets/session-secret/versions/7",
+                "name": f"projects/{project_segment}/secrets/session-secret/versions/7",
                 "state": state,
             }
         )
@@ -717,6 +724,8 @@ class SessionSecretTests(ValidatorTestCase):
                         REGION,
                         "--service",
                         SERVICE,
+                        "--project-number",
+                        PROJECT_NUMBER,
                     ]
                 )
         self.assertEqual(result, 2)
@@ -1698,7 +1707,8 @@ class Phase2JRegressionTests(ValidatorTestCase):
             )
             args = [
                 "secret-version", "--project", PROJECT, "--region", REGION,
-                "--service", SERVICE, "--expected-secret", "session-secret",
+                "--service", SERVICE, "--project-number", PROJECT_NUMBER,
+                "--expected-secret", "session-secret",
                 "--expected-version", "latest", "--evidence-root", root,
                 "--secret-status", "404", "--version-status", "SKIPPED",
                 "--secret-evidence-file", str(secret_file),
@@ -1727,6 +1737,150 @@ class Phase2QRegressionTests(ValidatorTestCase):
             expected_image_tag=IMAGE_TAG,
             scope=self.authorized_scope,
         )
+
+    def test_authoritative_project_identity_pair_is_exact_and_active(self):
+        metadata = {
+            "projectId": PROJECT,
+            "projectNumber": PROJECT_NUMBER,
+            "lifecycleState": "ACTIVE",
+        }
+        result = validator.validate_project_identity_document(
+            metadata,
+            expected_project_id=PROJECT,
+            expected_project_number=PROJECT_NUMBER,
+        )
+        self.assertEqual(result["classification"], "VERIFIED_ACTIVE_PROJECT_IDENTITY")
+        self.assertEqual(result["projectId"], PROJECT)
+        self.assertEqual(result["projectNumber"], PROJECT_NUMBER)
+        for changed in (
+            {**metadata, "projectId": "other-project-123"},
+            {**metadata, "projectNumber": "999999999999"},
+            {**metadata, "lifecycleState": "DELETE_REQUESTED"},
+            {**metadata, "unexpected": True},
+            {key: value for key, value in metadata.items() if key != "projectNumber"},
+        ):
+            with self.subTest(changed=changed):
+                with self.assertRaises(validator.ValidationError):
+                    validator.validate_project_identity_document(
+                        changed,
+                        expected_project_id=PROJECT,
+                        expected_project_number=PROJECT_NUMBER,
+                    )
+        for malformed_number in (None, 185495765507, "", "0", "01", "+1", "12345", "1" * 31):
+            with self.subTest(malformed_number=malformed_number):
+                self.assert_validation_code(
+                    "PROJECT_NUMBER",
+                    validator.validate_project_identity_document,
+                    metadata,
+                    expected_project_id=PROJECT,
+                    expected_project_number=malformed_number,
+                )
+
+    def test_secret_resources_accept_only_the_verified_project_alias_pair(self):
+        for project_segment in (PROJECT, PROJECT_NUMBER):
+            document = secret_metadata(project_segment=project_segment)
+            with self.subTest(project_segment=project_segment):
+                result = validator.validate_secret_version_document(
+                    document,
+                    expected_secret="session-secret",
+                    expected_version="7",
+                    project=PROJECT,
+                    project_number=PROJECT_NUMBER,
+                )
+                self.assertEqual(result["classification"], "EXISTING_ENABLED")
+                self.assertEqual(
+                    result["secret"],
+                    f"projects/{PROJECT}/secrets/session-secret",
+                )
+                self.assertEqual(
+                    result["observedSecretResource"],
+                    f"projects/{project_segment}/secrets/session-secret",
+                )
+                self.assertEqual(
+                    result["observedVersionResource"],
+                    f"projects/{project_segment}/secrets/session-secret/versions/7",
+                )
+                self.assertEqual(
+                    result["matchedSecretProjectSegment"], project_segment
+                )
+                self.assertEqual(
+                    result["matchedVersionProjectSegment"], project_segment
+                )
+
+    def test_numeric_secret_resource_requires_the_verified_project_number(self):
+        numeric = secret_metadata(project_segment=PROJECT_NUMBER)
+        self.assert_validation_code(
+            "PROJECT_NUMBER_REQUIRED",
+            validator.validate_secret_version_document,
+            numeric,
+            expected_secret="session-secret",
+            expected_version="7",
+            project=PROJECT,
+        )
+        for project_segment in ("other-project-123", "999999999999"):
+            with self.subTest(project_segment=project_segment):
+                self.assert_validation_code(
+                    "SECRET_SCOPE_MISMATCH",
+                    validator.validate_secret_version_document,
+                    secret_metadata(project_segment=project_segment),
+                    expected_secret="session-secret",
+                    expected_version="7",
+                    project=PROJECT,
+                    project_number=PROJECT_NUMBER,
+                )
+
+    def test_matching_secret_name_under_another_project_is_rejected(self):
+        for project_segment in ("unrelated-project-1", "999999999999"):
+            document = secret_metadata(project_segment=project_segment)
+            with self.subTest(project_segment=project_segment):
+                with self.assertRaises(validator.ValidationError):
+                    validator.validate_secret_http_evidence(
+                        {"name": document["secret"]["name"]},
+                        {
+                            "name": document["version"]["name"],
+                            "state": "ENABLED",
+                        },
+                        secret_status=200,
+                        version_status=200,
+                        expected_secret="session-secret",
+                        expected_version="7",
+                        project=PROJECT,
+                        project_number=PROJECT_NUMBER,
+                    )
+
+    def test_numeric_saved_reference_preserves_observed_identity(self):
+        numeric_reference = saved_secret_reference_result(
+            secret=f"projects/{PROJECT_NUMBER}/secrets/session-secret"
+        )
+        result = validator.validate_secret_reference_result(
+            numeric_reference, self.authorized_scope, PROJECT_NUMBER
+        )
+        self.assertEqual(
+            result["secretResource"], f"projects/{PROJECT}/secrets/session-secret"
+        )
+        self.assertEqual(
+            result["observedSecretReference"],
+            f"projects/{PROJECT_NUMBER}/secrets/session-secret",
+        )
+        self.assertEqual(result["matchedProjectSegment"], PROJECT_NUMBER)
+
+    def test_project_alias_evidence_remains_strict(self):
+        with self.assertRaises(validator.ValidationError):
+            validator.strict_loads(
+                '{"name":"projects/%s/secrets/session-secret",'
+                '"name":"projects/%s/secrets/session-secret"}'
+                % (PROJECT, PROJECT_NUMBER)
+            )
+        numeric = secret_metadata(project_segment=PROJECT_NUMBER)
+        numeric["version"]["unexpected"] = True
+        with self.assertRaises(validator.ValidationError):
+            validator.validate_secret_version_document(
+                numeric,
+                expected_secret="session-secret",
+                expected_version="7",
+                project=PROJECT,
+                project_number=PROJECT_NUMBER,
+            )
 
     def test_saved_secret_reference_result_is_scope_bound_and_canonical(self):
         valid = validator.validate_secret_reference_result(
@@ -1814,6 +1968,7 @@ class Phase2QRegressionTests(ValidatorTestCase):
                 "--project", PROJECT,
                 "--region", REGION,
                 "--service", SERVICE,
+                "--project-number", PROJECT_NUMBER,
                 "--evidence-root", root,
                 "--input-file", str(result_file),
                 "--output", "resource-version",
@@ -2735,6 +2890,13 @@ class Phase2QRegressionTests(ValidatorTestCase):
         self.assertIn("artifact-image-request", runbook)
         self.assertIn("DockerImages.Get", runbook)
         self.assertIn("secret-reference-result", runbook)
+        self.assertIn("json(projectId,projectNumber,lifecycleState)", runbook)
+        self.assertIn('--project-number="$PROJECT_NUMBER"', runbook)
+        for document in (runbook, readme, handoff, checklist):
+            normalized = " ".join(document.split())
+            self.assertIn("project ID", normalized)
+            self.assertIn("project number", normalized)
+            self.assertIn("observed resource identity", normalized)
         self.assertIn("pushStart <= pushEnd <= finishTime", runbook)
         for document in (runbook, readme, handoff, checklist):
             normalized = " ".join(document.split())
@@ -2784,6 +2946,19 @@ class Phase2FCliTests(unittest.TestCase):
         return [
             (
                 [
+                    "project-identity",
+                    *self.common,
+                    "--project-number",
+                    PROJECT_NUMBER,
+                ],
+                {
+                    "projectId": PROJECT,
+                    "projectNumber": PROJECT_NUMBER,
+                    "lifecycleState": "ACTIVE",
+                },
+            ),
+            (
+                [
                     "revision", *self.common, "--expected-revision", BASELINE,
                     "--expected-digest", DIGEST, "--expected-image", IMAGE_URI,
                 ],
@@ -2808,9 +2983,9 @@ class Phase2FCliTests(unittest.TestCase):
                 ],
                 scoped("transition", {"pre": pre, "post": post}),
             ),
-            (["session-secret", *self.common], scoped("serviceConfig", session_document(session_reference()))),
+            (["session-secret", *self.common, "--project-number", PROJECT_NUMBER], scoped("serviceConfig", session_document(session_reference()))),
             (
-                ["secret-version", *self.common, "--expected-secret", "session-secret", "--expected-version", "7"],
+                ["secret-version", *self.common, "--project-number", PROJECT_NUMBER, "--expected-secret", "session-secret", "--expected-version", "7"],
                 scoped("secretMetadata", secret_metadata()),
             ),
             (

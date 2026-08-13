@@ -88,8 +88,11 @@ the validated candidate tag and Build digest; its DockerImage URI digest and tag
 must agree before the validator derives a deployable immutable reference. This is
 Cloud Build artifact-output binding, not a SLSA attestation. Saved
 `SESSION_SECRET` results are strictly rebound to the current project, region,
-and service before metadata URLs are constructed, and the secret must resolve
-within the current project with an exact positive numeric version. Aliases and
+and service before metadata URLs are constructed. One authoritative active-project
+response must bind the exact authorized project ID and project number. Secret
+Manager resources may use either verified segment, while every unrelated textual
+or numeric project is rejected; successful output retains the observed resource
+identity. The secret must resolve with an exact positive numeric version. Aliases and
 plaintext-like selectors fail before every HTTP classification. Runtime
 preservation compares a schema-validated safe Cloud Run v2 projection with a
 nonempty container list. A singleton container may omit `name`; it is compared
