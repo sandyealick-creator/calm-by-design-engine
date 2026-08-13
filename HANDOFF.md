@@ -202,7 +202,11 @@ tag resolution with Build-result digest equality, safe runtime comparison,
 scope-bound numeric `SESSION_SECRET` references revalidated before metadata URL
 construction and every HTTP classification, and complete expected
 traffic/rollback maps. Runtime comparison requires a schema-valid Cloud Run v2
-safe projection with nonempty named containers; service-level and revision-level
+safe projection with a nonempty container list. A singleton container may omit
+`name`; it is compared by its sole position, and name presence or absence is not
+drift. A present singleton name must be valid. Multiple containers require
+explicit, valid, unique names and are compared by name independent of order.
+Service-level and revision-level
 scaling are distinct, readiness probes are included with startup and liveness
 probes, and impossible port, utilization, and network-interface structures stop
 before comparison. Plaintext environment and probe-header values are excluded

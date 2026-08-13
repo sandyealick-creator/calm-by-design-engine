@@ -92,7 +92,11 @@ and service before metadata URLs are constructed, and the secret must resolve
 within the current project with an exact positive numeric version. Aliases and
 plaintext-like selectors fail before every HTTP classification. Runtime
 preservation compares a schema-validated safe Cloud Run v2 projection with a
-nonempty named-container structure; it deliberately excludes plaintext
+nonempty container list. A singleton container may omit `name`; it is compared
+by its sole position, and name presence or absence is not drift. A present
+singleton name must be valid. Multiple containers require explicit, valid,
+unique names and are compared by name independent of order. The projection
+deliberately excludes plaintext
 environment and probe-header values and does not claim equality of unselected
 fields. A floating `LATEST` allocation is a
 deployment and rollback hazard, not a standalone source-validation or image-build

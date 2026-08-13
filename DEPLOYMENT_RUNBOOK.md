@@ -426,8 +426,12 @@ capture_runtime_snapshot() {
 
 Section 7 invokes this function once immediately before and once immediately
 after deployment, then passes both strictly parsed HTTP response bodies to `runtime-equal`.
-Require `RUNTIME_UNCHANGED`. The validator requires a nonempty named container
-list and validates every selected service, template, container, environment,
+Require `RUNTIME_UNCHANGED`. The validator requires a nonempty container list.
+A singleton container may omit `name`; it is compared by its sole position, and
+name presence or absence is not drift. A present singleton name must be valid.
+Multiple containers require explicit, valid, unique names and are compared by
+name independent of order. The validator validates every selected service,
+template, container, environment,
 secret-reference, resource, port, probe, volume, scaling, and networking field
 against its Cloud Run v2 shape. This includes distinct service-level scaling,
 revision-level scaling, and startup, liveness, and readiness probes. Optional
