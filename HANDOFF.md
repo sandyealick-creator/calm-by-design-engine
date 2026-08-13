@@ -200,7 +200,11 @@ fixtures. Its scoped contracts cover revision and traffic identity, candidate
 tag/revision nonexistence, bounded terminal-build evidence, exact DockerImage
 tag resolution with Build-result digest equality, safe runtime comparison,
 scope-bound numeric `SESSION_SECRET` references revalidated before metadata URL
-construction and every HTTP classification, and complete expected
+construction and every HTTP classification, including an exact active-project
+metadata binding between the authorized project ID and project number. Secret
+Manager resources may use either verified project segment, retain their observed
+resource identity in successful evidence, and reject every other textual or numeric
+project. The contracts also cover complete expected
 traffic/rollback maps. Runtime comparison requires a schema-valid Cloud Run v2
 safe projection with a nonempty container list. A singleton container may omit
 `name`; it is compared by its sole position, and name presence or absence is not

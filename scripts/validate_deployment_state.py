@@ -23,6 +23,7 @@ from typing import Any, NoReturn, Sequence
 DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 REVISION_RE = re.compile(r"[a-z]([a-z0-9-]*[a-z0-9])?")
 PROJECT_RE = re.compile(r"[a-z0-9][a-z0-9-]{4,28}[a-z0-9]")
+PROJECT_NUMBER_RE = re.compile(r"[1-9][0-9]{5,29}")
 REGION_RE = re.compile(r"[a-z][a-z0-9-]{1,30}[a-z0-9]")
 SECRET_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,255}")
 NUMERIC_VERSION_RE = re.compile(r"[1-9][0-9]*")
@@ -87,6 +88,22 @@ class Scope:
 
 
 @dataclass(frozen=True)
+class ProjectIdentity:
+    project_id: str
+    project_number: str
+
+    @property
+    def aliases(self) -> frozenset[str]:
+        return frozenset((self.project_id, self.project_number))
+
+    def output(self) -> dict[str, str]:
+        return {
+            "projectId": self.project_id,
+            "projectNumber": self.project_number,
+        }
+
+
+@dataclass(frozen=True)
 class ImageIdentity:
     project: str
     region: str
@@ -137,6 +154,48 @@ def require_scope(project: Any, region: Any, service: Any) -> Scope:
         fail("REGION", "Region identity is malformed")
     service = _require_revision_name(service, "SERVICE")
     return Scope(project, region, service)
+
+
+def require_project_identity(
+    project_id: Any, project_number: Any
+) -> ProjectIdentity:
+    if (
+        not isinstance(project_id, str)
+        or not PROJECT_RE.fullmatch(project_id)
+        or project_id.isdigit()
+    ):
+        fail("PROJECT_ID", "Project ID is malformed")
+    if not isinstance(project_number, str) or not PROJECT_NUMBER_RE.fullmatch(
+        project_number
+    ):
+        fail("PROJECT_NUMBER", "Project number is malformed")
+    return ProjectIdentity(project_id, project_number)
+
+
+def validate_project_identity_document(
+    document: Any, *, expected_project_id: str, expected_project_number: str
+) -> dict[str, str]:
+    """Bind one active project ID to its exact authoritative project number."""
+
+    expected = require_project_identity(expected_project_id, expected_project_number)
+    root = _require_object(
+        document, "PROJECT_IDENTITY", "Project metadata evidence is malformed"
+    )
+    _require_exact_keys(
+        root,
+        required={"projectId", "projectNumber", "lifecycleState"},
+        code="PROJECT_IDENTITY",
+    )
+    observed = require_project_identity(root["projectId"], root["projectNumber"])
+    if observed != expected:
+        fail("PROJECT_IDENTITY_MISMATCH", "Project identity pair differs")
+    if root["lifecycleState"] != "ACTIVE":
+        fail("PROJECT_LIFECYCLE", "Authorized project is not active")
+    return {
+        "classification": "VERIFIED_ACTIVE_PROJECT_IDENTITY",
+        **observed.output(),
+        "lifecycleState": "ACTIVE",
+    }
 
 
 def scoped_payload(
@@ -809,19 +868,49 @@ def _validate_numeric_version(value: Any, *, code: str = "VERSION_SELECTOR") -> 
     return value
 
 
-def _secret_resource(reference: str, project: str) -> str:
+def _secret_identity(
+    reference: str, project: str, project_number: str | None = None
+) -> tuple[str, str, str, str]:
     reference = _validate_secret_reference(reference)
+    if project_number is None:
+        if (
+            not isinstance(project, str)
+            or not PROJECT_RE.fullmatch(project)
+            or project.isdigit()
+        ):
+            fail("PROJECT_ID", "Project ID is malformed")
+        aliases = frozenset((project,))
+    else:
+        aliases = require_project_identity(project, project_number).aliases
     full_match = SECRET_RESOURCE_RE.fullmatch(reference)
     if full_match:
-        if full_match.group("project") != project:
+        observed_project = full_match.group("project")
+        if observed_project.isdigit() and project_number is None:
+            fail(
+                "PROJECT_NUMBER_REQUIRED",
+                "Numeric secret project requires a verified project number",
+            )
+        if observed_project not in aliases:
             fail("SECRET_SCOPE_MISMATCH", "Secret reference identifies another project")
-        return reference
-    if not isinstance(project, str) or not PROJECT_RE.fullmatch(project):
-        fail("PROJECT_ID", "Project identity is malformed")
-    return f"projects/{project}/secrets/{reference}"
+        secret_id = full_match.group("secret")
+        observed_resource = reference
+    else:
+        observed_project = project
+        secret_id = reference
+        observed_resource = f"projects/{project}/secrets/{secret_id}"
+    canonical_resource = f"projects/{project}/secrets/{secret_id}"
+    return canonical_resource, observed_resource, observed_project, secret_id
 
 
-def validate_secret_reference_result(document: Any, scope: Scope) -> dict[str, Any]:
+def _secret_resource(
+    reference: str, project: str, project_number: str | None = None
+) -> str:
+    return _secret_identity(reference, project, project_number)[0]
+
+
+def validate_secret_reference_result(
+    document: Any, scope: Scope, project_number: str | None = None
+) -> dict[str, Any]:
     """Revalidate one saved SESSION_SECRET handoff before any metadata request."""
 
     root = _require_object(
@@ -860,7 +949,9 @@ def validate_secret_reference_result(document: Any, scope: Scope) -> dict[str, A
             "SECRET_REFERENCE_SCOPE_MISMATCH",
             "Saved secret-reference scope differs from the authorized scope",
         )
-    secret_resource = _secret_resource(root["secret"], scope.project)
+    secret_resource, observed_reference, matched_project, _secret_id = _secret_identity(
+        root["secret"], scope.project, project_number
+    )
     version = _validate_numeric_version(
         root["version"], code="SECRET_REFERENCE_VERSION"
     )
@@ -869,6 +960,8 @@ def validate_secret_reference_result(document: Any, scope: Scope) -> dict[str, A
         "name": "SESSION_SECRET",
         "scope": scope.output(),
         "secretResource": secret_resource,
+        "observedSecretReference": observed_reference,
+        "matchedProjectSegment": matched_project,
         "version": version,
     }
 
@@ -879,11 +972,14 @@ def validate_secret_version_document(
     expected_secret: str,
     expected_version: str,
     project: str,
+    project_number: str | None = None,
 ) -> dict[str, str]:
     """Classify exact secret/version metadata without accepting a payload."""
 
     _validate_numeric_version(expected_version)
-    expected_resource = _secret_resource(expected_secret, project)
+    expected_resource, _expected_observed, _expected_project, expected_secret_id = (
+        _secret_identity(expected_secret, project, project_number)
+    )
     root = _require_object(
         document, "SECRET_METADATA", "Secret-version evidence must be an object"
     )
@@ -912,7 +1008,18 @@ def validate_secret_version_document(
                 "Missing secret evidence has contradictory version metadata",
             )
         return {"classification": "MISSING_SECRET"}
-    if secret["result"] != "FOUND" or secret.get("name") != expected_resource:
+    if secret["result"] != "FOUND":
+        fail("SECRET_METADATA", "Secret metadata is malformed or mismatched")
+    secret_name = secret.get("name")
+    if not isinstance(secret_name, str):
+        fail("SECRET_METADATA", "Secret metadata is malformed or mismatched")
+    (
+        _secret_canonical,
+        observed_secret_resource,
+        observed_secret_project,
+        observed_secret_id,
+    ) = _secret_identity(secret_name, project, project_number)
+    if observed_secret_id != expected_secret_id:
         fail("SECRET_METADATA", "Secret metadata is malformed or mismatched")
 
     if version["result"] == "NOT_FOUND":
@@ -923,7 +1030,15 @@ def validate_secret_version_document(
         fail("SECRET_VERSION_METADATA", "Version metadata result is malformed")
     version_name = version.get("name")
     match = VERSION_RESOURCE_RE.fullmatch(version_name) if isinstance(version_name, str) else None
-    if match is None or match.group("secret_resource") != expected_resource:
+    if match is None:
+        fail("SECRET_VERSION_METADATA", "Version metadata identity is malformed")
+    (
+        _version_canonical,
+        observed_version_secret_resource,
+        observed_version_project,
+        observed_version_secret_id,
+    ) = _secret_identity(match.group("secret_resource"), project, project_number)
+    if observed_version_secret_id != expected_secret_id:
         fail("SECRET_VERSION_METADATA", "Version metadata identity is malformed")
     if expected_version.isdigit() and match.group("version") != expected_version:
         fail("SECRET_VERSION_MISMATCH", "Version metadata differs from the requested version")
@@ -939,6 +1054,10 @@ def validate_secret_version_document(
         "classification": classifications[state],
         "secret": expected_resource,
         "version": match.group("version"),
+        "observedSecretResource": observed_secret_resource,
+        "observedVersionResource": version_name,
+        "matchedSecretProjectSegment": observed_secret_project,
+        "matchedVersionProjectSegment": observed_version_project,
     }
 
 
@@ -964,10 +1083,12 @@ def validate_secret_http_evidence(
     expected_secret: str,
     expected_version: str,
     project: str,
+    project_number: str | None = None,
 ) -> dict[str, str]:
     _validate_numeric_version(expected_version)
-    expected_resource = _secret_resource(expected_secret, project)
-    version_resource = f"{expected_resource}/versions/{expected_version}"
+    expected_resource, _observed, _matched, expected_secret_id = _secret_identity(
+        expected_secret, project, project_number
+    )
     if secret_status == 404:
         _validate_not_found_body(secret_body)
         if version_status is not None or version_body is not None:
@@ -981,7 +1102,12 @@ def validate_secret_http_evidence(
         secret_body, "SECRET_METADATA", "Secret metadata response is malformed"
     )
     _require_exact_keys(secret, required={"name"}, code="SECRET_METADATA")
-    if secret["name"] != expected_resource:
+    if not isinstance(secret["name"], str):
+        fail("SECRET_METADATA", "Secret metadata identity differs")
+    _canonical, _observed, _matched, observed_secret_id = _secret_identity(
+        secret["name"], project, project_number
+    )
+    if observed_secret_id != expected_secret_id:
         fail("SECRET_METADATA", "Secret metadata identity differs")
     if version_status == 404:
         _validate_not_found_body(version_body)
@@ -997,7 +1123,21 @@ def validate_secret_http_evidence(
             required={"name", "state"},
             code="SECRET_VERSION_METADATA",
         )
-        if version_document["name"] != version_resource:
+        version_name = version_document["name"]
+        version_match = (
+            VERSION_RESOURCE_RE.fullmatch(version_name)
+            if isinstance(version_name, str)
+            else None
+        )
+        if version_match is None:
+            fail("SECRET_VERSION_METADATA", "Secret version identity differs")
+        _canonical, _observed, _matched, version_secret_id = _secret_identity(
+            version_match.group("secret_resource"), project, project_number
+        )
+        if (
+            version_secret_id != expected_secret_id
+            or version_match.group("version") != expected_version
+        ):
             fail("SECRET_VERSION_METADATA", "Secret version identity differs")
         version = {"result": "FOUND", **version_document}
     elif version_status in {401, 403}:
@@ -1008,12 +1148,13 @@ def validate_secret_http_evidence(
         {
             "requestedSecret": expected_secret,
             "requestedVersion": expected_version,
-            "secret": {"result": "FOUND", "name": expected_resource},
+            "secret": {"result": "FOUND", "name": secret["name"]},
             "version": version,
         },
         expected_secret=expected_secret,
         expected_version=expected_version,
         project=project,
+        project_number=project_number,
     )
 
 
@@ -2036,6 +2177,13 @@ def build_parser() -> argparse.ArgumentParser:
         target.add_argument("--region", required=True)
         target.add_argument("--service", required=True)
 
+    project_identity_parser = subparsers.add_parser("project-identity")
+    add_scope(project_identity_parser)
+    project_identity_parser.add_argument("--project-number", required=True)
+    project_identity_parser.add_argument(
+        "--output", choices=("json", "project-number"), default="json"
+    )
+
     revision_parser = subparsers.add_parser("revision")
     add_scope(revision_parser)
     revision_parser.add_argument("--expected-revision", required=True)
@@ -2058,12 +2206,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     session_parser = subparsers.add_parser("session-secret")
     add_scope(session_parser)
+    session_parser.add_argument("--project-number", required=True)
     session_parser.add_argument(
         "--output", choices=("json", "reference"), default="json"
     )
 
     reference_parser = subparsers.add_parser("secret-reference-result")
     add_scope(reference_parser)
+    reference_parser.add_argument("--project-number", required=True)
     reference_parser.add_argument("--evidence-root", required=True)
     reference_parser.add_argument("--input-file", required=True)
     reference_parser.add_argument(
@@ -2072,6 +2222,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     secret_parser = subparsers.add_parser("secret-version")
     add_scope(secret_parser)
+    secret_parser.add_argument("--project-number", required=True)
     secret_parser.add_argument("--expected-secret", required=True)
     secret_parser.add_argument("--expected-version", required=True)
     secret_parser.add_argument("--evidence-root")
@@ -2183,7 +2334,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.evidence_root, args.input_file, must_exist=True
             )
             result = validate_secret_reference_result(
-                _strict_load_path(input_path), scope
+                _strict_load_path(input_path), scope, args.project_number
             )
             if args.output == "resource-version":
                 print(result["secretResource"], result["version"])
@@ -2192,7 +2343,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.command == "secret-version":
             _validate_numeric_version(args.expected_version)
-            _secret_resource(args.expected_secret, args.project)
+            _secret_resource(
+                args.expected_secret, args.project, args.project_number
+            )
         if args.command == "authorize-image":
             build_path = validate_evidence_file_path(
                 args.evidence_root, args.build_evidence_file, must_exist=True
@@ -2276,6 +2429,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 expected_secret=args.expected_secret,
                 expected_version=args.expected_version,
                 project=args.project,
+                project_number=args.project_number,
             )
             result["scope"] = scope.output()
             _emit(result)
@@ -2346,7 +2500,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             document = _read_stdin_document()
 
-        if args.command == "revision":
+        if args.command == "project-identity":
+            result = validate_project_identity_document(
+                document,
+                expected_project_id=args.project,
+                expected_project_number=args.project_number,
+            )
+            result["scope"] = scope.output()
+            if args.output == "project-number":
+                print(result["projectNumber"])
+                return 0
+        elif args.command == "revision":
             scope, evidence = scoped_payload(
                 document,
                 "revision",
@@ -2411,7 +2575,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 service=args.service,
             )
             result = parse_session_secret_document(evidence)
-            _secret_resource(result["secret"], scope.project)
+            _secret_resource(
+                result["secret"], scope.project, args.project_number
+            )
             result["scope"] = scope.output()
             if args.output == "reference":
                 print(result["secret"], result["version"])
@@ -2429,6 +2595,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 expected_secret=args.expected_secret,
                 expected_version=args.expected_version,
                 project=args.project,
+                project_number=args.project_number,
             )
             result["scope"] = scope.output()
         elif args.command == "nonexistence":
