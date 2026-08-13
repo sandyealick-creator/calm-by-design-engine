@@ -122,6 +122,42 @@ def minimal_runtime_service():
     }
 
 
+def preserved_unnamed_runtime_service():
+    return {
+        "ingress": "INGRESS_TRAFFIC_ALL",
+        "name": f"projects/{PROJECT}/locations/{REGION}/services/{SERVICE}",
+        "scaling": {"maxInstanceCount": 20},
+        "template": {
+            "containers": [
+                {
+                    "env": [
+                        {"name": "GEMINI_API_KEY"},
+                        {"name": "AIRTABLE_API_KEY"},
+                        {"name": "WEBHOOK_SECRET"},
+                        {"name": "GEMINI_MODEL"},
+                    ],
+                    "ports": [{"containerPort": 8080, "name": "http1"}],
+                    "resources": {
+                        "cpuIdle": True,
+                        "limits": {"cpu": "1000m", "memory": "512Mi"},
+                        "startupCpuBoost": True,
+                    },
+                    "startupProbe": {
+                        "failureThreshold": 1,
+                        "periodSeconds": 240,
+                        "tcpSocket": {"port": 8080},
+                        "timeoutSeconds": 240,
+                    },
+                }
+            ],
+            "maxInstanceRequestConcurrency": 80,
+            "scaling": {"maxInstanceCount": 20},
+            "serviceAccount": "185495765507-compute@developer.gserviceaccount.com",
+            "timeout": "300s",
+        },
+    }
+
+
 def populated_runtime_service():
     document = minimal_runtime_service()
     document.update(
@@ -1835,10 +1871,103 @@ class Phase2QRegressionTests(ValidatorTestCase):
             {"name": service_name, "template": {"containers": {}}},
             {"name": service_name, "template": {"containers": None}},
             {"name": service_name, "template": {"containers": 1}},
-            {"name": service_name, "template": {"containers": [{}]}},
             {"name": service_name, "template": {"containers": [{"name": None}]}},
         )
         for document in invalid:
+            with self.subTest(document=document):
+                with self.assertRaises(validator.ValidationError):
+                    validator.validate_runtime_service_document(
+                        document, self.authorized_scope
+                    )
+
+    def test_runtime_accepts_exact_preserved_unnamed_singleton_projection(self):
+        preserved = preserved_unnamed_runtime_service()
+        result = validator.validate_runtime_service_document(
+            preserved, self.authorized_scope
+        )
+        self.assertEqual(result["classification"], "RUNTIME_CANONICAL")
+
+    def test_runtime_singleton_name_is_optional_and_not_drift(self):
+        unnamed = minimal_runtime_service()
+        unnamed["template"]["containers"][0].pop("name")
+        named = minimal_runtime_service()
+        for pre, post in ((unnamed, named), (named, unnamed), (unnamed, unnamed)):
+            with self.subTest(pre_named="name" in pre["template"]["containers"][0]):
+                self.assertEqual(
+                    validator.validate_runtime_comparison(
+                        {"pre": pre, "post": post}, self.authorized_scope
+                    )["classification"],
+                    "RUNTIME_UNCHANGED",
+                )
+
+    def test_runtime_singleton_rejects_invalid_present_names(self):
+        for invalid_name in ("", "bad/name", " leading", 7, None, [], {}):
+            document = minimal_runtime_service()
+            document["template"]["containers"][0]["name"] = invalid_name
+            with self.subTest(invalid_name=invalid_name):
+                self.assert_validation_code(
+                    "RUNTIME_CONTAINER",
+                    validator.validate_runtime_service_document,
+                    document,
+                    self.authorized_scope,
+                )
+
+    def test_runtime_multiple_containers_require_unique_valid_names(self):
+        valid = minimal_runtime_service()
+        valid["template"]["containers"].append({"name": "sidecar"})
+        self.assertEqual(
+            validator.validate_runtime_service_document(
+                valid, self.authorized_scope
+            )["classification"],
+            "RUNTIME_CANONICAL",
+        )
+        for containers in (
+            [{"name": "app"}, {}],
+            [{"name": "app"}, {"name": "app"}],
+            [{"name": "app"}, {"name": ""}],
+            [{"name": "app"}, {"name": None}],
+        ):
+            document = minimal_runtime_service()
+            document["template"]["containers"] = containers
+            with self.subTest(containers=containers):
+                self.assert_validation_code(
+                    "RUNTIME_CONTAINER",
+                    validator.validate_runtime_service_document,
+                    document,
+                    self.authorized_scope,
+                )
+
+    def test_runtime_multiple_containers_compare_by_name_not_order(self):
+        first = minimal_runtime_service()
+        first["template"]["containers"] = [
+            {"name": "app", "env": [{"name": "APP_ENV"}]},
+            {"name": "sidecar", "env": [{"name": "SIDECAR_ENV"}]},
+        ]
+        reordered = json.loads(json.dumps(first))
+        reordered["template"]["containers"].reverse()
+        self.assertEqual(
+            validator.validate_runtime_comparison(
+                {"pre": first, "post": reordered}, self.authorized_scope
+            )["classification"],
+            "RUNTIME_UNCHANGED",
+        )
+        changed = json.loads(json.dumps(reordered))
+        changed["template"]["containers"][0]["env"][0]["name"] = "DRIFTED"
+        self.assert_validation_code(
+            "RUNTIME_DRIFT",
+            validator.validate_runtime_comparison,
+            {"pre": first, "post": changed},
+            self.authorized_scope,
+        )
+
+    def test_runtime_unnamed_singleton_preserves_unrelated_fail_closed_checks(self):
+        for mutation in (
+            lambda container: container.update({"unexpected": True}),
+            lambda container: container.update({"ports": []}),
+            lambda container: container.update({"env": [{"name": ""}]}),
+        ):
+            document = preserved_unnamed_runtime_service()
+            mutation(document["template"]["containers"][0])
             with self.subTest(document=document):
                 with self.assertRaises(validator.ValidationError):
                     validator.validate_runtime_service_document(
@@ -2607,7 +2736,15 @@ class Phase2QRegressionTests(ValidatorTestCase):
         self.assertIn("DockerImages.Get", runbook)
         self.assertIn("secret-reference-result", runbook)
         self.assertIn("pushStart <= pushEnd <= finishTime", runbook)
-        self.assertIn("nonempty named container", runbook)
+        for document in (runbook, readme, handoff, checklist):
+            normalized = " ".join(document.split())
+            self.assertIn("A singleton container may omit `name`", normalized)
+            self.assertIn(
+                "Multiple containers require explicit, valid, unique names",
+                normalized,
+            )
+            self.assertIn("compared by name independent of order", normalized)
+        self.assertNotIn("nonempty named container", runbook)
         self.assertIn("--expected-image=", runbook)
         self.assertIn("tagless, digestless base", runbook)
         self.assertIn("Artifact Registry image URI", runbook)

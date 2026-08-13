@@ -1551,11 +1551,12 @@ def _validate_runtime_volume_mounts(value: Any) -> None:
             _runtime_string(mount["subPath"], "RUNTIME_VOLUME_MOUNT")
 
 
-def _validate_runtime_container(value: Any) -> None:
+def _validate_runtime_container(value: Any, *, require_name: bool) -> None:
     container = _require_object(
         value, "RUNTIME_CONTAINER", "Runtime container is malformed"
     )
     optional = {
+        "name",
         "env",
         "resources",
         "ports",
@@ -1565,9 +1566,13 @@ def _validate_runtime_container(value: Any) -> None:
         "volumeMounts",
     }
     _require_exact_keys(
-        container, required={"name"}, optional=optional, code="RUNTIME_CONTAINER"
+        container,
+        required={"name"} if require_name else set(),
+        optional=optional - ({"name"} if require_name else set()),
+        code="RUNTIME_CONTAINER",
     )
-    _require_revision_name(container["name"], "RUNTIME_CONTAINER")
+    if "name" in container:
+        _require_revision_name(container["name"], "RUNTIME_CONTAINER")
     if "env" in container:
         _validate_runtime_environment(container["env"])
     if "resources" in container:
@@ -1873,13 +1878,15 @@ def validate_runtime_service_document(document: Any, scope: Scope) -> dict[str, 
     containers = template["containers"]
     if not isinstance(containers, list) or not containers:
         fail("RUNTIME_CONTAINERS", "Runtime containers are missing or malformed")
+    multiple_containers = len(containers) > 1
     seen_containers: set[str] = set()
     for container in containers:
-        _validate_runtime_container(container)
-        name = container["name"]
-        if name in seen_containers:
-            fail("RUNTIME_CONTAINER", "Runtime container name is duplicated")
-        seen_containers.add(name)
+        _validate_runtime_container(container, require_name=multiple_containers)
+        if multiple_containers:
+            name = container["name"]
+            if name in seen_containers:
+                fail("RUNTIME_CONTAINER", "Runtime container name is duplicated")
+            seen_containers.add(name)
     if "serviceAccount" in template:
         _runtime_string(template["serviceAccount"], "RUNTIME_SERVICE_ACCOUNT")
     if "maxInstanceRequestConcurrency" in template:
@@ -1916,8 +1923,17 @@ def validate_runtime_service_document(document: Any, scope: Scope) -> dict[str, 
             fail("RUNTIME_VOLUME_MOUNT", "Runtime volume mount is duplicated")
         if not set(mount_names).issubset(volume_names):
             fail("RUNTIME_VOLUME_MOUNT", "Runtime volume mount has no matching volume")
+    canonical_root = {key: root[key] for key in sorted(root) if key != "name"}
+    canonical_template = dict(canonical_root["template"])
+    canonical_containers = [dict(container) for container in containers]
+    if multiple_containers:
+        canonical_containers.sort(key=lambda container: container["name"])
+    else:
+        canonical_containers[0].pop("name", None)
+    canonical_template["containers"] = canonical_containers
+    canonical_root["template"] = canonical_template
     canonical = json.dumps(
-        {key: root[key] for key in sorted(root) if key != "name"},
+        canonical_root,
         sort_keys=True,
         separators=(",", ":"),
     )
