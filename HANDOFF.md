@@ -244,8 +244,10 @@ fixed baseline revision; the raw maps therefore differ while the effective
 serving allocation remains identical and the candidate remains at zero. The
 post-deployment service evidence separately shows the candidate as
 `latestCreatedRevisionName`, the candidate revision itself as `Ready=True`, and
-the fixed baseline as `latestReadyRevisionName`; this avoids mistaking the
-newest created zero-traffic revision for the latest revision serving traffic.
+a complete fixed traffic map with the baseline at 100%. After a temporary
+revision-tag history, `latestReadyRevisionName` may be either the fixed baseline
+or the independently validated candidate, so it must not be used alone to infer
+production serving traffic.
 No traffic movement occurred during the correction or review phase, and
 participant enrollment and live participant use remain separately unauthorized.
 

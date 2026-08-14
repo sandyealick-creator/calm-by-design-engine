@@ -68,8 +68,10 @@ immutable resulting image digest, explicit project/region/service/repository/
 image identity, and a candidate revision created with zero traffic. For that
 candidate, the release evidence distinguishes newest-created, independently
 ready, and traffic-serving revisions: `latestCreatedRevisionName` is the
-candidate, its revision reports `Ready=True`, `latestReadyRevisionName` remains
-the fixed baseline, baseline traffic is 100%, and candidate traffic is 0%.
+candidate and its revision reports `Ready=True`. `latestReadyRevisionName` may
+be the fixed baseline or that independently validated candidate after a
+temporary revision-tag history; the complete fixed, untagged traffic map is
+authoritative, with baseline traffic at 100% and candidate traffic at 0%.
 Live verification and traffic movement require separate authorizations. Secret
 Manager references may be recorded by name or resource reference only, never as
 plaintext credential values in commands, documentation, terminal output, or the

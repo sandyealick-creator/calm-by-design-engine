@@ -613,6 +613,28 @@ class TrafficTests(ValidatorTestCase):
         self.assertEqual(result["latestReadyRevision"], baseline)
         self.assertEqual(result["candidateTraffic"], "ABSENT")
 
+    def test_candidate_latest_ready_with_fixed_baseline_traffic_passes(self):
+        # The caller must establish this independent revision proof before
+        # accepting the candidate as the allowed latest-ready identity.
+        validate_revision(
+            revision_document(name=CANDIDATE), expected_revision=CANDIDATE
+        )
+        result = validator.validate_zero_traffic_transition(
+            traffic_document(latest(100)),
+            traffic_document(
+                fixed(BASELINE, 100),
+                latest_ready=CANDIDATE,
+                latest_created=CANDIDATE,
+            ),
+            candidate_revision=CANDIDATE,
+            baseline_revision=BASELINE,
+            pre_latest_ready_revision=BASELINE,
+        )
+        self.assertEqual(result["latestCreatedRevision"], CANDIDATE)
+        self.assertEqual(result["latestReadyRevision"], CANDIDATE)
+        self.assertEqual(result["baselinePercent"], 100)
+        self.assertEqual(result["candidateTraffic"], "ABSENT")
+
     def test_unexpected_effective_map_drift(self):
         self.assert_validation_code(
             "EFFECTIVE_TRAFFIC_DRIFT",
@@ -942,7 +964,7 @@ class Phase2FScopeAndTransitionTests(ValidatorTestCase):
                     service=SERVICE,
                 )
 
-    def test_post_service_bindings_require_created_candidate_and_ready_baseline(self):
+    def test_post_service_bindings_require_created_candidate_and_allowed_ready_identity(self):
         pre = traffic_document(latest(100))
         post = traffic_document(fixed(BASELINE, 100), latest_created=CANDIDATE)
         self.assert_validation_code(
@@ -960,13 +982,44 @@ class Phase2FScopeAndTransitionTests(ValidatorTestCase):
             pre,
             traffic_document(
                 fixed(BASELINE, 100),
-                latest_ready=CANDIDATE,
+                latest_ready="cbd-assess-unexpected",
                 latest_created=CANDIDATE,
             ),
             candidate_revision=CANDIDATE,
             baseline_revision=BASELINE,
             pre_latest_ready_revision=BASELINE,
         )
+
+    def test_post_latest_ready_is_required_and_well_formed(self):
+        pre = traffic_document(latest(100))
+        malformed_documents = [
+            {
+                "status": {
+                    "latestCreatedRevisionName": CANDIDATE,
+                    "traffic": [fixed(BASELINE, 100)],
+                }
+            },
+            traffic_document(
+                fixed(BASELINE, 100),
+                latest_ready=None,
+                latest_created=CANDIDATE,
+            ),
+            traffic_document(
+                fixed(BASELINE, 100),
+                latest_ready=123,
+                latest_created=CANDIDATE,
+            ),
+        ]
+        for post in malformed_documents:
+            with self.subTest(post=post):
+                with self.assertRaises(validator.ValidationError):
+                    validator.validate_zero_traffic_transition(
+                        pre,
+                        post,
+                        candidate_revision=CANDIDATE,
+                        baseline_revision=BASELINE,
+                        pre_latest_ready_revision=BASELINE,
+                    )
         self.assert_validation_code(
             "POST_FLOATING_LATEST",
             validator.validate_zero_traffic_transition,
