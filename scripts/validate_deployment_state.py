@@ -700,10 +700,10 @@ def validate_zero_traffic_transition(
         fail("BASELINE_MISMATCH", "Pre-deployment latest-ready revision is unexpected")
     if pre_latest_ready_revision != baseline:
         fail("BASELINE_MISMATCH", "Approved baseline does not resolve floating LATEST")
-    if post.latest_ready_revision != baseline:
+    if post.latest_ready_revision not in {baseline, candidate}:
         fail(
             "POST_LATEST_READY_MISMATCH",
-            "Post-deployment latest-ready revision differs from the traffic-serving baseline",
+            "Post-deployment latest-ready revision is neither the approved baseline nor candidate",
         )
     if any(target.target_type == "LATEST" for target in post.targets):
         fail(

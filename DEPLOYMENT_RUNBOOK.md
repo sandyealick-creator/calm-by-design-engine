@@ -896,8 +896,10 @@ After separate zero-traffic deployment authorization, run this block. It
 requires the exact successful REST Build and DockerImage evidence, revalidates
 their complete current envelope and digest equality, captures pre-state before
 mutation, validates the exact candidate revision afterward, proves the candidate
-is the latest created revision while the baseline remains the latest
-traffic-serving revision, validates zero traffic, and compares runtime hashes:
+is the latest created revision, validates the complete fixed production traffic
+map, and compares runtime hashes. A temporary revision-tag history may leave
+`latestReadyRevisionName` at the independently validated candidate even though
+the fixed production target remains the baseline:
 
 ```bash
 (
@@ -1010,13 +1012,16 @@ or volume flags unless a new review explicitly authorizes a complete restatement
 of configuration.
 
 Exit 0 requires exact candidate name, digest, and `Ready=True`; observed
-post-deployment `latestCreatedRevisionName` equal to the candidate;
-`latestReadyRevisionName` equal to the traffic-serving baseline; a fixed,
-untagged baseline target at 100%; candidate absent or untagged at zero; only the
-documented floating-to-fixed raw transformation; and identical safe runtime
-hashes. A correct `--no-traffic` deployment therefore has newest-created
-candidate, independently ready candidate, latest-ready baseline, baseline
-traffic at 100%, and candidate traffic at 0%.
+post-deployment `latestCreatedRevisionName` equal to the candidate; and
+`latestReadyRevisionName` equal to either the fixed baseline or the
+independently validated candidate. The complete fixed, untagged traffic map is
+authoritative for production serving state: baseline at 100%, candidate absent
+or untagged at zero, and no floating `LATEST` or unexpected target. It also
+requires only the documented floating-to-fixed raw transformation and identical
+safe runtime hashes. A correct `--no-traffic` deployment therefore has a
+newest-created, independently ready candidate and baseline production traffic
+at 100% with candidate traffic at 0%, regardless of the allowed latest-ready
+identity.
 
 Do not require byte-for-byte equality between a floating raw pre-map and the
 documented fixed post-map. Any effective drift, candidate traffic, candidate
