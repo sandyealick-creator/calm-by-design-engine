@@ -56,6 +56,31 @@ def test_health_route_preserves_machine_readable_status(client):
     }
 
 
+def test_enroll_page_uses_approved_participant_preview_copy(client):
+    response = client.get("/enroll")
+
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+    assert "Confirm your Calm by Design access" in body
+    assert "only if Sandy has already approved you" in body
+    assert "does not complete PMA or membership paperwork" in body
+    assert "not monitored in real time" in body
+    assert "call or text 988" in body
+    assert "Optional: I agree to receive non-marketing text messages" in body
+    assert "Already have access?" in body
+    assert 'href="/recover"' in body
+    assert "marketing_consent" not in body
+
+
+def test_enrollment_defaults_deferred_marketing_consent_to_false(client, fake_airtable):
+    response = enroll(client)
+
+    assert response.status_code == 302
+    created = fake_airtable.find_all(main.T_CLIENTS)
+    assert len(created) == 1
+    assert created[0]["fields"][main.F_CLIENT["marketing_consent"]] is False
+
+
 def test_new_enrollment_creates_client_and_uses_clean_cookie_redirect(
     client, fake_airtable
 ):
