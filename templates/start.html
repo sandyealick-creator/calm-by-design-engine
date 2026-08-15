@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Welcome{% endblock %}
+{% block content %}
+<h1>Welcome to Calm by Design</h1>
+
+<p>This check-in is for approved Calm by Design participants who have already completed Sandy&rsquo;s outside membership and participation process.</p>
+
+<p>Calm by Design is educational wellness support. It is not medical care, therapy, diagnosis, crisis care, or emergency monitoring.</p>
+
+<p>You may be asked about how you are feeling, including physical symptoms, anxiety, energy, sleep, and what is on your mind. Your responses may be processed through the approved Calm by Design support systems to suggest a grounding practice or next step.</p>
+
+<section class="safety-box" aria-labelledby="start-safety-heading">
+  <h2 id="start-safety-heading">Important safety reminder</h2>
+  <p>This app is not monitored in real time. If you may be in immediate danger, may hurt yourself, cannot stay safe, or may be having a medical emergency, call 911 or contact emergency services now. In the United States, you may also call or text 988 for mental health crisis support. Do not wait for this app or a reply from White Raven Holistic.</p>
+</section>
+
+<form action="/enroll" method="get">
+  <div class="checkbox-row">
+    <input id="approved-participant-acknowledgement" type="checkbox" required aria-describedby="acknowledgement-copy">
+    <span id="acknowledgement-copy">I confirm that I am an approved Calm by Design participant and have completed the required outside membership and participation process. I understand this app provides educational wellness support only, is not medical care or emergency support, and is not monitored in real time.</span>
+  </div>
+  <button id="continue-to-enrollment" type="submit" disabled aria-disabled="true">Continue to enrollment</button>
+</form>
+
+<p class="muted">Already enrolled? <a href="/recover">Recover access</a></p>
+
+<script>
+  const acknowledgement = document.getElementById("approved-participant-acknowledgement");
+  const continueButton = document.getElementById("continue-to-enrollment");
+  acknowledgement.addEventListener("change", function () {
+    continueButton.disabled = !acknowledgement.checked;
+    continueButton.setAttribute("aria-disabled", String(!acknowledgement.checked));
+  });
+</script>
+{% endblock %}

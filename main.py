@@ -1213,9 +1213,15 @@ def _result_from_assessment(assess_record):
 
 
 # ---------------------------------------------------------------------------
-# Routes - health + existing GHL webhook
+# Routes - participant start, health, + existing GHL webhook
 # ---------------------------------------------------------------------------
 @app.get("/")
+def start_page():
+    """Show the no-data participant start page before enrollment."""
+    return no_store(render_template("start.html"))
+
+
+@app.get("/health")
 def health():
     return jsonify({"status": "ok", "service": "cbd-assess", "version": APP_VERSION,
                     "model": GEMINI_MODEL})
