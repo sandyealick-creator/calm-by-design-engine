@@ -897,9 +897,10 @@ requires the exact successful REST Build and DockerImage evidence, revalidates
 their complete current envelope and digest equality, captures pre-state before
 mutation, validates the exact candidate revision afterward, proves the candidate
 is the latest created revision, validates the complete fixed production traffic
-map, and compares runtime hashes. A temporary revision-tag history may leave
-`latestReadyRevisionName` at the independently validated candidate even though
-the fixed production target remains the baseline:
+map, and compares runtime hashes. Cloud Run may retain
+`latestReadyRevisionName` at the exact evidence-bound pre-deployment Ready
+revision after prior revision activity even though the fixed production target
+remains the baseline:
 
 ```bash
 (
@@ -1043,14 +1044,19 @@ of configuration.
 
 Exit 0 requires exact candidate name, digest, and `Ready=True`; observed
 post-deployment `latestCreatedRevisionName` equal to the candidate; and
-`latestReadyRevisionName` equal to either the fixed baseline or the
-independently validated candidate. The complete fixed, untagged traffic map is
-authoritative for production serving state: baseline at 100%, candidate absent
-or untagged at zero, and no floating `LATEST` or unexpected target. It also
-requires identical safe runtime hashes. A correct `--no-traffic` deployment
-therefore has a newest-created, independently ready candidate and baseline
-production traffic at 100% with candidate traffic at 0%, regardless of the
-allowed latest-ready identity.
+`latestReadyRevisionName` equal to the fixed baseline, the independently
+validated new candidate, or the exact evidence-bound pre-deployment
+`PRE_APPROVED_LATEST_READY_REVISION`. The third case is service-level Ready
+metadata only: it is permitted solely because that revision was independently
+captured with exact identity, `Ready=True`, image identity, and immutable digest
+before deployment. It does not prove routing and does not permit any other
+Ready revision. The complete fixed, untagged traffic map is authoritative for
+production serving state: baseline at 100%, candidate absent or untagged at
+zero, and no floating `LATEST` or unexpected target. It also requires identical
+safe runtime hashes. A correct `--no-traffic` deployment therefore has a
+newest-created, independently ready candidate and baseline production traffic
+at 100% with candidate traffic at 0%, regardless of the allowed latest-ready
+identity.
 
 Before executing the block, authorization must bind
 `PRE_APPROVED_LATEST_READY_REVISION` to either the fixed baseline or a

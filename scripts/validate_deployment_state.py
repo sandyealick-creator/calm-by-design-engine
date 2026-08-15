@@ -742,10 +742,11 @@ def validate_zero_traffic_transition(
             "PRE_TAGGED_TRAFFIC",
             "Pre-deployment traffic must not contain a tag",
         )
-    if post.latest_ready_revision not in {baseline, candidate}:
+    allowed_post_latest_ready = {baseline, candidate, approved_pre_latest_ready}
+    if post.latest_ready_revision not in allowed_post_latest_ready:
         fail(
             "POST_LATEST_READY_MISMATCH",
-            "Post-deployment latest-ready revision is neither the approved baseline nor candidate",
+            "Post-deployment latest-ready revision is not the baseline, candidate, or evidence-bound pre-deployment ready revision",
         )
     if any(target.target_type == "LATEST" for target in post.targets):
         fail(

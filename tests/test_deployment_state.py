@@ -646,7 +646,7 @@ class TrafficTests(ValidatorTestCase):
             ),
             traffic_document(
                 fixed(BASELINE, 100),
-                latest_ready=CANDIDATE,
+                latest_ready=pre_ready_candidate,
                 latest_created=CANDIDATE,
             ),
             candidate_revision=CANDIDATE,
@@ -659,6 +659,32 @@ class TrafficTests(ValidatorTestCase):
         )
         self.assertTrue(result["effectiveAllocationPreserved"])
         self.assertEqual(result["baselinePercent"], 100)
+        self.assertEqual(result["latestReadyRevision"], pre_ready_candidate)
+
+    def test_post_latest_ready_must_match_evidence_bound_preapproved_revision(self):
+        pre_ready_candidate = "cbd-assess-17237de"
+        pre_ready_evidence = revision_document(name=pre_ready_candidate)
+        self.assert_validation_code(
+            "POST_LATEST_READY_MISMATCH",
+            validator.validate_zero_traffic_transition,
+            traffic_document(
+                fixed(BASELINE, 100),
+                latest_ready=pre_ready_candidate,
+                latest_created=pre_ready_candidate,
+            ),
+            traffic_document(
+                fixed(BASELINE, 100),
+                latest_ready="cbd-assess-unapproved",
+                latest_created=CANDIDATE,
+            ),
+            candidate_revision=CANDIDATE,
+            baseline_revision=BASELINE,
+            pre_latest_ready_revision=pre_ready_candidate,
+            pre_approved_revision_evidence=pre_ready_evidence,
+            pre_approved_revision_digest=DIGEST,
+            pre_approved_revision_image=IMAGE_URI,
+            scope=validator.require_scope(PROJECT, REGION, SERVICE),
+        )
 
     def test_pre_approved_candidate_requires_exact_revision_evidence(self):
         pre_ready_candidate = "cbd-assess-17237de"
