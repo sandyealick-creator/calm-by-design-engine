@@ -28,6 +28,34 @@ def enroll(client, email="new@example.com", phone="+15550001111", sms=True):
     })
 
 
+def test_start_page_requires_acknowledgement_and_does_not_write(client, fake_airtable):
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert not response.is_json
+    body = response.get_data(as_text=True)
+    assert "Welcome to Calm by Design" in body
+    assert 'action="/enroll"' in body
+    assert 'id="approved-participant-acknowledgement"' in body
+    assert 'type="checkbox" required' in body
+    assert 'id="continue-to-enrollment" type="submit" disabled' in body
+    assert 'href="/recover"' in body
+    assert fake_airtable.tables == {}
+
+
+def test_health_route_preserves_machine_readable_status(client):
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.is_json
+    assert response.get_json() == {
+        "status": "ok",
+        "service": "cbd-assess",
+        "version": main.APP_VERSION,
+        "model": main.GEMINI_MODEL,
+    }
+
+
 def test_new_enrollment_creates_client_and_uses_clean_cookie_redirect(
     client, fake_airtable
 ):
