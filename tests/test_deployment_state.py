@@ -562,9 +562,9 @@ class TrafficTests(ValidatorTestCase):
             "LATEST_RESOLUTION_MISMATCH", state.effective_canonical, CANDIDATE
         )
 
-    def test_raw_latest_to_fixed_transition_with_candidate_absent(self):
+    def test_fixed_zero_traffic_transition_with_candidate_absent(self):
         result = validator.validate_zero_traffic_transition(
-            traffic_document(latest(100)),
+            traffic_document(fixed(BASELINE, 100)),
             traffic_document(
                 fixed(BASELINE, 100), latest_created=CANDIDATE
             ),
@@ -576,9 +576,9 @@ class TrafficTests(ValidatorTestCase):
         self.assertEqual(result["baselinePercent"], 100)
         self.assertTrue(result["effectiveAllocationPreserved"])
 
-    def test_raw_latest_to_fixed_transition_with_candidate_explicit_zero(self):
+    def test_fixed_zero_traffic_transition_with_candidate_explicit_zero(self):
         result = validator.validate_zero_traffic_transition(
-            traffic_document(latest(100)),
+            traffic_document(fixed(BASELINE, 100)),
             traffic_document(
                 fixed(BASELINE, 100), fixed(CANDIDATE, 0), latest_created=CANDIDATE
             ),
@@ -620,7 +620,7 @@ class TrafficTests(ValidatorTestCase):
             revision_document(name=CANDIDATE), expected_revision=CANDIDATE
         )
         result = validator.validate_zero_traffic_transition(
-            traffic_document(latest(100)),
+            traffic_document(fixed(BASELINE, 100)),
             traffic_document(
                 fixed(BASELINE, 100),
                 latest_ready=CANDIDATE,
@@ -635,11 +635,153 @@ class TrafficTests(ValidatorTestCase):
         self.assertEqual(result["baselinePercent"], 100)
         self.assertEqual(result["candidateTraffic"], "ABSENT")
 
+    def test_pre_approved_ready_candidate_with_fixed_baseline_traffic_passes(self):
+        pre_ready_candidate = "cbd-assess-17237de"
+        pre_ready_evidence = revision_document(name=pre_ready_candidate)
+        result = validator.validate_zero_traffic_transition(
+            traffic_document(
+                fixed(BASELINE, 100),
+                latest_ready=pre_ready_candidate,
+                latest_created=pre_ready_candidate,
+            ),
+            traffic_document(
+                fixed(BASELINE, 100),
+                latest_ready=CANDIDATE,
+                latest_created=CANDIDATE,
+            ),
+            candidate_revision=CANDIDATE,
+            baseline_revision=BASELINE,
+            pre_latest_ready_revision=pre_ready_candidate,
+            pre_approved_revision_evidence=pre_ready_evidence,
+            pre_approved_revision_digest=DIGEST,
+            pre_approved_revision_image=IMAGE_URI,
+            scope=validator.require_scope(PROJECT, REGION, SERVICE),
+        )
+        self.assertTrue(result["effectiveAllocationPreserved"])
+        self.assertEqual(result["baselinePercent"], 100)
+
+    def test_pre_approved_candidate_requires_exact_revision_evidence(self):
+        pre_ready_candidate = "cbd-assess-17237de"
+        pre = traffic_document(fixed(BASELINE, 100), latest_ready=pre_ready_candidate)
+        post = traffic_document(fixed(BASELINE, 100), latest_created=CANDIDATE)
+        common = {
+            "candidate_revision": CANDIDATE,
+            "baseline_revision": BASELINE,
+            "pre_latest_ready_revision": pre_ready_candidate,
+            "pre_approved_revision_digest": DIGEST,
+            "pre_approved_revision_image": IMAGE_URI,
+            "scope": validator.require_scope(PROJECT, REGION, SERVICE),
+        }
+        self.assert_validation_code(
+            "PRE_LATEST_READY_EVIDENCE_REQUIRED",
+            validator.validate_zero_traffic_transition,
+            pre,
+            post,
+            **common,
+        )
+        self.assert_validation_code(
+            "READINESS_NOT_TRUE",
+            validator.validate_zero_traffic_transition,
+            pre,
+            post,
+            pre_approved_revision_evidence=revision_document(
+                name=pre_ready_candidate,
+                conditions=[{"type": "Ready", "status": "False"}],
+            ),
+            **common,
+        )
+        self.assert_validation_code(
+            "REVISION_DIGEST_MISMATCH",
+            validator.validate_zero_traffic_transition,
+            pre,
+            post,
+            pre_approved_revision_evidence=revision_document(
+                name=pre_ready_candidate,
+                digest=f"{IMAGE_URI}@{OTHER_DIGEST}",
+            ),
+            **common,
+        )
+        missing_digest = revision_document(name=pre_ready_candidate)
+        del missing_digest["status"]["imageDigest"]
+        self.assert_validation_code(
+            "UNEXPECTED_STRUCTURE",
+            validator.validate_zero_traffic_transition,
+            pre,
+            post,
+            pre_approved_revision_evidence=missing_digest,
+            **common,
+        )
+
+    def test_unapproved_pre_latest_ready_revision_is_rejected(self):
+        self.assert_validation_code(
+            "PRE_LATEST_READY_MISMATCH",
+            validator.validate_zero_traffic_transition,
+            traffic_document(
+                fixed(BASELINE, 100),
+                latest_ready="cbd-assess-unapproved",
+            ),
+            traffic_document(
+                fixed(BASELINE, 100), latest_created=CANDIDATE
+            ),
+            candidate_revision=CANDIDATE,
+            baseline_revision=BASELINE,
+            pre_latest_ready_revision="cbd-assess-17237de",
+        )
+
+    def test_pre_latest_ready_is_required_and_well_formed(self):
+        post = traffic_document(fixed(BASELINE, 100), latest_created=CANDIDATE)
+        for pre in (
+            {"status": {"traffic": [fixed(BASELINE, 100)]}},
+            traffic_document(fixed(BASELINE, 100), latest_ready=None),
+            traffic_document(fixed(BASELINE, 100), latest_ready=123),
+        ):
+            with self.subTest(pre=pre):
+                with self.assertRaises(validator.ValidationError):
+                    validator.validate_zero_traffic_transition(
+                        pre,
+                        post,
+                        candidate_revision=CANDIDATE,
+                        baseline_revision=BASELINE,
+                        pre_latest_ready_revision=BASELINE,
+                    )
+
+    def test_pre_floating_or_tagged_traffic_is_rejected(self):
+        post = traffic_document(fixed(BASELINE, 100), latest_created=CANDIDATE)
+        cases = (
+            ("PRE_FLOATING_LATEST", traffic_document(latest(100))),
+            (
+                "PRE_TAGGED_TRAFFIC",
+                traffic_document(fixed(BASELINE, 100, tag="stable")),
+            ),
+        )
+        for code, pre in cases:
+            with self.subTest(code=code):
+                self.assert_validation_code(
+                    code,
+                    validator.validate_zero_traffic_transition,
+                    pre,
+                    post,
+                    candidate_revision=CANDIDATE,
+                    baseline_revision=BASELINE,
+                    pre_latest_ready_revision=BASELINE,
+                )
+
+    def test_pre_candidate_traffic_is_rejected(self):
+        self.assert_validation_code(
+            "EFFECTIVE_TRAFFIC_DRIFT",
+            validator.validate_zero_traffic_transition,
+            traffic_document(fixed(BASELINE, 99), fixed(CANDIDATE, 1)),
+            traffic_document(fixed(BASELINE, 100), latest_created=CANDIDATE),
+            candidate_revision=CANDIDATE,
+            baseline_revision=BASELINE,
+            pre_latest_ready_revision=BASELINE,
+        )
+
     def test_unexpected_effective_map_drift(self):
         self.assert_validation_code(
             "EFFECTIVE_TRAFFIC_DRIFT",
             validator.validate_zero_traffic_transition,
-            traffic_document(latest(100)),
+            traffic_document(fixed(BASELINE, 100)),
             traffic_document(
                 fixed(BASELINE, 90),
                 fixed("cbd-assess-unexpected", 10),
@@ -652,26 +794,32 @@ class TrafficTests(ValidatorTestCase):
 
     def test_candidate_nonzero_or_tagged_is_rejected(self):
         cases = [
-            [fixed(BASELINE, 99), fixed(CANDIDATE, 1)],
-            [fixed(BASELINE, 100), fixed(CANDIDATE, 0, tag="candidate")],
+            (
+                "CANDIDATE_HAS_TRAFFIC",
+                [fixed(BASELINE, 99), fixed(CANDIDATE, 1)],
+            ),
+            (
+                "POST_TAGGED_TRAFFIC",
+                [fixed(BASELINE, 100), fixed(CANDIDATE, 0, tag="candidate")],
+            ),
         ]
-        for targets in cases:
+        for code, targets in cases:
             with self.subTest(targets=targets):
                 with self.assertRaises(validator.ValidationError) as caught:
                     validator.validate_zero_traffic_transition(
-                        traffic_document(latest(100)),
+                        traffic_document(fixed(BASELINE, 100)),
                         traffic_document(*targets, latest_created=CANDIDATE),
                         candidate_revision=CANDIDATE,
                         baseline_revision=BASELINE,
                         pre_latest_ready_revision=BASELINE,
                     )
-                self.assertEqual(caught.exception.code, "CANDIDATE_HAS_TRAFFIC")
+                self.assertEqual(caught.exception.code, code)
 
-    def test_tag_drift_is_rejected(self):
+    def test_pre_tagged_traffic_is_rejected(self):
         self.assert_validation_code(
-            "EFFECTIVE_TRAFFIC_DRIFT",
+            "PRE_TAGGED_TRAFFIC",
             validator.validate_zero_traffic_transition,
-            traffic_document(latest(100, tag="stable")),
+            traffic_document(fixed(BASELINE, 100, tag="stable")),
             traffic_document(fixed(BASELINE, 100), latest_created=CANDIDATE),
             candidate_revision=CANDIDATE,
             baseline_revision=BASELINE,
@@ -965,7 +1113,7 @@ class Phase2FScopeAndTransitionTests(ValidatorTestCase):
                 )
 
     def test_post_service_bindings_require_created_candidate_and_allowed_ready_identity(self):
-        pre = traffic_document(latest(100))
+        pre = traffic_document(fixed(BASELINE, 100))
         post = traffic_document(fixed(BASELINE, 100), latest_created=CANDIDATE)
         self.assert_validation_code(
             "POST_LATEST_CREATED_MISMATCH",
@@ -991,7 +1139,7 @@ class Phase2FScopeAndTransitionTests(ValidatorTestCase):
         )
 
     def test_post_latest_ready_is_required_and_well_formed(self):
-        pre = traffic_document(latest(100))
+        pre = traffic_document(fixed(BASELINE, 100))
         malformed_documents = [
             {
                 "status": {
@@ -3402,7 +3550,7 @@ class Phase2FCliTests(unittest.TestCase):
             return status, stdout.getvalue(), stderr.getvalue()
 
     def valid_commands(self):
-        pre = traffic_document(latest(100))
+        pre = traffic_document(fixed(BASELINE, 100))
         post = traffic_document(fixed(BASELINE, 100), latest_created=CANDIDATE)
         build = Phase2FGateTests().build_document()
         docker_image = {
@@ -3497,6 +3645,46 @@ class Phase2FCliTests(unittest.TestCase):
                 self.assertEqual(failed[1], "")
                 self.assertNotIn(sentinel, failed[2])
                 self.assertNotIn("Traceback", failed[2])
+
+    def test_zero_traffic_binds_nonbaseline_ready_revision_to_evidence_file(self):
+        pre_ready_candidate = "cbd-assess-17237de"
+        with tempfile.TemporaryDirectory(prefix="phase2f-pre-ready.") as root:
+            root = __import__("os").path.realpath(root)
+            pre_path = Path(root) / "pre.json"
+            post_path = Path(root) / "post.json"
+            revision_path = Path(root) / "approved-revision.json"
+            pre_path.write_text(json.dumps(traffic_document(
+                fixed(BASELINE, 100), latest_ready=pre_ready_candidate
+            )))
+            post_path.write_text(json.dumps(traffic_document(
+                fixed(BASELINE, 100), latest_created=CANDIDATE
+            )))
+            revision_path.write_text(json.dumps(revision_document(
+                name=pre_ready_candidate
+            )))
+            args = [
+                "zero-traffic", *self.common,
+                "--candidate-revision", CANDIDATE,
+                "--baseline-revision", BASELINE,
+                "--pre-latest-ready-revision", pre_ready_candidate,
+                "--evidence-root", root,
+                "--pre-evidence-file", str(pre_path),
+                "--post-evidence-file", str(post_path),
+                "--pre-approved-latest-ready-evidence-file", str(revision_path),
+                "--pre-approved-latest-ready-digest", DIGEST,
+                "--pre-approved-latest-ready-image", IMAGE_URI,
+            ]
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                status = validator.main(args)
+            self.assertEqual(status, 0)
+            revision_path.write_text(json.dumps(revision_document(
+                name="cbd-assess-unapproved"
+            )))
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                status = validator.main(args)
+            self.assertEqual(status, 2)
 
     def test_build_nonterminal_exit_is_stable(self):
         args, document = next(

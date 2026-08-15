@@ -917,6 +917,7 @@ the fixed production target remains the baseline:
   : "${BUILD_SERVICE_ACCOUNT:?authorized Build service account is required}"
   : "${BUILD_CONFIG:?authorized submitted build config is required}"
   : "${BUILD_CONFIG_SHA256:?authorized submitted build config digest is required}"
+  : "${PRE_APPROVED_LATEST_READY_REVISION:?authorized pre-deployment latest-ready revision is required}"
   declare -F bind_scope >/dev/null || fail 'bind_scope is not loaded'
   declare -F capture_runtime_snapshot >/dev/null \
     || fail 'capture_runtime_snapshot is not loaded'
@@ -943,6 +944,34 @@ the fixed production target remains the baseline:
       --expected-build-config-sha256="$BUILD_CONFIG_SHA256" --output=image-ref
   )" || fail 'current build/tag/digest authorization'
 
+  PRE_APPROVED_LATEST_READY_ARGS=()
+  if [[ "$PRE_APPROVED_LATEST_READY_REVISION" != "$BASELINE_REVISION" ]]; then
+    : "${PRE_APPROVED_LATEST_READY_DIGEST:?approved pre-deployment revision digest is required}"
+    : "${PRE_APPROVED_LATEST_READY_IMAGE:?approved pre-deployment revision image is required}"
+    PRE_APPROVED_LATEST_READY_RAW="$EVIDENCE_ROOT/pre-approved-latest-ready-revision.json"
+    python3.12 scripts/validate_deployment_state.py evidence-path \
+      --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+      --evidence-root="$EVIDENCE_ROOT" \
+      --output-file="$PRE_APPROVED_LATEST_READY_RAW" >/dev/null \
+      || fail 'unsafe pre-approved latest-ready evidence path'
+    gcloud run revisions describe "$PRE_APPROVED_LATEST_READY_REVISION" \
+      --account="$ACCOUNT" --project="$PROJECT_ID" --region="$REGION" \
+      --format='json(metadata.name,status.conditions,status.imageDigest)' \
+      > "$PRE_APPROVED_LATEST_READY_RAW"
+    bind_scope revision < "$PRE_APPROVED_LATEST_READY_RAW" \
+      | python3.12 scripts/validate_deployment_state.py revision \
+          --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
+          --expected-revision="$PRE_APPROVED_LATEST_READY_REVISION" \
+          --expected-image="$PRE_APPROVED_LATEST_READY_IMAGE" \
+          --expected-digest="$PRE_APPROVED_LATEST_READY_DIGEST" >/dev/null \
+      || fail 'pre-approved latest-ready revision evidence is not ready or exact'
+    PRE_APPROVED_LATEST_READY_ARGS=(
+      --pre-approved-latest-ready-evidence-file "$PRE_APPROVED_LATEST_READY_RAW"
+      --pre-approved-latest-ready-digest "$PRE_APPROVED_LATEST_READY_DIGEST"
+      --pre-approved-latest-ready-image "$PRE_APPROVED_LATEST_READY_IMAGE"
+    )
+  fi
+
   PRE_SERVICE_RAW="$EVIDENCE_ROOT/pre-deploy-traffic.json"
   POST_SERVICE_RAW="$EVIDENCE_ROOT/post-deploy-traffic.json"
   PRE_RUNTIME_RAW="$EVIDENCE_ROOT/pre-runtime.raw.json"
@@ -961,7 +990,7 @@ the fixed production target remains the baseline:
   bind_scope serviceState < "$PRE_SERVICE_RAW" \
     | python3.12 scripts/validate_deployment_state.py traffic \
         --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
-        --latest-ready-revision="$BASELINE_REVISION" >/dev/null
+        --latest-ready-revision="$PRE_APPROVED_LATEST_READY_REVISION" >/dev/null
   capture_runtime_snapshot "$PRE_RUNTIME_RAW"
 
   gcloud run deploy "$SERVICE" \
@@ -992,7 +1021,8 @@ the fixed production target remains the baseline:
       --project="$PROJECT_ID" --region="$REGION" --service="$SERVICE" \
       --candidate-revision="$CANDIDATE_REVISION" \
       --baseline-revision="$BASELINE_REVISION" \
-      --pre-latest-ready-revision="$BASELINE_REVISION" \
+      --pre-latest-ready-revision="$PRE_APPROVED_LATEST_READY_REVISION" \
+      "${PRE_APPROVED_LATEST_READY_ARGS[@]}" \
       --evidence-root="$EVIDENCE_ROOT" --pre-evidence-file="$PRE_SERVICE_RAW" \
       --post-evidence-file="$POST_SERVICE_RAW"
 
@@ -1017,17 +1047,28 @@ post-deployment `latestCreatedRevisionName` equal to the candidate; and
 independently validated candidate. The complete fixed, untagged traffic map is
 authoritative for production serving state: baseline at 100%, candidate absent
 or untagged at zero, and no floating `LATEST` or unexpected target. It also
-requires only the documented floating-to-fixed raw transformation and identical
-safe runtime hashes. A correct `--no-traffic` deployment therefore has a
-newest-created, independently ready candidate and baseline production traffic
-at 100% with candidate traffic at 0%, regardless of the allowed latest-ready
-identity.
+requires identical safe runtime hashes. A correct `--no-traffic` deployment
+therefore has a newest-created, independently ready candidate and baseline
+production traffic at 100% with candidate traffic at 0%, regardless of the
+allowed latest-ready identity.
 
-Do not require byte-for-byte equality between a floating raw pre-map and the
-documented fixed post-map. Any effective drift, candidate traffic, candidate
-tag, unexpected target, missing target, changed tag, or changed percentage is a
-deployment failure. Do not issue a compensating traffic command without a
-separate rollback authorization.
+Before executing the block, authorization must bind
+`PRE_APPROVED_LATEST_READY_REVISION` to either the fixed baseline or a
+separately captured approved candidate. When it is not the baseline, the block
+captures a fresh exact revision document and binds its identity, `Ready=True`,
+image identity, and immutable digest to the approved values before deployment.
+The complete fixed `status.traffic` map remains the sole production-serving
+proof: the baseline must be exactly 100 percent, the new candidate must be
+absent or zero percent, and tags, floating `LATEST`, and unexpected targets
+fail both before and after deployment.
+
+The pre- and post-deployment traffic maps require fixed revision targets. Do
+not accept a floating-to-fixed transformation. After omitting only the allowed
+explicit zero-traffic entry for the new candidate, the fixed target inventory
+and allocation must be unchanged. Any traffic drift, candidate traffic,
+candidate tag, unexpected target, missing target, changed tag, or changed
+percentage is a deployment failure. Do not issue a compensating traffic command
+without a separate rollback authorization.
 
 ## 8. Separately authorized candidate testing
 
