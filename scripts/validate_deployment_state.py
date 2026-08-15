@@ -682,6 +682,10 @@ def validate_zero_traffic_transition(
     candidate_revision: str,
     baseline_revision: str,
     pre_latest_ready_revision: str,
+    pre_approved_revision_evidence: Any | None = None,
+    pre_approved_revision_digest: str | None = None,
+    pre_approved_revision_image: str | None = None,
+    scope: Scope | None = None,
 ) -> dict[str, Any]:
     """Prove a ready candidate has no production traffic after --no-traffic."""
 
@@ -696,10 +700,48 @@ def validate_zero_traffic_transition(
             "POST_LATEST_CREATED_MISMATCH",
             "Post-deployment latest-created revision differs from the candidate",
         )
-    if pre.latest_ready_revision != pre_latest_ready_revision:
-        fail("BASELINE_MISMATCH", "Pre-deployment latest-ready revision is unexpected")
-    if pre_latest_ready_revision != baseline:
-        fail("BASELINE_MISMATCH", "Approved baseline does not resolve floating LATEST")
+    approved_pre_latest_ready = _require_revision_name(
+        pre_latest_ready_revision, "PRE_LATEST_READY_REVISION"
+    )
+    if pre.latest_ready_revision != approved_pre_latest_ready:
+        fail(
+            "PRE_LATEST_READY_MISMATCH",
+            "Pre-deployment latest-ready revision is not the approved ready revision",
+        )
+    approval_evidence = (
+        pre_approved_revision_evidence,
+        pre_approved_revision_digest,
+        pre_approved_revision_image,
+    )
+    if approved_pre_latest_ready == baseline:
+        if any(item is not None for item in approval_evidence):
+            fail(
+                "PRE_LATEST_READY_EVIDENCE_UNEXPECTED",
+                "Baseline latest-ready revision must not supply candidate evidence",
+            )
+    else:
+        if not all(item is not None for item in approval_evidence) or scope is None:
+            fail(
+                "PRE_LATEST_READY_EVIDENCE_REQUIRED",
+                "Non-baseline latest-ready revision requires exact revision evidence",
+            )
+        validate_revision_document(
+            pre_approved_revision_evidence,
+            approved_pre_latest_ready,
+            pre_approved_revision_digest,
+            expected_image=pre_approved_revision_image,
+            scope=scope,
+        )
+    if any(target.target_type == "LATEST" for target in pre.targets):
+        fail(
+            "PRE_FLOATING_LATEST",
+            "Pre-deployment traffic must not contain a floating LATEST target",
+        )
+    if any(target.tag is not None for target in pre.targets):
+        fail(
+            "PRE_TAGGED_TRAFFIC",
+            "Pre-deployment traffic must not contain a tag",
+        )
     if post.latest_ready_revision not in {baseline, candidate}:
         fail(
             "POST_LATEST_READY_MISMATCH",
@@ -709,6 +751,11 @@ def validate_zero_traffic_transition(
         fail(
             "POST_FLOATING_LATEST",
             "Post-deployment traffic must not retain a floating LATEST target",
+        )
+    if any(target.tag is not None for target in post.targets):
+        fail(
+            "POST_TAGGED_TRAFFIC",
+            "Post-deployment traffic must not contain a tag",
         )
 
     candidate_post_targets = [
@@ -724,17 +771,12 @@ def validate_zero_traffic_transition(
     ):
         fail("CANDIDATE_HAS_TRAFFIC", "Candidate receives traffic or has a tag")
 
-    pre_effective = pre.effective_canonical(pre_latest_ready_revision)
+    pre_effective = pre.effective_canonical(approved_pre_latest_ready)
     post_effective = post.effective_canonical(baseline)
     if pre_effective != post_effective:
         fail("EFFECTIVE_TRAFFIC_DRIFT", "Effective serving allocation changed")
 
-    expected_post = [
-        TrafficTarget("FIXED", pre_latest_ready_revision, target.percent, target.tag)
-        if target.target_type == "LATEST"
-        else target
-        for target in pre.targets
-    ]
+    expected_post = list(pre.targets)
     post_without_candidate_zero: list[TrafficTarget] = []
     candidate_zero_count = 0
     for target in post.targets:
@@ -2382,6 +2424,9 @@ def build_parser() -> argparse.ArgumentParser:
     transition_parser.add_argument("--evidence-root")
     transition_parser.add_argument("--pre-evidence-file")
     transition_parser.add_argument("--post-evidence-file")
+    transition_parser.add_argument("--pre-approved-latest-ready-evidence-file")
+    transition_parser.add_argument("--pre-approved-latest-ready-digest")
+    transition_parser.add_argument("--pre-approved-latest-ready-image")
 
     session_parser = subparsers.add_parser("session-secret")
     add_scope(session_parser)
@@ -2663,7 +2708,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         document: Any
         if args.command == "zero-traffic" and any(
-            (args.evidence_root, args.pre_evidence_file, args.post_evidence_file)
+            (
+                args.evidence_root,
+                args.pre_evidence_file,
+                args.post_evidence_file,
+                args.pre_approved_latest_ready_evidence_file,
+            )
         ):
             if not all(
                 (args.evidence_root, args.pre_evidence_file, args.post_evidence_file)
@@ -2679,6 +2729,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "pre": _strict_load_path(pre_path),
                 "post": _strict_load_path(post_path),
             }
+            if args.pre_approved_latest_ready_evidence_file:
+                approved_path = validate_evidence_file_path(
+                    args.evidence_root,
+                    args.pre_approved_latest_ready_evidence_file,
+                    must_exist=True,
+                )
+                envelope["preApprovedRevision"] = _strict_load_path(approved_path)
         elif args.command == "runtime-equal" and any(
             (args.evidence_root, args.pre_evidence_file, args.post_evidence_file)
         ):
@@ -2782,13 +2839,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "TRANSITION_DOCUMENT",
                     "Zero-traffic evidence is malformed",
                 )
-                _require_exact_keys(envelope, required={"pre", "post"})
+                _require_exact_keys(
+                    envelope,
+                    required={"pre", "post"},
+                    optional={"preApprovedRevision"},
+                )
             result = validate_zero_traffic_transition(
                 envelope["pre"],
                 envelope["post"],
                 candidate_revision=args.candidate_revision,
                 baseline_revision=args.baseline_revision,
                 pre_latest_ready_revision=args.pre_latest_ready_revision,
+                pre_approved_revision_evidence=envelope.get("preApprovedRevision"),
+                pre_approved_revision_digest=args.pre_approved_latest_ready_digest,
+                pre_approved_revision_image=args.pre_approved_latest_ready_image,
+                scope=scope,
             )
             result["scope"] = scope.output()
         elif args.command == "session-secret":
