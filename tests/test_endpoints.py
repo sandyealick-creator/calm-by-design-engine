@@ -32,6 +32,7 @@ def test_start_page_requires_acknowledgement_and_does_not_write(client, fake_air
     response = client.get("/")
 
     assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store"
     assert not response.is_json
     body = response.get_data(as_text=True)
     assert "Welcome to Calm by Design" in body

@@ -1218,7 +1218,7 @@ def _result_from_assessment(assess_record):
 @app.get("/")
 def start_page():
     """Show the no-data participant start page before enrollment."""
-    return no_store(render_template("start.html"))
+    return no_store(make_response(render_template("start.html")))
 
 
 @app.get("/health")
