@@ -1345,6 +1345,86 @@ class Phase2FGateTests(ValidatorTestCase):
                         **build_validation_kwargs(),
                         scope=validator.require_scope(PROJECT, REGION, SERVICE),
                     )
+                empty_results = self.build_document(state)
+                empty_results.pop("finishTime")
+                empty_results["results"] = {}
+                with self.assertRaises(validator.NonterminalBuild):
+                    validator.validate_build_document(
+                        empty_results,
+                        expected_build_id=BUILD_ID,
+                        expected_source_sha=SOURCE_SHA,
+                        expected_source_tree=SOURCE_TREE,
+                        expected_image_tag=IMAGE_TAG,
+                        **build_validation_kwargs(),
+                        scope=validator.require_scope(PROJECT, REGION, SERVICE),
+                    )
+                empty_images = self.build_document(state)
+                empty_images.pop("finishTime")
+                empty_images["results"] = {"images": []}
+                with self.assertRaises(validator.NonterminalBuild):
+                    validator.validate_build_document(
+                        empty_images,
+                        expected_build_id=BUILD_ID,
+                        expected_source_sha=SOURCE_SHA,
+                        expected_source_tree=SOURCE_TREE,
+                        expected_image_tag=IMAGE_TAG,
+                        **build_validation_kwargs(),
+                        scope=validator.require_scope(PROJECT, REGION, SERVICE),
+                    )
+                populated_results = self.build_document(state)
+                populated_results.pop("finishTime")
+                self.assert_validation_code(
+                    "BUILD_STATUS",
+                    validator.validate_build_document,
+                    populated_results,
+                    expected_build_id=BUILD_ID,
+                    expected_source_sha=SOURCE_SHA,
+                    expected_source_tree=SOURCE_TREE,
+                    expected_image_tag=IMAGE_TAG,
+                    **build_validation_kwargs(),
+                    scope=validator.require_scope(PROJECT, REGION, SERVICE),
+                )
+                unknown_results = self.build_document(state)
+                unknown_results.pop("finishTime")
+                unknown_results["results"] = {"unknown": []}
+                self.assert_validation_code(
+                    "BUILD_RESULTS",
+                    validator.validate_build_document,
+                    unknown_results,
+                    expected_build_id=BUILD_ID,
+                    expected_source_sha=SOURCE_SHA,
+                    expected_source_tree=SOURCE_TREE,
+                    expected_image_tag=IMAGE_TAG,
+                    **build_validation_kwargs(),
+                    scope=validator.require_scope(PROJECT, REGION, SERVICE),
+                )
+                malformed_images = self.build_document(state)
+                malformed_images.pop("finishTime")
+                malformed_images["results"] = {"images": None}
+                self.assert_validation_code(
+                    "BUILD_RESULTS",
+                    validator.validate_build_document,
+                    malformed_images,
+                    expected_build_id=BUILD_ID,
+                    expected_source_sha=SOURCE_SHA,
+                    expected_source_tree=SOURCE_TREE,
+                    expected_image_tag=IMAGE_TAG,
+                    **build_validation_kwargs(),
+                    scope=validator.require_scope(PROJECT, REGION, SERVICE),
+                )
+                finish_time = self.build_document(state)
+                finish_time.pop("results")
+                self.assert_validation_code(
+                    "BUILD_STATUS",
+                    validator.validate_build_document,
+                    finish_time,
+                    expected_build_id=BUILD_ID,
+                    expected_source_sha=SOURCE_SHA,
+                    expected_source_tree=SOURCE_TREE,
+                    expected_image_tag=IMAGE_TAG,
+                    **build_validation_kwargs(),
+                    scope=validator.require_scope(PROJECT, REGION, SERVICE),
+                )
         for state in validator.FAILED_BUILD_STATES | {"UNKNOWN", ""}:
             with self.subTest(state=state):
                 with self.assertRaises(validator.ValidationError):
