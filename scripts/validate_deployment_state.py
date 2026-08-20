@@ -1488,8 +1488,25 @@ def validate_build_document(
     }:
         fail("BUILD_SOURCE_MISMATCH", "Build source or image binding differs")
     if status in NONTERMINAL_BUILD_STATES:
-        if "finishTime" in root or "results" in root:
+        if "finishTime" in root:
             fail("BUILD_STATUS", "Nonterminal build contains terminal result evidence")
+        if "results" in root:
+            nonterminal_results = _require_object(
+                root["results"],
+                "BUILD_RESULTS",
+                "Nonterminal build results are malformed",
+            )
+            _require_exact_keys(
+                nonterminal_results,
+                required=set(),
+                optional={"images"},
+                code="BUILD_RESULTS",
+            )
+            result_images = nonterminal_results.get("images", [])
+            if not isinstance(result_images, list):
+                fail("BUILD_RESULTS", "Nonterminal build result images are malformed")
+            if result_images:
+                fail("BUILD_STATUS", "Nonterminal build contains terminal result evidence")
         raise NonterminalBuild
     if status in FAILED_BUILD_STATES:
         fail("BUILD_FAILED", "Build reached a non-success terminal state")
