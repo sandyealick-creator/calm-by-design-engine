@@ -111,7 +111,7 @@ Fields added this build cycle (all additive, created via the Airtable MCP with e
 
 ## 11. GHL workflows
 
-- **Active workflows, pending controlled compatibility verification**: "Daily Check-In - Assessment" (form -> webhook -> `/assess`), "Crisis Alert Notification" (polls Crisis Alerts), "Safety Buffer Routing" (polls AI Assessments). `/assess` now applies a journal limit, rate limit, and strict UUIDv4 validation when `submission_id` is supplied; normal shared-core routing is unchanged.
+- **Active workflows**: "Daily Check-In - Assessment" (form -> webhook -> `/assess`), "Crisis Alert Notification" (polls Crisis Alerts), "Safety Buffer Routing" (polls AI Assessments). The active published "Daily Check-In - Assessment" workflow uses the replacement webhook secret and successfully authenticated to live `/assess`. Test-only verification completed the expected Airtable/Gemini processing with deterministic Support Score `14`, Score Tier `Steady`, and Response Route `Steady`. All synthetic HighLevel and Airtable test records were deleted; no further compatibility test is required. `/assess` applies a journal limit, rate limit, and strict UUIDv4 validation when `submission_id` is supplied; normal shared-core routing is unchanged.
 - **Still requires manual creation**: "Send Check-in Link" - trigger on `Recovery Requests` new records where `Recovery Link` is not empty, find contact by email, email that link. Not yet created.
 
 ## 12. Major files

@@ -39,9 +39,9 @@ GHL's Crisis Alert Notification and Safety Buffer Routing workflows continue to 
 - [x] Participant-facing enrollment, check-in, recovery, and result/safety pages (`templates/`)
 - [ ] Deploy and verify this version on Google Cloud Run (`cbd-assess`, `us-east1`)
 - [ ] Complete controlled end-to-end verification with test-only records before participant enrollment
-- [x] Credentials rotated after being briefly exposed in a shared doc during setup
+- [x] Credential-exposure incident closed; production and governed rollback use replacement Secret Manager-backed credentials
 - [x] GitHub repo created and pushed *(this repo)*
-- [x] Existing GHL "Daily Check-In - Assessment" webhook workflow retained against `/assess`; controlled testing must verify its payload against the new length, rate, and optional submission-ID validation
+- [x] Existing GHL "Daily Check-In - Assessment" webhook workflow retained against `/assess`; live test-only compatibility verification completed successfully. The active workflow authenticated to `/assess`, completed the expected Airtable/Gemini processing, and produced Support Score `14` with a `Steady` tier and route. All synthetic test records were deleted; no repeat compatibility test is required.
 - [ ] New GHL "Send Check-in Link" workflow (Recovery Requests polling) — manual, see `MANUAL_TEST_CHECKLIST.md`
 - [x] Golden test set run and results archived (`golden_results.json`)
 - [ ] Devpost submission finalized
